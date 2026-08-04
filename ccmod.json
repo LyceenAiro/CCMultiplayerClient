@@ -1,0 +1,20 @@
+{
+	"id": "multiplayer",
+	"name": "multiplayer",
+	"displayName": "CrossCode Multiplayer",
+	"version": "0.1.0",
+	"description": "Adds online co-op by synchronizing players, enemies and projectiles over a socket.io relay server.",
+	"license": "MIT",
+	"authors": ["CCDirectLink"],
+	"repository": "https://github.com/CCDirectLink/CCMultiplayerClient",
+	"main": "dist/mod.js",
+	"ccmodDependencies": {
+		"crosscode": "^1.4.2",
+		"ccloader": "^2.22.0",
+		"simplify": "^2.14.0"
+	},
+	"assets": [
+		"assets/data/enemies/multiplayer.json",
+		"config/config.json"
+	]
+}

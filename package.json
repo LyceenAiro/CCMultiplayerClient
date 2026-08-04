@@ -1,0 +1,32 @@
+{
+	"name": "multiplayer",
+	"displayName": "CrossCode Multiplayer",
+	"version": "0.1.0",
+	"description": "A multiplayer mod for CrossCode. Adds online co-op by synchronizing players, enemies and projectiles over a socket.io relay server.",
+	"license": "MIT",
+	"author": "CCDirectLink",
+	"main": "dist/mod.js",
+	"ccmodDependencies": {
+		"crosscode": "^1.4.2",
+		"ccloader": "^2.22.0",
+		"simplify": "^2.14.0"
+	},
+	"assets": [
+		"assets/data/enemies/multiplayer.json",
+		"config/config.json"
+	],
+	"scripts": {
+		"build": "node esbuild.config.mjs",
+		"watch": "node esbuild.config.mjs --watch",
+		"check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"socket.io-client": "^4.7.5"
+	},
+	"devDependencies": {
+		"@types/node": "^18.11.15",
+		"esbuild": "^0.20.0",
+		"typescript": "^5.4.0",
+		"ultimate-crosscode-typedefs": "file:./vendor/ultimate-crosscode-typedefs"
+	}
+}

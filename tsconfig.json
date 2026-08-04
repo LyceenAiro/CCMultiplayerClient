@@ -1,0 +1,21 @@
+{
+	"include": [
+		"src",
+		"vendor/ultimate-crosscode-typedefs/crosscode-ccloader-all.d.ts"
+	],
+	"compilerOptions": {
+		"outDir": "dist",
+		"sourceMap": true,
+		"strict": true,
+		"noImplicitAny": false,
+		"strictNullChecks": false,
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"target": "ES2019",
+		"lib": ["ES2019", "DOM", "DOM.Iterable"],
+		"allowJs": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true
+	}
+}
