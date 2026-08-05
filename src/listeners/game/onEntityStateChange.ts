@@ -4,7 +4,8 @@ import { EntityListener } from './entityListener';
 
 export class OnEntityStateChangeListener {
 
-	private last = '';
+	// Dedup state is per-entity (keyed by multiplayerId).
+	private last = new Map<number, string>();
 
 	constructor(
         private main: Multiplayer,
@@ -23,13 +24,11 @@ export class OnEntityStateChangeListener {
 
 	private onUpdate(entity: IMultiplayerEntity): void {
 		const state = entity.currentState;
+		const last = this.last.get(entity.multiplayerId);
 
-		if (state !== this.last) {
+		if (last === undefined || state !== last) {
 			this.onEntityStateChanged(entity, state);
-			// Was `this.last = status` — `status` resolved to the browser's
-			// global `window.status` (a string), never the entity state, so state
-			// updates were sent every frame. Store the actual state instead.
-			this.last = state;
+			this.last.set(entity.multiplayerId, state);
 		}
 	}
 }

@@ -12,13 +12,22 @@ export class OnThrownBallListener {
 
 	public onThrowBall(ballInfo: IBallInfo): void {
 		if (ballInfo.combatant === null) {
+			console.warn('[multiplayer] onThrowBall: combatant is null, dropping ball', ballInfo.ballInfo);
 			return;
 		}
 
 		const entity = this.resolveEntity(ballInfo.combatant);
 		if (!entity) {
+			console.warn('[multiplayer] onThrowBall: could not resolve entity for combatant "' +
+				ballInfo.combatant + '" (mirror not spawned yet?), dropping ball', ballInfo.ballInfo);
 			return;
 		}
+
+		// The mirror's `proxies` was captured at spawn time; element switches make
+		// 1.4.2 reassign playerEntity.proxies to a NEW object, leaving the mirror
+		// with a stale reference and SHOOT_PROXY unable to resolve the proxy name.
+		// Refresh it so the proxy lookup succeeds.
+		(entity as any).proxies = ig.game.playerEntity.proxies;
 
 		// `SHOOT_PROXY` settings are an internal shape that has shifted between
 		// game versions; the values we pass are part of our own wire protocol, so

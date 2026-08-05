@@ -12,9 +12,9 @@ export class OnUpdateAnimationListener {
 	public onUpdateAnimation(player: string, face: Vec2, anim: string): void {
 		const pl = this.main.players[player];
 		if (pl && pl.entity) {
-			pl.entity.face.x = face.x;
-			pl.entity.face.y = face.y;
-			pl.entity.currentAnim = anim;
+			// The mirror entity is locked (see lockEntity): write through the
+			// protected backing fields so 1.4.2 animation code doesn't revert it.
+			this.main.setEntityAnimationProtected(pl.entity, face, anim);
 			this.clearAnimation(pl.entity);
 			this.playAnimation(pl.entity, anim);
 		}

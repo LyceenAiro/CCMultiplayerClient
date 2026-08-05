@@ -14,12 +14,6 @@ export class OnUpdateEntityAnimationListener {
 			return;
 		}
 
-		this.setEntityAnimation({face, anim}, this.main.entities[id]);
-	}
-
-	private setEntityAnimation(from: {face: Vec2, anim: string}, to: ig.ActorEntity) {
-		(to.face as any).xProtected = from.face.x;
-		(to.face as any).yProtected = from.face.y;
-		to.currentAnim = {protected: from.anim} as unknown as string;
+		this.main.setEntityAnimationProtected(this.main.entities[id], face, anim);
 	}
 }

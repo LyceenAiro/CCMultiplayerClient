@@ -22,13 +22,23 @@ export class OnTeleportListener {
 	public onTeleport(map: string, teleportPosition: any): void {
 		this.main.loadingMap = true;
 
+		let marker: string | null = null;
 		for (const key in teleportPosition) {
 			const value = teleportPosition[key];
 			if (value && typeof value === 'string') {
-				this.main.connection.changeMap(map, value);
-				return;
+				marker = value;
+				break;
 			}
 		}
-		this.main.connection.changeMap(map, null);
+
+		// Fire the changeMap request and stash the response promise. onMapEnter
+		// (loadLevel) awaits it to learn whether we're the host of the target
+		// instance — which decides whether enemies are stripped from the level.
+		// Derive the area from the TARGET map name: at teleport time
+		// sc.map.currentPlayerArea still points at the map we're leaving, so
+		// reading it would mis-classify towns and split matchmaking instances.
+		const areaPath = this.main.getAreaPathOfMap(map);
+		const areaType = this.main.getAreaTypeOfMap(map);
+		this.main.pendingChangeMap = this.main.connection.changeMap(map, marker, areaPath, areaType);
 	}
 }

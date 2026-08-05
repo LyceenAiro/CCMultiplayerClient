@@ -12,7 +12,9 @@ export class OnUpdatePositionListener {
 	public onUpdatePostion(player: string, position: Vec3): void {
 		const pl = this.main.players[player];
 		if (pl && pl.entity) {
-			pl.entity.coll.pos = position;
+			// The mirror entity is locked (see lockEntity): write through the
+			// protected backing fields so 1.4.2 physics doesn't revert the move.
+			this.main.copyEntityPosition(position, pl.entity.coll.pos);
 			pl.position = position;
 		}
 	}

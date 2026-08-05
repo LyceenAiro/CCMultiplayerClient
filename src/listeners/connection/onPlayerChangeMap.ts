@@ -37,16 +37,24 @@ export class OnPlayerChangeMapListener {
 				skipHook: true,
 			} as any) as IMultiplayerEntity;
 			entity.proxies = ig.game.playerEntity.proxies;
+			// Lock the mirror's pos/face/anim/state so 1.4.2 physics & animation
+			// don't overwrite the network-driven values (same treatment as enemy
+			// mirrors). Without this the remote player rubber-bands / runs in place.
+			this.main.lockEntity(entity, position);
 			this.main.players[player] = {name: player,
 				position: {x: position.x, y: position.y, z: position.z},
 				entity} as IPlayer;
 			console.log(this.main.players[player]);
 		} else {
+			// A player LEFT our instance. In the old room architecture this forcibly
+			// teleported us after them ("everyone shares one map"); in the lobby
+			// architecture we simply despawn their mirror and carry on.
+			const mirror = this.main.players[player];
+			if (mirror && mirror.entity) {
+				try { mirror.entity.kill(); } catch (_) { /* ignore */ }
+			}
 			this.main.players[player] = undefined;
 			delete this.main.players[player];
-
-			ig.game.teleport(map, ig.TeleportPosition.createFromJson({marker: marker as string}));
-			this.main.connection.changeMap(map, marker);
 		}
 	}
 

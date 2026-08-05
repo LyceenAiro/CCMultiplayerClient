@@ -32,7 +32,13 @@ export class LoadScreenHook {
 	}
 
 	public addButton(box: sc.ButtonListBox, name: string) {
-		const button = new sc.SaveSlotButton(undefined, 0);
+		// slot must be -1 (the "new game / no save" slot). In 1.4.2 the title-screen
+		// highlight (SaveSlotButtonHighlight.setSlot) dereferences
+		// `ig.storage.getSlot(slot).data` for any slot != -1; with slot 0 that throws
+		// "Cannot read property 'data' of undefined" whenever there is no save in
+		// that slot (e.g. a fresh profile). -1 keeps it on the autoSlotMiss branch,
+		// which simply shows our server name.
+		const button = new sc.SaveSlotButton(undefined, -1);
 		button.autoSlotMiss.setText(name);
 
 		box.addButton(button, false);

@@ -59,14 +59,19 @@ export class OnEntitySpawnListener {
 		}
 
 		if (typeof type !== 'string' && (type as unknown) === (ig.ENTITY.Ball as unknown)) {
-			const ballSettings = this.filterBall(settings);
-			if (ballSettings) {
-				if (typeof ballSettings.combatant !== 'string'
-					&& settings.combatant.name === null) { // Don't resend other player's balls
+			const isLocalPlayerBall = settings.combatant === ig.game.playerEntity;
+			// Only re-broadcast balls the LOCAL player threw. Remote-player mirrors
+			// replay their own balls via onThrowBall, and enemy (NPC) balls are
+			// simulated locally by the host — neither needs a lookup here. filterBall
+			// only knows the player's proxies, so it can't resolve enemy ball types;
+			// don't spam a warning for those.
+			if (isLocalPlayerBall) {
+				const ballSettings = this.filterBall(settings);
+				if (ballSettings) {
 					this.main.connection.throwBall(ballSettings);
+				} else {
+					console.warn('[multiplayer] Could not find type of ball (filterBall returned null). combatant=localPlayer');
 				}
-			} else {
-				console.warn('Could not find type of ball. Maybe something else threw the ball?');
 			}
 			return this.original.call(ig.game, type, x, y, z, settings, showAppearEffects);
 		}

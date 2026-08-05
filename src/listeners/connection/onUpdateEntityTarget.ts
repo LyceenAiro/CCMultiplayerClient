@@ -10,6 +10,12 @@ export class OnUpdateEntityTargetListener {
 	}
 
 	public onUpdateEntityTarget(id: number, target: string | number | null): void {
+		// Enemy sync is host-authoritative: the host drives targets locally and
+		// must not apply target updates bounced back from the relay.
+		if (this.main.host) {
+			return;
+		}
+
 		let entity: ig.Entity | null | undefined;
 
 		if (target === null) {

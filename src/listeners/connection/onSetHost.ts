@@ -10,7 +10,14 @@ export class OnSetHostListener {
 		this.main.connection.onSetHost(this.onSetHost.bind(this));
 	}
 
-	public onSetHost(isHost: boolean): void {
+	public onSetHost(isHost: boolean, map?: string): void {
+		// setHost now carries the map it applies to (per-instance host). Ignore
+		// updates for a map we're no longer on (e.g. we teleported away as the
+		// server migrated our old instance's host to us).
+		if (map && ig.game.mapName && map !== ig.game.mapName) {
+			return;
+		}
+
 		if (this.main.host === isHost) {
 			return;
 		}
@@ -19,7 +26,7 @@ export class OnSetHostListener {
 
 		if (isHost) {
 			this.unlockEntities();
-			console.log('[multiplayer] This user is now the host!');
+			console.log('[multiplayer] This user is now the host of ' + (map || 'this map') + '!');
 		} else {
 			this.lockEntities();
 			console.log('[multiplayer] This user no longer the host!');
@@ -79,11 +86,11 @@ export class OnSetHostListener {
 		Object.defineProperty(entity.coll, 'pos',
 			{ get() { return protectedPos; }, set() {console.log('tried to maniplulate pos'); } });
 
-		let protectedAnim = entity.coll;
+		let protectedAnim = entity.currentAnim;
 
 		Object.defineProperty(entity, 'currentAnim', {
 			get() { return protectedAnim; },
-			set(data) { if (data.protected) { protectedAnim = data.protected; } },
+			set(data) { if (data && data.protected) { protectedAnim = data.protected; } },
 		});
 
 		const protectedFace = entity.face ? {xProtected: entity.face.x, yProtected: entity.face.y}

@@ -4,7 +4,8 @@ import { EntityListener } from './entityListener';
 
 export class OnEntityHealthChangeListener {
 
-	private last = 0;
+	// Dedup state is per-entity (keyed by multiplayerId).
+	private last = new Map<number, number>();
 
 	constructor(
         private main: Multiplayer,
@@ -22,11 +23,19 @@ export class OnEntityHealthChangeListener {
 	}
 
 	private onUpdate(entity: IMultiplayerEntity): void {
-		const health = entity.params.getStat('hp');
+		// Some entities (and mirror entities mid-setup) have no combat params yet;
+		// skip them instead of dereferencing a null `params`.
+		if (!entity.params) {
+			return;
+		}
+		// `currentHp` is the live health value; `getStat('hp')` returns the stat
+		// *cap* (which never changes), so it would never trigger a send.
+		const health = entity.params.currentHp;
+		const last = this.last.get(entity.multiplayerId);
 
-		if (health !== this.last) {
+		if (last === undefined || health !== last) {
 			this.onEntityHealthChanged(entity, health);
-			this.last = health;
+			this.last.set(entity.multiplayerId, health);
 		}
 	}
 }

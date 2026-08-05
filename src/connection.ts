@@ -7,7 +7,7 @@ export interface IConnection {
     isOpen(): boolean;
 
     identify(username: string): Promise<IIdentifyResult>;
-    changeMap(name: string, marker: string | null): void;
+    changeMap(name: string, marker: string | null, areaPath: string, areaType: number): Promise<IChangeMapResult>;
 
     updatePersition(position: Vec3): void;
     updateAnimation(face: Vec2, anim: string): void;
@@ -24,9 +24,28 @@ export interface IConnection {
     updateEntityHealth(id: number | null, health: number): void;
     updateEntityState(id: number, state: string): void;
     updateEntityTarget(id: number, target: string | number | null): void;
+    // Real player profile (level/stats/equip) shown in the Social info box.
+    updatePlayerProfile(profile: IPlayerProfile): void;
+
+    // ---- social (lobby architecture) ----
+    friendAdd(name: string): void;
+    friendAccept(name: string): void;
+    friendDecline(name: string): void;
+    friendRemove(name: string): void;
+    friendList(): void;
+    friendRequests(): void;
+    partyInvite(name: string): void;
+    partyAccept(partyId: string): void;
+    partyDecline(partyId: string): void;
+    partyLeave(): void;
+    saveUpload(slot: string, data: string): void;
+    logout(): void;
+    // ---- lobby queries ----
+    roomPlayers(): void;
+    onlineCount(): void;
 
     onSetHost(callback:
-        (isHost: boolean) => void): void;
+        (isHost: boolean, map?: string) => void): void;
 
     onPlayerChangeMap(callback:
         (player: string, enters: boolean, position: Vec3, map: string, marker: string | null) => void): void;
@@ -54,4 +73,35 @@ export interface IConnection {
         (id: number, target: string | number | null) => void): void;
     onUpdateEntityHealth(callback:
         (id: number | string, health: number) => void): void;
+    onPlayerProfile(callback:
+        (player: string, profile: IPlayerProfile) => void): void;
+
+    // ---- social callbacks ----
+    onPresence(callback: (player: string, online: boolean) => void): void;
+    onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[] } | null) => void): void;
+    onPartyInvite(callback: (from: string, partyId: string) => void): void;
+    onFriendList(callback: (friends: Array<{ name: string, online: boolean }>) => void): void;
+    onFriendActionResult(callback: (result: any) => void): void;
+    onFriendRequest(callback: (from: string) => void): void;
+    onFriendRequests(callback: (requests: Array<{ name: string, online: boolean }>) => void): void;
+    // ---- lobby query callbacks ----
+    onRoomPlayers(callback: (players: string[]) => void): void;
+    onOnlineCount(callback: (count: number) => void): void;
+}
+
+export interface IChangeMapResult {
+    instanceId: string;
+    isHost: boolean;
+    members: Array<{ name: string, pos?: Vec3 }>;
+}
+
+/** A remote player's real profile, shown in the Social menu info box. All fields
+ * optional — we only display what the sender actually provided. */
+export interface IPlayerProfile {
+    level?: number;
+    hp?: number;
+    attack?: number;
+    defense?: number;
+    focus?: number;
+    equip?: { head?: number, leftArm?: number, rightArm?: number, torso?: number, feet?: number };
 }

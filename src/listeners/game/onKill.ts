@@ -12,7 +12,12 @@ export class OnEntityKilledListener {
 		ig.Entity.prototype.kill = function(this: ig.Entity, ...args: any) {
 			const converted = this as IMultiplayerEntity;
 			if (converted.multiplayerId) {
-				self.onEntityKilled(converted.multiplayerId);
+				// Enemy sync is host-authoritative: only the host broadcasts a kill.
+				// A client that receives a killEntity replays entity.kill() locally,
+				// which re-enters this hook — it must drop the id but NOT re-broadcast.
+				if (self.main.host) {
+					self.onEntityKilled(converted.multiplayerId);
+				}
 				delete (converted as any).multiplayerId;
 			}
 

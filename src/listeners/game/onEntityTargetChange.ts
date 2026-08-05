@@ -4,7 +4,9 @@ import { EntityListener } from './entityListener';
 
 export class OnEntityTargetChangeListener {
 
-	private last: ig.Entity | null = null;
+	// Dedup state is per-entity (keyed by multiplayerId). `undefined` = not yet
+	// seen, `null` = seen with no target (distinct so we send the initial state).
+	private last = new Map<number, ig.Entity | null>();
 
 	constructor(
         private main: Multiplayer,
@@ -25,9 +27,10 @@ export class OnEntityTargetChangeListener {
 
 	private onUpdate(entity: IMultiplayerEntity): void {
 		const target: ig.Entity | null = entity.target;
-		if (target !== this.last) {
+		const last = this.last.get(entity.multiplayerId);
+		if (last === undefined || target !== last) {
 			this.onEntityTargetChanged(entity);
-			this.last = target;
+			this.last.set(entity.multiplayerId, target);
 		}
 	}
 }

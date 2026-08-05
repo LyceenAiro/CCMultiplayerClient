@@ -1,5 +1,4 @@
 import * as esbuild from 'esbuild';
-import { cpSync, mkdirSync } from 'node:fs';
 
 const watch = process.argv.includes('--watch');
 
@@ -18,17 +17,12 @@ const buildOptions = {
 	logLevel: 'info',
 };
 
-// Ship the runtime assets (enemy definition + default server config) next to
-// the compiled module so CCLoader3 picks them up as mod assets. The repo keeps
-// game assets under `assets/assets/` and the server config under
-// `assets/config/`.
-function copyAssets() {
-	mkdirSync('dist', { recursive: true });
-	cpSync('assets/assets/data', 'dist/data', { recursive: true });
-	cpSync('assets/config', 'dist/config', { recursive: true });
-}
-
-copyAssets();
+// NOTE: we deliberately do NOT copy assets into dist/. CCLoader v2 discovers a
+// mod's game assets by scanning `<modRoot>/assets/`, and this repo already keeps
+// them in the right place (`assets/assets/data/...` -> game path
+// `data/enemies/multiplayer.json`, and `assets/config/config.json` -> the
+// runtime config the code reads at `<modRoot>/config/config.json`). Only the
+// compiled JS belongs in dist/.
 
 if (watch) {
 	const ctx = await esbuild.context(buildOptions);

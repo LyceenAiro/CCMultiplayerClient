@@ -10,7 +10,9 @@ export class OnKillEntityListener {
 	}
 
 	public onKillEntity(id: number): void {
-		if (!this.main.entities[id]) {
+		// Host-authoritative: the host's kills are driven by its own game logic,
+		// not by a bounced-back killEntity from the relay.
+		if (this.main.host || !this.main.entities[id]) {
 			return;
 		}
 

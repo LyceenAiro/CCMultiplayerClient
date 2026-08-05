@@ -17,6 +17,10 @@ declare global {
 		y: number;
 		z: number;
 	}
+
+	/** jQuery is loaded by the game; declared loosely for the overlay UI code. */
+	const $: any;
+	type JQuery = any;
 }
 
 export {};

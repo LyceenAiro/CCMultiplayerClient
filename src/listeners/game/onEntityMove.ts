@@ -4,7 +4,9 @@ import { EntityListener } from './entityListener';
 
 export class OnEntityMoveListener {
 
-	private last: Vec3 = {x: -1, y: -1, z: -1};
+	// Dedup state is per-entity (keyed by multiplayerId), not a single shared
+	// value — with multiple enemies a shared `last` flips every tick.
+	private last = new Map<number, Vec3>();
 
 	constructor(
         private main: Multiplayer,
@@ -23,10 +25,11 @@ export class OnEntityMoveListener {
 
 	private onUpdate(entity: IMultiplayerEntity): void {
 		const pos: Vec3 = entity.coll.pos;
+		const last = this.last.get(entity.multiplayerId);
 
-		if (!this.comparePosition(pos, this.last)) {
+		if (!last || !this.comparePosition(pos, last)) {
 			this.onEntityMoved(entity, pos);
-			this.copyPosition(pos, this.last);
+			this.last.set(entity.multiplayerId, {x: pos.x, y: pos.y, z: pos.z});
 		}
 	}
 
@@ -34,11 +37,5 @@ export class OnEntityMoveListener {
 		return left.x === right.x &&
             left.y === right.y &&
             left.z === right.z;
-	}
-
-	private copyPosition(from: Vec3, to: Vec3): void {
-		to.x = from.x;
-		to.y = from.y;
-		to.z = from.z;
 	}
 }

@@ -1,5 +1,5 @@
 import { IBallInfo } from '../ballInfo';
-import { IConnection } from '../connection';
+import { IConnection, IChangeMapResult, IPlayerProfile } from '../connection';
 import { Multiplayer } from '../multiplayer';
 import { IServer } from '../server';
 
@@ -45,7 +45,13 @@ export class SocketIoConnector implements IConnection {
 					this.setHost(result.host);
 
 					if (this.map && this.marker) {
-						this.changeMap(this.map, this.marker);
+						// Re-derive the area from the map name (currentPlayerArea may
+						// not be reliable during reconnect).
+						const idx = this.map.indexOf('.');
+						const areaPath = idx === -1 ? this.map : this.map.substring(0, idx);
+						const area = (sc.map as any).areas[areaPath];
+						const areaType = area && typeof area.areaType === 'number' ? area.areaType : 1;
+						this.changeMap(this.map, this.marker, areaPath, areaType);
 					}
 				}
 			}
@@ -53,7 +59,7 @@ export class SocketIoConnector implements IConnection {
 
 		await new Promise<void>((resolve, reject) => {
 			if (!this.socket) {
-				return reject();
+				return reject(new Error('[multiplayer] No socket created.'));
 			}
 
 			if (this.socket.connected) {
@@ -64,8 +70,10 @@ export class SocketIoConnector implements IConnection {
 				resolve();
 			});
 
-			this.socket.once('connect_error', () => {
-				reject();
+			// Surface the real reason (CORS, server down, bad port, ...) instead of
+			// an empty rejection, so the console shows something actionable.
+			this.socket.once('connect_error', (err: Error) => {
+				reject(new Error('[multiplayer] Could not connect to ' + this.address + ' — ' + (err && err.message ? err.message : 'connection failed')));
 			});
 		});
 	}
@@ -84,14 +92,17 @@ export class SocketIoConnector implements IConnection {
                 success: boolean,
                 username: string,
                 host: boolean,
-                mapName: string,
+                mapName: string | null,
+                save?: { slot: string, data: string } | null,
+                failed?: string,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null});
 				} else {
-					reject(data);
+					// The server rejects with {failed: "..."} — no `success` field.
+					reject(new Error('[multiplayer] Login rejected: ' + (data.failed || 'unknown reason')));
 				}
 			});
 
@@ -102,10 +113,14 @@ export class SocketIoConnector implements IConnection {
 			});
 		});
 	}
-	public changeMap(name: string, marker: string | null): void {
+	public changeMap(name: string, marker: string | null, areaPath: string, areaType: number): Promise<IChangeMapResult> {
 		this.map = name;
 		this.marker = marker;
-		this.socket.emit('changeMap', {name, marker});
+		const pos = ig.game.playerEntity ? { x: ig.game.playerEntity.coll.pos.x, y: ig.game.playerEntity.coll.pos.y, z: ig.game.playerEntity.coll.pos.z } : { x: 0, y: 0, z: 0 };
+		return new Promise<IChangeMapResult>((resolve) => {
+			this.socket.once('changeMapResponse', (data: IChangeMapResult) => resolve(data));
+			this.socket.emit('changeMap', {name, marker, areaPath, areaType, pos});
+		});
 	}
 	public updatePersition(position: Vec3): void {
 		this.socket.emit('updatePosition', position);
@@ -146,11 +161,19 @@ export class SocketIoConnector implements IConnection {
 	public updateEntityTarget(id: number, target: string | number | null): void {
 		this.socket.emit('updateEntityTarget', {id, target});
 	}
+	public updatePlayerProfile(profile: IPlayerProfile): void {
+		this.socket.emit('updatePlayerProfile', profile);
+	}
 
-	public onSetHost(callback: (isHost: boolean) => void): void {
+	public onSetHost(callback: (isHost: boolean, map?: string) => void): void {
 		this.setHost = callback;
-		this.socket.on('setHost', (isHost: boolean) => {
-			callback(isHost);
+		this.socket.on('setHost', (data: { isHost: boolean, map?: string } | boolean) => {
+			// Tolerate the legacy bare-boolean form.
+			if (typeof data === 'boolean') {
+				callback(data);
+			} else {
+				callback(data.isHost, data.map);
+			}
 		});
 	}
 
@@ -214,5 +237,85 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('updateEntityHealth', (data: any) => {
 			callback(data.id, data.hp);
 		});
+	}
+	public onPlayerProfile(callback: (player: string, profile: IPlayerProfile) => void): void {
+		this.socket.on('updatePlayerProfile', (data: any) => {
+			callback(data.player, data.profile);
+		});
+	}
+
+	// ---- social (lobby architecture) ----
+	public friendAdd(name: string): void {
+		this.socket.emit('friendAdd', { name });
+	}
+	public friendAccept(name: string): void {
+		this.socket.emit('friendAccept', { name });
+	}
+	public friendDecline(name: string): void {
+		this.socket.emit('friendDecline', { name });
+	}
+	public friendRemove(name: string): void {
+		this.socket.emit('friendRemove', { name });
+	}
+	public friendList(): void {
+		this.socket.emit('friendList');
+	}
+	public friendRequests(): void {
+		this.socket.emit('friendRequests');
+	}
+	public partyInvite(name: string): void {
+		this.socket.emit('partyInvite', { to: name });
+	}
+	public partyAccept(partyId: string): void {
+		this.socket.emit('partyAccept', { partyId });
+	}
+	public partyDecline(partyId: string): void {
+		this.socket.emit('partyDecline', { partyId });
+	}
+	public partyLeave(): void {
+		this.socket.emit('partyLeave');
+	}
+	public saveUpload(slot: string, data: string): void {
+		this.socket.emit('saveUpload', { slot, data });
+	}
+	public logout(): void {
+		this.socket.emit('logout');
+	}
+
+	// ---- lobby queries (Social-menu "房间玩家" tab + online counter) ----
+	public roomPlayers(): void {
+		this.socket.emit('roomPlayers');
+	}
+	public onlineCount(): void {
+		this.socket.emit('onlineCount');
+	}
+
+	public onPresence(callback: (player: string, online: boolean) => void): void {
+		this.socket.on('presence', (data: any) => callback(data.player, data.online));
+	}
+	public onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[] } | null) => void): void {
+		this.socket.on('partyUpdate', (data: any) => callback(data));
+	}
+	public onPartyInvite(callback: (from: string, partyId: string) => void): void {
+		this.socket.on('partyInvite', (data: any) => callback(data.from, data.partyId));
+	}
+	public onFriendList(callback: (friends: Array<{ name: string, online: boolean }>) => void): void {
+		this.socket.on('friendList', (data: any) => callback(data.friends));
+	}
+	public onFriendActionResult(callback: (result: any) => void): void {
+		this.socket.on('friendActionResult', (data: any) => callback(data));
+	}
+	public onFriendRequest(callback: (from: string) => void): void {
+		this.socket.on('friendRequest', (data: any) => callback(data.from));
+	}
+	public onFriendRequests(callback: (requests: Array<{ name: string, online: boolean }>) => void): void {
+		this.socket.on('friendRequests', (data: any) => callback(data.requests));
+	}
+	// ---- lobby query callbacks ----
+	public onRoomPlayers(callback: (players: string[]) => void): void {
+		this.socket.on('roomPlayers', (data: any) => callback(data.players));
+	}
+	public onOnlineCount(callback: (count: number) => void): void {
+		this.socket.on('onlineCount', (data: any) => callback(data.count));
 	}
 }

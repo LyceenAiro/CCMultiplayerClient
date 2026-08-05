@@ -20,7 +20,11 @@ export class OnPlayerHealthChangeListener {
 	}
 
 	private onUpdate(player: ig.ENTITY.Player): void {
-		const health = player.params.getStat('hp');
+		if (!player || !player.params) {
+			return;
+		}
+		// `currentHp` is the live health value; `getStat('hp')` returns the cap.
+		const health = player.params.currentHp;
 
 		if (health !== this.last) {
 			this.onPlayerHealthChanged(health);

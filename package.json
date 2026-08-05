@@ -6,15 +6,14 @@
 	"license": "MIT",
 	"author": "CCDirectLink",
 	"main": "dist/mod.js",
+	"assets": [
+		"data/enemies/multiplayer.json"
+	],
 	"ccmodDependencies": {
 		"crosscode": "^1.4.2",
 		"ccloader": "^2.22.0",
-		"simplify": "^2.14.0"
+		"Simplify": "^2.14.0"
 	},
-	"assets": [
-		"assets/data/enemies/multiplayer.json",
-		"config/config.json"
-	],
 	"scripts": {
 		"build": "node esbuild.config.mjs",
 		"watch": "node esbuild.config.mjs --watch",

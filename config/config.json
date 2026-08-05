@@ -1,12 +1,15 @@
 {
-	"servers": [{
-		"hostname": "localhost",
-		"port": 1423,
-		"type": "http"
-	},{
-		"display": "Public server (Germany)",
-		"hostname": "130.162.212.177",
-		"port": 1423,
-		"type": "http"
-	}]
+	"servers": [
+		{
+			"hostname": "localhost",
+			"port": 15151,
+			"type": "http"
+		},
+		{
+			"display": "Public server (Germany)",
+			"hostname": "130.162.212.177",
+			"port": 1423,
+			"type": "http"
+		}
+	]
 }
