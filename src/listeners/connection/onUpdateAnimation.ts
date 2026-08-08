@@ -27,7 +27,9 @@ export class OnUpdateAnimationListener {
 	private playAnimation(entity: ig.Entity, anim: string): void {
 		// The action-step `action` array is our own wire data; its element types
 		// are internal and version-sensitive, so we cast instead of matching the
-		// game's exact SHOW_ANIMATION settings shape.
+		// game's exact SHOW_ANIMATION settings shape. (Building the DO_ACTION step
+		// per frame is some GC churn, but this path is proven — the lower-level
+		// ig.Action run/inlineStart API isn't safe to call directly here.)
 		new ig.EVENT_STEP.DO_ACTION({
 			entity,
 			keepState: false,

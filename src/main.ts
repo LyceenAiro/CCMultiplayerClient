@@ -1,5 +1,7 @@
 import { Multiplayer } from './multiplayer';
 import { installSocialMenuButton } from './ui/socialMenuInject';
+import { installQuickMenuEnhancements } from './ui/quickMenuInject';
+import { installMpOptionsTab, startNameTagLoop } from './ui/mpOptions';
 
 /**
  * CCLoader v2 entry point.
@@ -29,6 +31,12 @@ async function startMultiplayer(): Promise<void> {
 		// the instance until a click actually happens.
 		installSocialMenuButton(() => multiplayer);
 
+		// Round 11: quick-menu (SHIFT) inspect enhancements — same lazy pattern.
+		installQuickMenuEnhancements(() => multiplayer);
+
+		// Round 12: mod-dedicated options tab (+ persistent player name tags).
+		installMpOptionsTab(() => multiplayer);
+
 		multiplayer = new Multiplayer();
 
 		console.log('[multiplayer] Loading..');
@@ -40,6 +48,9 @@ async function startMultiplayer(): Promise<void> {
 		multiplayer.initialize();
 
 		console.log('[multiplayer] Initialized');
+
+		// Per-frame name-tag pump (idempotent, reads the instance lazily).
+		startNameTagLoop(() => multiplayer);
 	} catch (e) {
 		console.error(e);
 	}

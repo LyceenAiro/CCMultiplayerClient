@@ -21,6 +21,10 @@ export class OnPlayerMoveListener {
 	}
 
 	private onUpdate(player: ig.ENTITY.Player): void {
+		// netSync's per-frame playerState stream already carries position; the legacy
+		// updatePosition packet is redundant on the wire (server relays it but no client
+		// listens). Skip to avoid double position traffic.
+		if (this.main.useNetSync) return;
 		const pos = player.coll.pos;
 
 		if (!this.comparePosition(pos, this.last)) {

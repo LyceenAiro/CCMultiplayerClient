@@ -12,14 +12,13 @@ export class OnThrownBallListener {
 
 	public onThrowBall(ballInfo: IBallInfo): void {
 		if (ballInfo.combatant === null) {
-			console.warn('[multiplayer] onThrowBall: combatant is null, dropping ball', ballInfo.ballInfo);
-			return;
+			return; // malformed; nothing to do
 		}
 
 		const entity = this.resolveEntity(ballInfo.combatant);
 		if (!entity) {
-			console.warn('[multiplayer] onThrowBall: could not resolve entity for combatant "' +
-				ballInfo.combatant + '" (mirror not spawned yet?), dropping ball', ballInfo.ballInfo);
+			// Mirror not spawned yet (they entered while we were loading a map). Skip
+			// this one ball quietly — the next update will land once their mirror is up.
 			return;
 		}
 
@@ -54,6 +53,6 @@ export class OnThrownBallListener {
 			return this.main.entities[combatant];
 		}
 
-		throw new Error('Malformed data in ballInfo.combatant received!');
+		return undefined;
 	}
 }

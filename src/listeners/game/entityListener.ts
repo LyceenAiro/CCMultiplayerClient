@@ -26,6 +26,7 @@ export class EntityListener {
 			return;
 		}
 
+		const __t0 = Date.now();
 		const entities = ig.game.entities;
 		for (let i = 0; i < entities.length; i++) {
 			const entity = ig.game.entities[i];
@@ -45,5 +46,9 @@ export class EntityListener {
 				}
 			}
 		}
+		// Diagnose combat stutter: if the per-frame enemy-sync work ever takes >4ms
+		// it can drop a frame. Log so we can see if THIS is the source of the hitch.
+		const __dt = Date.now() - __t0;
+		if (__dt > 4) console.warn('[multiplayer] EntityListener.onUpdate took ' + __dt + 'ms over ' + entities.length + ' entities');
 	}
 }

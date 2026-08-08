@@ -5,6 +5,8 @@ import { Multiplayer } from '../../multiplayer';
 export class OnEntitySpawnListener {
 	private unknownEntities: Array<string | typeof ig.Entity> = [];
 	private recursiveEntities: Array<string | typeof ig.Entity> = [];
+	/** Rate-limit for the null-enemyType spawn diagnostic (can be batchy). */
+	private lastNullTypeLog = 0;
 	private original!: <T extends ig.Entity>(type: string | (new(...args: any[]) => T),
 											x: number,
 											y: number,
@@ -24,11 +26,37 @@ export class OnEntitySpawnListener {
 			z: number,
 			settings: any,
 			showAppearEffects?: boolean) => {
-			if (settings && settings.skipHook) {
-				return this.original.call(ig.game, type, x, y, z, settings, showAppearEffects) as T;
-			}
-			return this.onEntitySpawned(type as string | typeof ig.Entity, x, y, z, settings, showAppearEffects) as T;
+			const entity = (settings && settings.skipHook)
+				? this.original.call(ig.game, type, x, y, z, settings, showAppearEffects) as T
+				: this.onEntitySpawned(type as string | typeof ig.Entity, x, y, z, settings, showAppearEffects) as T;
+			// Enemy.init leaves enemyType null when settings lack enemyInfo — such an
+			// enemy is INVISIBLE and crashes in onKill. Repair when the type is
+			// recoverable, otherwise log a stack so we can find the offending spawner.
+			this.verifyEnemyType(type, entity, settings);
+			return entity;
 		};
+	}
+
+	private verifyEnemyType(type: string | (new(...args: any[]) => ig.Entity), entity: any, settings: any): void {
+		try {
+			// NOTE: the engine's EnemySpawner spawns with the CONSTRUCTOR
+			// (ig.ENTITY.Enemy), not the string 'Enemy' — accept both forms.
+			const isEnemy = type === 'Enemy' || type === (ig.ENTITY as any).Enemy;
+			if (!isEnemy || !entity || entity.enemyType) return;
+			const t = settings && settings.enemyInfo && settings.enemyInfo.type;
+			if (t) {
+				entity.enemyType = new sc.EnemyType(t);
+				entity.enemyName = entity.enemyName || t;
+				console.warn('[multiplayer] repaired NULL enemyType post-spawn (type=' + t + ')');
+			} else {
+				const now = Date.now();
+				if (now - this.lastNullTypeLog > 2000) {
+					this.lastNullTypeLog = now;
+					console.warn('[multiplayer] Enemy spawned WITHOUT enemyInfo (invisible until killed; onKill guarded). stack: '
+						+ ((new Error().stack || '').split('\n').slice(1, 6).join(' <- ')));
+				}
+			}
+		} catch (_) { /* diagnostics must never break a spawn */ }
 	}
 
 	public onEntitySpawned(type: string | typeof ig.Entity,
@@ -97,7 +125,11 @@ export class OnEntitySpawnListener {
 		if (entity && !entity.multiplayerId) {
 			entity.settings = settings;
 
-			if (this.main.host) {
+			// Under the new block sync the host does NOT register/broadcast enemies here —
+			// it streams the whole map's enemy state (keyed by stable mapId) at ~15Hz and
+			// members spawn their own puppets. Skip registration so entities stay
+			// multiplayerId-free (which is exactly what netSync's sendEnemyBlock expects).
+			if (this.main.host && !this.main.useNetSync) {
 				const mid = this.main.registerEntity(entity);
 
 				// TODO: improve this (Maybe with a white/blacklist?)

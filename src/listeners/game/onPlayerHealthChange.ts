@@ -2,7 +2,8 @@ import { Multiplayer } from '../../multiplayer';
 import { PlayerListener } from './playerListener';
 
 export class OnPlayerHealthChangeListener {
-	private last = 0;
+	private lastHp = -1;
+	private lastSp = -1;
 
 	constructor(
         private main: Multiplayer,
@@ -15,20 +16,27 @@ export class OnPlayerHealthChangeListener {
 		});
 	}
 
-	public onPlayerHealthChanged(health: number): void {
-		this.main.connection.updateEntityHealth(null, health);
-	}
-
 	private onUpdate(player: ig.ENTITY.Player): void {
 		if (!player || !player.params) {
 			return;
 		}
-		// `currentHp` is the live health value; `getStat('hp')` returns the cap.
-		const health = player.params.currentHp;
+		const params: any = player.params;
+		const hp = params.currentHp;
+		const sp = params.currentSp;
 
-		if (health !== this.last) {
-			this.onPlayerHealthChanged(health);
-			this.last = health;
+		// Push whenever HP or SP changes (near-real-time). updatePlayerStats is
+		// player-scoped (not host-gated) and feeds the in-game party HUD directly.
+		if (hp !== this.lastHp || sp !== this.lastSp) {
+			this.lastHp = hp;
+			this.lastSp = sp;
+			try {
+				(this.main.connection as any).updatePlayerStats({
+					hp,
+					maxHp: params.getStat ? params.getStat('hp') : 0,
+					sp,
+					maxSp: params.maxSp,
+				});
+			} catch (e) { /* ignore */ }
 		}
 	}
 }

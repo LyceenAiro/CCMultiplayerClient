@@ -26,6 +26,9 @@ export class OnSetHostListener {
 
 		if (isHost) {
 			this.unlockEntities();
+			// New sync: our puppet enemies are position-locked + animation-pinned, so
+			// respawn them as fresh AI-driven enemies before we take over as authority.
+			try { this.main.onPromotedToHost && this.main.onPromotedToHost(); } catch (e) { /* ignore */ }
 			console.log('[multiplayer] This user is now the host of ' + (map || 'this map') + '!');
 		} else {
 			this.lockEntities();
@@ -103,7 +106,8 @@ export class OnSetHostListener {
 		let protectedState = entity.currentState;
 		Object.defineProperty(entity, 'currentState', {
 			get() { return protectedState; },
-			set(data) { if (data.protected) { protectedState = data.protected; } },
+			// Engine cleanup assigns currentState = null; guard so that doesn't throw.
+			set(data) { if (data && data.protected) { protectedState = data.protected; } },
 		});
 	}
 }

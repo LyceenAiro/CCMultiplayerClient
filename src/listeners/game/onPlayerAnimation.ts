@@ -22,6 +22,9 @@ export class OnPlayerAnimationListener {
 	}
 
 	private onUpdate(player: ig.ENTITY.Player): void {
+		// netSync's per-frame playerState stream already carries anim+face; skip the
+		// legacy updateAnimation packet to avoid duplicate traffic.
+		if (this.main.useNetSync) return;
 		// `currentAnim` may be an animation-set object rather than a plain string
 		// in 1.4.x; normalise it to the animation name before sending.
 		const animation = this.animName(player.currentAnim);

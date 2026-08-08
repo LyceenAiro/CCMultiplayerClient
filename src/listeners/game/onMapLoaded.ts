@@ -16,11 +16,15 @@ export class OnMapLoadedListener {
 	}
 
 	public afterUpdate(): void {
-		if (!this.main.loadingMap && ig.ready) {
-			while (this.main.futureEntities.length > 0) {
-				this.main.spawnMultiplayerEntity(this.main.futureEntities[0]);
-				this.main.futureEntities.shift();
-			}
+		// Flush pending enemy-mirror spawns ONLY once the map has fully finished
+		// loading (loadingComplete -> not teleporting). Flushing earlier (bare
+		// ig.ready) fires while map resources are still streaming in, so the
+		// EnemyType.load() inside spawnMultiplayerEntity misses the resource batch
+		// and the mirror spawns invisible/broken (looks like a "frozen" enemy).
+		if (this.main.loadingMap || ig.game.isTeleporting()) return;
+		while (this.main.futureEntities.length > 0) {
+			this.main.spawnMultiplayerEntity(this.main.futureEntities[0]);
+			this.main.futureEntities.shift();
 		}
 	}
 }

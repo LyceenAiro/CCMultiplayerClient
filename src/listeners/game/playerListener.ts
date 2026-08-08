@@ -21,9 +21,12 @@ export class PlayerListener {
 		const player = ig.game.playerEntity;
 
 		if (player && !this.main.loadingMap) {
+			const __t0 = Date.now();
 			for (const child of this.children) {
 				child(player);
 			}
+			const __dt = Date.now() - __t0;
+			if (__dt > 4) console.warn('[multiplayer] PlayerListener.onUpdate took ' + __dt + 'ms');
 		}
 	}
 }

@@ -12,10 +12,11 @@ export class OnEntityKilledListener {
 		ig.Entity.prototype.kill = function(this: ig.Entity, ...args: any) {
 			const converted = this as IMultiplayerEntity;
 			if (converted.multiplayerId) {
-				// Enemy sync is host-authoritative: only the host broadcasts a kill.
-				// A client that receives a killEntity replays entity.kill() locally,
-				// which re-enters this hook — it must drop the id but NOT re-broadcast.
-				if (self.main.host) {
+				// With the new block sync, host kills are conveyed by the enemy simply
+				// being ABSENT from the host's next state block (members kill it then) —
+				// there is no killEntity round-trip to suppress. Only the legacy per-id
+				// path broadcasts here.
+				if (self.main.host && !(self.main as any).useNetSync) {
 					self.onEntityKilled(converted.multiplayerId);
 				}
 				delete (converted as any).multiplayerId;
