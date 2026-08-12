@@ -15,14 +15,10 @@
 
 const enDict: { [key: string]: string } = {
     // socialOverlay.ts — friend-request toast + comm-call dialog + F8 command box
-    friendRequestSuffix: ' sent you a friend request',
     accept: 'Accept',
     decline: 'Decline',
-    commIncoming: 'INCOMING COMM',
-    commFrom: 'Caller: ',
     commAccept: 'Accept Party',
     commDecline: 'Decline',
-    commInviteMsg: ' invites you to team up — will you travel together?',
     cmdBoxTitle: 'Commands (Enter to run / F8 to close)',
     // Round 19: party invites / teleports auto-declined while in a cutscene.
     inviteBusy: 'In a cutscene — party invite declined automatically',
@@ -43,9 +39,6 @@ const enDict: { [key: string]: string } = {
     addFriendChip: 'Add Friend',
     infoBlockHost: 'Block Host',
     infoOnlinePlayer: 'Online Player',
-    addFriendTitle: 'Add Friend',
-    addFriendPh: 'Player name',
-    addFriendSend: 'Send Request',
 
     // quickMenuInject.ts — quick-menu inspect boxes
     addFriend: 'Add Friend',
@@ -53,6 +46,13 @@ const enDict: { [key: string]: string } = {
     levelLabel: 'Lv ',
     expLabel: 'EXP ',
     hpLabel: 'HP ',
+
+    // netBadge.ts — network-quality badge tooltips
+    netPingLabel: 'Ping',
+    netLossLabel: 'Loss',
+    memberLevel: 'Lv.',
+    // Round 27 (item 2): off-map teammate badge/portrait tooltip.
+    notInSameRoom: 'Not in the same room',
 
     // mpOptions.ts — mod options tab
     optionsTab: 'Multiplayer',
@@ -66,6 +66,14 @@ const enDict: { [key: string]: string } = {
     optLeaderGoldDesc: "Renders the party leader's name tag in gold.",
     optShowPing: 'Show Ping',
     optShowPingDesc: 'Shows your current network latency (ms) next to your name tag, updated every second.',
+    optHostTick: 'Host Tick Rate',
+    optHostTickDesc: 'Enemy state sync rate when you are the host of a map (15/30/60). Takes effect the next time you become the host.',
+    optPlayerStateRate: 'Position sync rate',
+    optPlayerStateRateDesc: 'Your own position/state update rate (10/20/30/60 Hz). Applies immediately.',
+    optNetDebug: 'Show Network Debug',
+    optNetDebugDesc: 'Shows a bottom-right overlay with your upload/download data rates and packet loss while playing.',
+    optNetDebugCum: 'Net Debug Totals',
+    optNetDebugCumDesc: 'Extends the network debug overlay with cumulative upload/download totals.',
     optTagAlpha: 'Name Tag Opacity',
     optTagAlphaDesc: "Adjusts the opacity of the name tag's dark background.",
     optTagSize: 'Name Tag Size',
@@ -87,18 +95,70 @@ const enDict: { [key: string]: string } = {
     deathAllDown: 'All party members down — loading last checkpoint…',
     deathCountdown: 'Respawning in {n}s',
     deathSoon: 'Respawning soon…',
+    // Round 23: save-success toast (shown when the server confirms an upload).
+    toastSaveDone: 'Save uploaded',
+
+    // round 23 wave 3 — social overhaul (add-friend search flow)
+    searchTitle: 'Search Players',
+    searchPh: 'Player name',
+    searchBtn: 'Search',
+    searchRequired: 'Enter a player name to search',
+    searching: 'Searching…',
+    searchFailed: 'Search failed',
+    searchNoResults: 'No matching players found',
+    friendAddBtn: 'Send friend request',
+    alreadyFriends: 'Already friends',
+    requestPending: 'Request pending',
+    botNotUnlocked: 'Not unlocked yet',
+    friendCannotSelf: "You can't add yourself",
+    friendRequestSentToast: 'Friend request sent',
+    friendActionFailed: 'Action failed',
+    // round 23 wave 3 — 申请管理 (Requests) tab
+    requestsTab: 'Requests',
+    reqAcceptTitle: 'Accept friend request',
+    reqWithdraw: 'Withdraw request',
+    reqWithdrawTitle: 'Withdraw request',
+    // round 23 wave 3 — party-invite busy + friend-remove confirm
+    partyInviteBusy: 'They have a pending invite',
+    confirmRemoveFriendTitle: 'Remove Friend',
+    confirmRemoveFriendMsg: 'Remove {name} from friends?',
+    confirmOk: 'Confirm',
+    confirmCancel: 'Cancel',
+    // round 23 wave 3 — notifications (showMpToast)
+    friendAddedToast: 'You and {name} are now friends',
+    friendRequestReceivedToast: '{name} sent you a friend request',
+    friendRequestWithdrawnToast: '{name} withdrew the friend request',
+    friendRequestDeclinedToast: '{name} declined your friend request',
+    partyMemberJoined: '{name} joined the party',
+    partyMemberLeft: '{name} left the party',
+    partyMemberKicked: '{name} was kicked from the party',
+    partyMemberDisconnected: '{name} disconnected from the party',
+    // round 23 wave 4 — party chat (chatBox.ts)
+    chatPlaceholder: 'Type a message, Enter to send…',
+    chatSend: 'Send',
+    chatNotInParty: 'Not in a party — party chat unavailable',
+    // round 24 — save-toast toggle + simplified party-invite popup
+    optShowSaveToast: 'Show Save Toast',
+    optShowSaveToastDesc: 'Shows a toast when your save has been uploaded to the server.',
+    commInviteSimple: '{name} invites you to party',
+
+    // round 27 — full-screen "downloading cloud save" block overlay (multiplayer.ts launchGame)
+    saveDlTitle: 'Downloading Cloud Save',
+    saveDlIndeterminate: 'Downloading cloud save…',
+    saveDlProgress: 'Downloading cloud save… {pct}%',
+    saveDlFailed: 'Cloud save download failed — starting without it',
+    // round 27 (item 5) — exit-to-title save UPLOAD dialog (same overlay as the download)
+    saveUpTitle: 'Uploading Save',
+    saveUpIndeterminate: 'Uploading save before returning to title…',
+    saveUpFailed: 'Save upload failed — returning to title anyway',
 };
 
 const zhDict: { [key: string]: string } = {
     // socialOverlay.ts — friend-request toast + comm-call dialog + F8 command box
-    friendRequestSuffix: ' 请求添加你为好友',
     accept: '接受',
     decline: '拒绝',
-    commIncoming: '正在接入通讯 · INCOMING COMM',
-    commFrom: '呼叫方：',
     commAccept: '接受组队',
     commDecline: '拒绝',
-    commInviteMsg: ' 向你发起组队请求——是否接受与 TA 结伴同行？',
     cmdBoxTitle: '命令 (回车执行 / F8 关闭)',
     // Round 19: party invites / teleports auto-declined while in a cutscene.
     inviteBusy: '过场动画中，已自动拒绝组队邀请',
@@ -119,9 +179,6 @@ const zhDict: { [key: string]: string } = {
     addFriendChip: '加好友',
     infoBlockHost: '当前区块主机',
     infoOnlinePlayer: '在线玩家',
-    addFriendTitle: '加好友',
-    addFriendPh: '玩家名',
-    addFriendSend: '发送请求',
 
     // quickMenuInject.ts — quick-menu inspect boxes
     addFriend: '加好友',
@@ -129,6 +186,13 @@ const zhDict: { [key: string]: string } = {
     levelLabel: '等级 ',
     expLabel: '经验 ',
     hpLabel: 'HP ',
+
+    // netBadge.ts — network-quality badge tooltips
+    netPingLabel: '延迟',
+    netLossLabel: '丢包',
+    memberLevel: '等级',
+    // Round 27 (item 2): off-map teammate badge/portrait tooltip.
+    notInSameRoom: '不在同一房间',
 
     // mpOptions.ts — mod options tab
     optionsTab: '多人',
@@ -142,6 +206,14 @@ const zhDict: { [key: string]: string } = {
     optLeaderGoldDesc: '开启后，队伍队长的名字以金色显示',
     optShowPing: '显示ping值',
     optShowPingDesc: '开启后，自己名字标签旁显示当前网络延迟(毫秒)，每秒更新一次',
+    optHostTick: '主机同步频率',
+    optHostTickDesc: '作为地图主机时敌人状态同步频率(15/30/60)，下一次作为主机时生效',
+    optPlayerStateRate: '位置同步频率',
+    optPlayerStateRateDesc: '自身位置/状态同步频率(10/20/30/60Hz)，调整后立即生效',
+    optNetDebug: '显示网络调试',
+    optNetDebugDesc: '开启后，游玩时屏幕右下角显示每秒上传/下载数据量与丢包率',
+    optNetDebugCum: '网络调试累计量',
+    optNetDebugCumDesc: '开启后，在网络调试基础上额外显示累计上传/下载数据量',
     optTagAlpha: '名字背景透明度',
     optTagAlphaDesc: '调整名字标签深色背景的透明度',
     optTagSize: '名字字体大小',
@@ -163,6 +235,62 @@ const zhDict: { [key: string]: string } = {
     deathAllDown: '全队阵亡 — 正在读取最近存档点…',
     deathCountdown: '复活倒计时：{n} 秒',
     deathSoon: '即将复活…',
+    // Round 23: save-success toast (shown when the server confirms an upload).
+    toastSaveDone: '存档已保存并上传',
+
+    // round 23 wave 3 — social overhaul (add-friend search flow)
+    searchTitle: '搜索玩家',
+    searchPh: '玩家名',
+    searchBtn: '搜索',
+    searchRequired: '请输入要搜索的玩家名',
+    searching: '搜索中…',
+    searchFailed: '搜索失败',
+    searchNoResults: '没有找到相关玩家',
+    friendAddBtn: '发送好友申请',
+    alreadyFriends: '已是好友',
+    requestPending: '申请已发送，等待对方处理',
+    botNotUnlocked: '剧情尚未解锁',
+    friendCannotSelf: '不能添加自己',
+    friendRequestSentToast: '申请已发送',
+    friendActionFailed: '操作失败',
+    // round 23 wave 3 — 申请管理 (Requests) tab
+    requestsTab: '申请管理',
+    reqAcceptTitle: '接受好友申请',
+    reqWithdraw: '撤回申请',
+    reqWithdrawTitle: '撤回好友申请',
+    // round 23 wave 3 — party-invite busy + friend-remove confirm
+    partyInviteBusy: '对方正在处理其他邀请',
+    confirmRemoveFriendTitle: '删除好友',
+    confirmRemoveFriendMsg: '确定要删除好友 {name} 吗？',
+    confirmOk: '确认',
+    confirmCancel: '取消',
+    // round 23 wave 3 — notifications (showMpToast)
+    friendAddedToast: '你与 {name} 成为了好友',
+    friendRequestReceivedToast: '{name} 向你发送了好友申请',
+    friendRequestWithdrawnToast: '{name} 撤回了好友申请',
+    friendRequestDeclinedToast: '{name} 拒绝了你的好友申请',
+    partyMemberJoined: '{name} 加入了队伍',
+    partyMemberLeft: '{name} 离开了队伍',
+    partyMemberKicked: '{name} 被踢出了队伍',
+    partyMemberDisconnected: '{name} 断线离开了队伍',
+    // round 23 wave 4 — party chat (chatBox.ts)
+    chatPlaceholder: '输入消息，回车发送…',
+    chatSend: '发送',
+    chatNotInParty: '你不在队伍中，无法发送小队消息',
+    // round 24 — 保存提示开关 + 简化版组队邀请弹窗
+    optShowSaveToast: '显示保存提示',
+    optShowSaveToastDesc: '存档成功上传到服务器后显示提示通知',
+    commInviteSimple: '{name} 邀请你组队',
+
+    // round 27 — 下载云端存档时的全屏等待提示 (multiplayer.ts launchGame)
+    saveDlTitle: '正在下载云端存档',
+    saveDlIndeterminate: '正在下载云端存档…',
+    saveDlProgress: '正在下载云端存档… {pct}%',
+    saveDlFailed: '云端存档下载失败，将以本地存档开始游戏',
+    // round 27 (item 5) — 返回标题前的存档上传弹窗（与下载共用同一覆盖层）
+    saveUpTitle: '正在上传存档',
+    saveUpIndeterminate: '正在上传存档，完成后将返回标题…',
+    saveUpFailed: '存档上传失败，仍将返回标题',
 };
 
 let cached: { [key: string]: string } | null = null;

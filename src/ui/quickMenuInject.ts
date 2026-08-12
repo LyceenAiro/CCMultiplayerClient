@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
+import { confirmRemoveFriendMp } from './socialMenuInject';
 
 /**
  * Quick-menu (SHIFT) inspect enhancements:
@@ -413,10 +414,20 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 const m = getMain();
                 if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername) return;
                 if (this._mpIsFriend) {
-                    m.connection.friendRemove(this._mpUsername);
-                    this._mpIsFriend = false;
-                    this.friendBtn.setText(t('addFriend'), true);
-                    console.log('[multiplayer] quick-menu: removed friend ' + this._mpUsername);
+                    // Round 23 review: route through the same confirm window the
+                    // social menu uses — an accidental click must not silently drop
+                    // a friend. The actual remove only fires on 确认.
+                    const username = this._mpUsername;
+                    const self = this;
+                    confirmRemoveFriendMp(username, () => {
+                        try {
+                            const m2 = getMain();
+                            if (m2 && m2.connection) m2.connection.friendRemove(username);
+                            if (self._mpIsFriend !== undefined) self._mpIsFriend = false;
+                            if (self.friendBtn) self.friendBtn.setText(t('addFriend'), true);
+                            console.log('[multiplayer] quick-menu: removed friend ' + username);
+                        } catch (_) { /* the inspect box may be gone; the server list refresh confirms */ }
+                    });
                 } else {
                     // friendAdd sends a REQUEST (mutual only after the target accepts,
                     // or instantly if they had already requested us) — reflect that.
@@ -570,11 +581,15 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 this.levelLine.setText(t('levelLabel') + lvl);
                 const exp = mdl && typeof mdl.exp === 'number' ? String(mdl.exp) : '?';
                 this.expLine.setText(t('expLabel') + exp);
-                const cur = mdl && mdl.params ? mdl.params.currentHp : null;
+                let cur: any = mdl && mdl.params ? mdl.params.currentHp : null;
                 let max: any = null;
                 if (mdl && mdl.params && typeof mdl.params.getStat === 'function') {
                     try { max = mdl.params.getStat('hp'); } catch (_) { max = null; }
                 }
+                // Round 22: a dead teammate's HP is stored as -maxHp (the HpHudBarGui
+                // flash trigger) — display-only clamp so the inspect box never shows a
+                // negative number.
+                if (typeof cur === 'number') cur = Math.max(0, cur);
                 this.hpLine.setText(t('hpLabel') + (cur == null ? '?' : cur) + ' / ' + (max == null ? '?' : max));
             } catch (_) { /* ignore */ }
         },

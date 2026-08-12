@@ -13,7 +13,10 @@ export class SocialOverlay {
     /** Currently open comm-invite dialog (one at a time). */
     private commBox: JQuery | null = null;
     private commTimer: number | null = null;
-    private commTypeTimer: number | null = null;
+    /** Round 24: cached in-game comm notification sound (calling.ogg — the ring the
+     * engine plays on an incoming bot comm message). Reused across invites like the
+     * game reuses its own sound objects. */
+    private commRing: any = null;
 
     constructor(private main: Multiplayer) { }
 
@@ -57,24 +60,29 @@ export class SocialOverlay {
     }
 
     /** Round 19: a transient, non-modal toast (used for the cutscene auto-decline
-     * and teleport-refusal feedback). Auto-removes after 3s; never steals focus. */
+     * and teleport-refusal feedback). Auto-removes after 3s; never steals focus.
+     * Round 24: styled as .mpCommToast (NOT .mpToast) so the top-right stacked
+     * toasts from ui/toasts.ts can never be overridden to render center-screen. */
     public showToast(message: string): void {
         try {
             this.ensureCommStyle();
-            const box = $('<div class="mpToast"></div>');
+            const box = $('<div class="mpCommToast"></div>');
             box.text(String(message));
             $(document.body).append(box);
             window.setTimeout(() => { box.remove(); }, 3000);
         } catch (_) { /* a toast must never break the caller */ }
     }
 
-    /** Toast for an incoming FRIEND request (accept makes the friendship mutual). */
-    public friendRequestToast(from: string): void {
-        const conn = this.main.connection;
-        this.flash(from + t('friendRequestSuffix'), [
-            { label: t('accept'), cb: () => conn.friendAccept(from) },
-            { label: t('decline'), cb: () => conn.friendDecline(from) },
-        ]);
+    /** Round 24: play the in-game comm notification ring — the same calling.ogg the
+     * engine plays on an incoming bot comm message. Copied idiom: the game caches
+     * `new ig.Sound(path, volume)` on the GUI and calls `.play(loop)`; we play a
+     * single (non-looping) iteration. Guarded — a missing/blocked sound must never
+     * break the invite. */
+    private playInviteRing(): void {
+        try {
+            if (!this.commRing) this.commRing = new (ig as any).Sound('media/sound/hud/calling.ogg', 1);
+            this.commRing.play(false);
+        } catch (_) { /* a sound must never break the invite */ }
     }
 
     // ---- immersive comm-call invite dialog ----
@@ -85,35 +93,28 @@ export class SocialOverlay {
         const style = document.createElement('style');
         style.id = 'mpCommStyle';
         style.textContent = `
+/* Round 23 wave 3: the party invite popup now lives on the RIGHT side, vertically
+   centered (like LoL's surrender-vote box) instead of bottom-center. Same navy/
+   cyan palette as the login panel; the draining bar auto-declines at 20s.
+   Round 24: the popup is simplified — a single message line + the two buttons +
+   the draining bar (the old blinking header is gone). The transient cutscene/
+   teleport toast uses .mpCommToast (NOT .mpToast) so it can never hijack the
+   top-right stacked toasts from ui/toasts.ts (round-24 cascade fix). */
 .mpComm {
-    position: fixed; left: 50%; bottom: 14%;
-    transform: translateX(-50%);
-    width: 560px; max-width: 92vw;
+    position: fixed; right: 24px; top: 50%;
+    transform: translateY(-50%);
+    width: 340px; max-width: 92vw;
     background: rgba(6, 18, 30, 0.94);
     border: 2px solid #6fc7ff; border-radius: 6px;
     box-shadow: 0 0 18px rgba(111, 199, 255, 0.35), inset 0 0 26px rgba(13, 42, 66, 0.8);
     color: #eaf7ff; font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
-    z-index: 10000; padding: 12px 16px 14px 16px;
+    z-index: 10000; padding: 14px 16px;
     animation: mpCommIn 0.22s ease-out;
 }
-@keyframes mpCommIn { from { opacity: 0; transform: translateX(-50%) translateY(26px); }
-                      to   { opacity: 1; transform: translateX(-50%) translateY(0); } }
-.mpCommHead { display: flex; align-items: center; gap: 8px;
-    border-bottom: 1px solid rgba(111,199,255,0.4); padding-bottom: 6px; margin-bottom: 10px; }
-.mpCommDot { width: 9px; height: 9px; border-radius: 50%; background: #7dffa8;
-    box-shadow: 0 0 8px #7dffa8; animation: mpBlink 1.1s infinite; }
-@keyframes mpBlink { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
-.mpCommTag { font-size: 11px; letter-spacing: 2px; color: #8fd6ff; }
-.mpCommFrom { margin-left: auto; font-size: 12px; color: #bfe8ff; }
-.mpCommBody { display: flex; gap: 12px; align-items: flex-start; }
-.mpCommAvatar { flex: 0 0 46px; width: 46px; height: 46px; border-radius: 50%;
-    background: linear-gradient(135deg, #2c5d7c, #123248);
-    border: 2px solid #6fc7ff; color: #dff3ff;
-    font-size: 22px; font-weight: bold; text-align: center; line-height: 44px; }
-.mpCommMsg { flex: 1 1 auto; font-size: 14px; line-height: 1.55; min-height: 44px; color: #eaf7ff; }
-.mpCommMsg .mpCaret { display: inline-block; width: 7px; background: #8fd6ff;
-    animation: mpBlink 0.8s infinite; }
-.mpCommBtns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+@keyframes mpCommIn { from { opacity: 0; transform: translateY(26px); }
+                      to   { opacity: 1; transform: translateY(0); } }
+.mpCommMsg { font-size: 14px; line-height: 1.55; margin-bottom: 12px; color: #eaf7ff; }
+.mpCommBtns { display: flex; justify-content: flex-end; gap: 10px; }
 .mpCommBtn { min-width: 96px; padding: 5px 14px; cursor: pointer;
     background: rgba(18, 50, 72, 0.9); color: #dff3ff;
     border: 1px solid #6fc7ff; border-radius: 4px;
@@ -121,11 +122,13 @@ export class SocialOverlay {
 .mpCommBtn:hover { background: rgba(46, 104, 142, 0.95); box-shadow: 0 0 8px rgba(111,199,255,0.6); }
 .mpCommBtn.mpPrimary { background: rgba(31, 111, 74, 0.9); border-color: #7dffa8; color: #eafff2; }
 .mpCommBtn.mpPrimary:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 8px rgba(125,255,168,0.6); }
-.mpCommBar { height: 3px; margin-top: 10px; background: rgba(111,199,255,0.25); border-radius: 2px; overflow: hidden; }
-.mpCommBarFill { height: 100%; width: 100%; background: #6fc7ff;
+/* Reverse progress bar: starts FULL and drains over the 20s window; when it empties
+   the invite auto-declines (the JS setTimeout in showCommInvite). */
+.mpCommBar { height: 6px; margin-top: 12px; background: rgba(111,199,255,0.25); border-radius: 3px; overflow: hidden; }
+.mpCommBarFill { height: 100%; width: 100%; background: linear-gradient(90deg, #6fc7ff, #7dffa8);
     animation: mpCommCountdown 20s linear forwards; }
 @keyframes mpCommCountdown { from { width: 100%; } to { width: 0%; } }
-.mpToast { position: fixed; left: 50%; top: 22%; transform: translateX(-50%);
+.mpCommToast { position: fixed; left: 50%; top: 22%; transform: translateX(-50%);
     max-width: 80vw; padding: 8px 16px; z-index: 10001;
     background: rgba(6, 18, 30, 0.94); border: 1px solid #6fc7ff; border-radius: 4px;
     color: #eaf7ff; font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
@@ -135,24 +138,22 @@ export class SocialOverlay {
         document.head.appendChild(style);
     }
 
-    /** In-game COMM-style party invite: portrait + typewriter message + accept/decline,
-     * auto-declines after 20s. Replaces a previous invite if one is still open. */
+    /** Round 23 wave 3: right-side party invite (LoL-style surrender-vote box).
+     * Round 24: simplified — ONE message line + 接受/拒绝 + a reverse progress bar
+     * draining over 20s. When it empties -> auto-decline + close (same decline logic
+     * as before). One popup at a time — a new invite replaces the old
+     * (closeComm(true) first). Non-blocking: the player can keep playing while it's up. */
     private showCommInvite(from: string, partyId: string): void {
         this.closeComm(true);
         this.ensureCommStyle();
         const conn = this.main.connection;
         const box = $('<div class="mpComm"></div>');
-        const initial = (from || '?').charAt(0).toUpperCase();
-        box.append(
-            '<div class="mpCommHead"><span class="mpCommDot"></span>'
-            + '<span class="mpCommTag">' + t('commIncoming') + '</span>'
-            + '<span class="mpCommFrom">' + t('commFrom') + $('<i>').text(from).html() + '</span></div>'
-            + '<div class="mpCommBody">'
-            + '<div class="mpCommAvatar">' + $('<i>').text(initial).html() + '</div>'
-            + '<div class="mpCommMsg"><span class="mpCommText"></span><span class="mpCaret">&nbsp;</span></div>'
-            + '</div>'
-            + '<div class="mpCommBtns"></div>'
-            + '<div class="mpCommBar"><div class="mpCommBarFill"></div></div>');
+        // Round 24: the header (blinking dot + title + caller line) is gone — the
+        // popup is just the message, the two buttons and the draining bar.
+        const msg = $('<div class="mpCommMsg"></div>').text(t('commInviteSimple').replace('{name}', from));
+        box.append(msg);
+        box.append('<div class="mpCommBtns"></div>');
+        box.append('<div class="mpCommBar"><div class="mpCommBarFill"></div></div>');
         const btns = box.find('.mpCommBtns');
         const accept = $('<button class="mpCommBtn mpPrimary">' + t('commAccept') + '</button>');
         const decline = $('<button class="mpCommBtn">' + t('commDecline') + '</button>');
@@ -161,20 +162,15 @@ export class SocialOverlay {
         btns.append(accept).append(decline);
         $(document.body).append(box);
         this.commBox = box;
-        ig.system.setFocusLost();
-        // Typewriter message.
-        const text = from + t('commInviteMsg');
-        const msgEl = box.find('.mpCommText');
-        let i = 0;
-        this.commTypeTimer = window.setInterval(() => {
-            i++;
-            msgEl.text(text.slice(0, i));
-            if (i >= text.length) {
-                if (this.commTypeTimer !== null) { clearInterval(this.commTypeTimer); this.commTypeTimer = null; }
-                box.find('.mpCaret').remove();
-            }
-        }, 45);
-        // Auto-decline after 20s (matches the CSS countdown bar).
+        // Round 24: the in-game comm notification ring — the same calling.ogg the
+        // engine plays on an incoming bot comm message (ig.EVENT_STEP.RING_PRIVATE_MSG
+        // -> sc.model.message.ringPrivateMessage -> PrivateMessageBGGui sound.incoming).
+        // Played ONCE, only now that the popup is actually up.
+        this.playInviteRing();
+        // Non-blocking: do NOT steal the game's focus (like LoL's vote box) — the
+        // player can keep moving while the invite is up.
+        // Reverse countdown: the draining bar empties over 20s (CSS matches), then
+        // auto-decline + close.
         this.commTimer = window.setTimeout(() => {
             try { conn.partyDecline(partyId); } catch (_) { /* ignore */ }
             this.closeComm();
@@ -185,7 +181,6 @@ export class SocialOverlay {
      * dialog immediately takes over focus). */
     private closeComm(silent?: boolean): void {
         if (this.commTimer !== null) { clearTimeout(this.commTimer); this.commTimer = null; }
-        if (this.commTypeTimer !== null) { clearInterval(this.commTypeTimer); this.commTypeTimer = null; }
         if (this.commBox) { this.commBox.remove(); this.commBox = null; }
         if (!silent) ig.system.regainFocus();
     }
@@ -215,19 +210,5 @@ export class SocialOverlay {
             return false;
         });
         form.find('input[type=text]').focus();
-    }
-
-    /** A transient message box with action buttons (used for friend requests). */
-    private flash(message: string, buttons: Array<{ label: string, cb: () => void }>): void {
-        const box = $('<div class="gameOverlayBox gamecodeMessage"></div>');
-        box.append('<b>' + message + '</b><br>');
-        for (const b of buttons) {
-            const btn = $('<button>' + b.label + '</button>');
-            btn.on('click', () => { b.cb(); box.remove(); ig.system.regainFocus(); });
-            box.append(btn);
-        }
-        $(document.body).append(box);
-        box.addClass('shown');
-        ig.system.setFocusLost();
     }
 }

@@ -14,6 +14,31 @@ export interface IConnection {
      * 1/s mpPing probe; read by the options tab's 显示ping值 tag display. */
     readonly pingMs: number;
 
+    /** Round 21: current network debug stats for the options HUD overlay (bits per
+     * second up/down, packet loss % over the last 10 probes, and all-time totals).
+     * Round 22 (EXTRA 2): `tickRate` = the observed entityState block rate (blocks
+     * per second — whichever direction is active: host sends, member receives).
+     * Item 3: `tickRateHostile`/`tickRateBase` = the two per-stream rates the HUD
+     * should display (the summed `tickRate` double-counts them). OPTIONAL so
+     * connectors that don't measure it need no implementation; the HUD
+     * overlay guards the call with `conn.getNetStats?.()`. */
+    getNetStats?(): { upBitsSec: number; downBitsSec: number; lossPct: number; upBitsTotal: number; downBitsTotal: number; tickRate: number; tickRateHostile?: number; tickRateBase?: number };
+
+    /** Round 25: send one network-quality probe `{t, seq}`. The server echoes it
+     * back verbatim as `netPong` (auth-gated, ~4/s); the connector folds the echo
+     * into a sliding window for getNetQuality(). Called by the connector's own 1/s
+     * probe loop — exposed for completeness. */
+    netPing(t: number, seq: number): void;
+    /** Round 25: register the `netPong` echo handler. `t` and `seq` arrive exactly
+     * as sent (both validated server-side), so a pong maps unambiguously to its
+     * probe. */
+    onNetPong(callback: (t: number, seq: number) => void): void;
+    /** Round 25: current network quality for the HUD badges — median RTT of the
+     * answered probes in the sliding netPing window + packet loss % (unanswered
+     * after ~2s counts lost) + a derived tier. OPTIONAL like getNetStats; the
+     * badges guard with `conn.getNetQuality?.()`. */
+    getNetQuality?(): INetQuality;
+
     identify(username: string): Promise<IIdentifyResult>;
     /** Round 19: `isolated` is the PVP-duel isolation tri-state forwarded to the
      * server (true = pin routing to solo:<user>:<map>; false = clear; absent =
@@ -30,8 +55,11 @@ export interface IConnection {
      * `dead`=1 while our player is dead: teammates despawn our mirror until respawn. */
     updatePlayerState(state: { pos: Vec3, face: Vec2, anim: string, dead?: number, hp?: number, maxHp?: number, sp?: number, maxSp?: number, cg?: number, em?: number, cl?: string, cs?: number }): void;
     /** Host-only: broadcast the whole enemy state block for the current map.
-     * `combat` = host's combat mode, so members enter/see the shared fight. */
-    updateEntityStateBlock(map: string, entities: any[], combat?: boolean): void;
+     * `combat` = host's combat mode, so members enter/see the shared fight.
+     * `full` = this block was force-full (f:1 on the wire) — the ~1s heartbeat that
+     * tells members the host reported its FULL roster (so a missing map enemy is dead
+     * on the host). Omitted (falsy) for normal delta blocks. */
+    updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean): void;
     /** Round 19: a client's cutscene-spawned monsters (story enemies). The server
      * relays this to the instance as `cutsceneEntity` with the sender stamped as
      * `from`; receivers render them as csPuppets and reap them when the stream stops. */
@@ -46,14 +74,69 @@ export interface IConnection {
      * apply the damage to their real player (mirrors' hp is owner-driven). ax/ay =
      * the attacking enemy's position (round 11, drives knockback direction).
      * attack = the attacker's attack stat (round 20, drives the owner's guard shield
-     * damage reduction). */
-    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number }): void;
-    /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string }): void;
+     * damage reduction). ROUND 27 (item 4, host-authoritative monster damage):
+     * `monster` marks a host-RECOMPUTED monster hit (recomputeHostMonsterHit) that
+     * the member applies VERBATIM — `perfect` = a perfect guard (0 damage + counter
+     * window), `regular` = a regular guard (chip damage + guard-bar), `knockback` =
+     * whether the engine knockback fires. PvP hits (mirror-to-mirror) omit these. */
+    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }): void;
+    /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
+     * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
+     * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
+     * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
+     * fixed MEDIUM. */
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean }): void;
+    /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
+     * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
+     * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
+     * every other member replays the enemy's hurt sound/FX on its own puppet. */
+    emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }): void;
+    /** Round 21: member -> host — a monster hit our real player LOCALLY (native damage
+     * pipeline: guard/i-frames/knockback). Bookkeeping only: the member's HP already
+     * streams via playerState, so the host must NOT re-apply any damage from this. */
+    emitCombatResult(hit: { uid: number, damage: number, guarded: boolean }): void;
+    /** Round 26: a counter/guard-break dramatic effect just played on a SHARED enemy
+     * (a real host enemy or a member puppet — uid spaces match, puppets mirror host
+     * enemy uids). Relay it to the instance so everyone else replays the head popup +
+     * speedlines on the same entity; the server excludes the sender and rate-limits
+     * ~20/s. kind = 'counter' | 'break'. */
+    emitCombatFx(uid: number, kind: string): void;
     /** Round 17: HOST -> all — one of my real enemies started an attack (fresh attack
      * anim edge at block cadence). Members replay it on their puppet toward the local
-     * player (member puppets no longer run local AI). */
-    enemyAttack(atk: { uid: number, anim: string }): void;
+     * player (member puppets no longer run local AI). Round 22 (RC1): `t` is the
+     * username of the member the enemy is actually attacking (null for host-targeted /
+     * bot / unknown) — only that member schedules the local hit. */
+    enemyAttack(atk: { uid: number, anim: string, t: string | null }): void;
+    /** Round 23: HOST -> all — a host real enemy just died and its death chain
+     * granted credits to the HOST's player. Members grant the SAME credits to their
+     * own players. Round 24 (loot fairness): the host no longer rolls item drops
+     * with its own stats (they were wrong for members) — it relays the enemy's RAW
+     * drop table (`drops`) + its `boosterState` instead, and every member rolls the
+     * table with ITS OWN stats (identical distribution to the engine's
+     * resolveItemDrops). uid = the dead enemy's uid; credit = the granted credits
+     * (0 when none); boosterState = the enemy's booster state (number, default 0). */
+    emitLoot(loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }): void;
+    /** Round 33 (item 2b): HOST -> all — one of the host's real enemies played a sound
+     * (any action step). Member puppets run NO local AI, so without this relay they are
+     * completely silent. The host relays the sound's path + playback params; each member
+     * replays it locally positioned on their same-uid puppet. `global` = a non-positional
+     * sound; `radius` = the 3D falloff radius. Server relays via broadcastHostState. */
+    emitEnemySound(s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }): void;
+    /** ROUND 34 (item 3): any client -> its instance — the LOCAL player's own attack
+     * sound (melee swing / ball throw) fired on an Effect entity. The enemySound relay is
+     * host-only + Enemy-gated, so it never carries player attack sounds; this fills the
+     * gap. Every OTHER same-instance client replays it positioned on the attacker's mirror. */
+    emitPlayerSound(s: { path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }): void;
+    /** ROUND 43 (skill-release sound): any client -> its instance — the local player FIRED
+     * a skill whose launch sound we silenced locally (the playAtEntity enemy/ball observer
+     * kills skill-projectile sounds and, before this round, sent nothing). `player` = the
+     * caster's name; every other client replays it positioned on the caster's mirror. This
+     * fills the 回旋斩 / charged-shot gap the playerSound path couldn't reach. */
+    emitSkillSound(s: { player: string, path: string, volume?: number, variance?: number, radius?: number, speed?: number }): void;
+    /** ROUND 39 (item 1): any client -> its instance — the local player RELEASED a
+     * sustained (loop:true) sound (the skill charge-up). Every other same-instance client
+     * cuts the looped handle it started for that player (applySoundStop). */
+    emitSoundStop(): void;
 
     updateEntityPosition(id: number, pos: Vec3): void;
     updateEntityAnimation(id: number, face: Vec2, anim: string): void;
@@ -70,6 +153,11 @@ export interface IConnection {
     friendAccept(name: string): void;
     friendDecline(name: string): void;
     friendRemove(name: string): void;
+    /** Round 23 wave 3: search known players by name (search-first add-friend flow).
+     * The server replies to the requester only with `searchPlayersResult`. */
+    searchPlayers(query: string): void;
+    /** Round 23 wave 3: withdraw an outgoing friend request (requester-side decline). */
+    friendRequestWithdraw(name: string): void;
     friendList(): void;
     friendRequests(): void;
     partyInvite(name: string): void;
@@ -82,9 +170,19 @@ export interface IConnection {
     /** Ask the server for a teammate's location (manual regroup). `target` = the
      * clicked teammate's username; without it the leader is used. */
     partyRegroup(target?: string): void;
+    /** Round 23 wave 4 (party chat): send a PARTY-ONLY chat message. The server
+     * relays it to every other party member in the SAME map instance; the sender
+     * echoes locally (the server never echoes). */
+    chat(text: string): void;
+    /** Round 23 wave 4 (party chat): a party teammate's chat message arrived
+     * (server-relayed, only from same-instance party members). */
+    onChat(cb: (msg: { from: string, text: string }) => void): void;
     /** Host -> all: the native party BOTS currently in the roster (round 11).
-     * Members spawn local follower copies so they can SEE the host's bots. */
-    partyBots(bots: string[]): void;
+     * Members spawn local follower copies so they can SEE the host's bots.
+     * Round 27 (item 2): `maps` carries the HOST's map for each BOT so the party
+     * HUD can hide a bot's HP/SP/EXP bars + grey its net diamond while the bot
+     * (its owner) is off our map. Optional — older hosts/servers omit it. */
+    partyBots(bots: string[], maps?: { [botName: string]: string }): void;
     /** Round 13: the party LEADER streams live bot state (pos/anim/hp/level) so
      * members can render the leader's follower bots as host-driven puppets. */
     botState(state: { map: string, bots: IBotStateEntry[] }): void;
@@ -102,7 +200,47 @@ export interface IConnection {
     /** Round 11: a player CAST a special skill — replay its effect sheet on the
      * sender's mirror (f = fixed world pos for spawnFixed effects). */
     skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void;
+    /** Round 27 (item 2): publish OUR current map to the party so teammates' HUDs
+     * can hide our HP/SP/EXP bars + grey our net diamond while we're off their map. */
+    memberMap?(map: string): void;
+    /** Round 27 (item 2): a party member relayed their current map. */
+    onMemberMap?(cb: (name: string, map: string) => void): void;
     saveUpload(slot: string, data: string): void;
+    /** Round 23: one part of a chunked, rate-limited save UPLOAD. The client splits
+     * the save into 8192-char parts and paces them (~512 kb/s) through the
+     * saveUploadQueue; the server reassembles them in order and confirms with
+     * saveSaved once the last part lands. `gen` is bumped on every submit so a
+     * stale (aborted) stream is discarded server-side. */
+    saveChunk(chunk: { gen: number, slot: string, total: number, seq: number, part: string, reason: string }): void;
+    /** Round 23: the server confirmed a save upload finished persisting (the client
+     * shows the save-succeeded toast). `bytes` = the reassembled payload length. */
+    onSaveSaved(callback: (slot: string, bytes: number) => void): void;
+    /** Round 27 (item 5): the server rejected/dropped a save upload (rate-limited,
+     * corrupt stream, or area-change storm suppression). The exit-to-title upload
+     * dialog resolves FAILURE on this so the player exits instead of waiting for the
+     * full timeout. */
+    onSaveFailed?(callback: (slot: string, reason: string) => void): void;
+    /** Round 23: the server STREAMS the player's save as paced saveDownload parts
+     * right after the handshake (it is no longer embedded in handshakeResponse).
+     * The connector reassembles the parts and fires this callback ONCE — with the
+     * full save string when the stream completes, or null when the server signals
+     * "no save" (saveDownload {slot, total:0}). */
+    onSaveDownload(callback: (result: { slot: string, data: string } | null) => void): void;
+    /** Round 24: the connector reports EVERY valid save-download part it appends
+     * while reassembling (before the stream completes), so the multiplayer layer can
+     * run an ACTIVITY-based restore watchdog — "give up only after 15s with NO new
+     * parts arriving" — instead of a flat timer from game start (a large-but-valid
+     * save that streams slower than the old window used to be abandoned mid-stream).
+     * Round 27: the callback also carries download progress — `received`/`total` =
+     * parts received / total parts, `bytes` = chars reassembled so far (≈ bytes for
+     * the ASCII-encrypted save string) — so the blocking download overlay can render
+     * a real progress bar. */
+    onSaveDownloadProgress(callback: (progress: { received: number, total: number, bytes: number }) => void): void;
+    /** Round 27: true once the save-download stream has completed (or the server
+     * signaled "no save" via total:0). Lets launchGame skip its blocking overlay
+     * entirely when the download already settled during login. OPTIONAL so a
+     * connector without the streamed download needs no implementation. */
+    readonly saveDownloadSettled?: boolean;
     logout(): void;
     // ---- lobby queries ----
     roomPlayers(): void;
@@ -123,12 +261,39 @@ export interface IConnection {
     onThrowBall(callback:
         (ballInfo: IBallInfo) => void): void;
     onCombatHit(callback:
-        (hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number }) => void): void;
+        (hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }) => void): void;
     onEnemyDamage(callback:
-        (hit: { uid: number, damage: number, attacker: string }) => void): void;
+        (hit: { uid: number, damage: number, attacker: string, attackElement?: number, critical?: boolean }) => void): void;
+    /** ROUND 45 (Gap A, host origin): the host relayed that a member's hit landed on a
+     * real enemy — replay the hurt FX on our same-uid puppet (cosmetic only, no damage). */
+    onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }) => void): void;
     /** Round 17: the host's real enemy started an attack — replay it on our puppet
-     * (uid) toward the local player with the given attack anim. */
-    onEnemyAttack(callback: (uid: number, anim: string) => void): void;
+     * (uid) toward the local player with the given attack anim. Round 22 (RC1): `t`
+     * is the targeted member's username (null when the host/bot/unknown was targeted). */
+    onEnemyAttack(callback: (uid: number, anim: string, t: string | null) => void): void;
+    /** Round 21: a member reported a monster hit it detected locally (native damage
+     * pipeline). Bookkeeping for the host; see emitCombatResult. */
+    onCombatResult(callback: (hit: { uid: number, damage: number, guarded: boolean }) => void): void;
+    /** Round 26: a shared enemy (uid) had a counter/guard-break FX elsewhere (server-
+     * relayed, sender excluded). Replay it locally on the same-uid entity. kind =
+     * 'counter' | 'break'. */
+    onCombatFx(callback: (uid: number, kind: string) => void): void;
+    /** Round 23: the host killed a real enemy — grant the relayed credits to our own
+     * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
+     * via broadcastHostState. */
+    onLoot(callback: (loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }) => void): void;
+    /** Round 33 (item 2b): the host relayed an enemy sound (see emitEnemySound). Replay
+     * it locally positioned on the same-uid puppet (or globally when `global`). */
+    onEnemySound(callback: (s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }) => void): void;
+    /** ROUND 34 (item 3): a same-instance player's attack sound (see emitPlayerSound).
+     * Replay it locally positioned on that player's mirror. */
+    onPlayerSound(callback: (s: { player: string, path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }) => void): void;
+    /** ROUND 43 (skill-release sound): a same-instance player fired a skill's launch
+     * sound — replay it on that player's mirror (see NetSync.applySkillSound). */
+    onSkillSound(callback: (s: { player: string, path: string, volume?: number, variance?: number, radius?: number, speed?: number }) => void): void;
+    /** ROUND 39 (item 1): a same-instance player released a sustained sound (see
+     * emitSoundStop) — cut the looped handle we started for them. */
+    onSoundStop(callback: (player: string) => void): void;
 
     onRegisterEntity(callback:
         (id: number, type: string, pos: Vec3, settings: object) => void): void;
@@ -154,7 +319,7 @@ export interface IConnection {
     onPlayerPing(callback: (name: string, ping: number, isHost?: boolean) => void): void;
     // ---- NEW sync system callbacks ----
     onPlayerState(callback: (player: string, state: any) => void): void;
-    onEntityState(callback: (map: string, entities: any[], combat: boolean) => void): void;
+    onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean) => void): void;
     /** Round 19: a client's cutscene-spawned monsters arrived. `from` = the stream
      * owner's username (server-stamped); receivers ignore their own echo and reap
      * the owner's csPuppets when its stream stops. */
@@ -162,14 +327,18 @@ export interface IConnection {
 
     // ---- social callbacks ----
     onPresence(callback: (player: string, online: boolean) => void): void;
-    onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[] } | null) => void): void;
+    /** Round 23 wave 3: `lastLeft` (optional, additive) rides the roster broadcast —
+     * `{name, reason}` with reason 'left'|'kicked'|'disconnected' — so a departed
+     * member's removal can be toasted with the correct manner. Absent -> 'left'. */
+    onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[], lastLeft?: { name: string, reason: string } } | null) => void): void;
     onPartyInvite(callback: (from: string, partyId: string) => void): void;
     onPartyMove(callback: (data: { leader?: string, map?: string, pos?: Vec3 }) => void): void;
     // Server nudge to re-assert our current instance (e.g. after someone joined
     // our party) so both ends spawn each other's mirror entity.
     onPartyReSync(callback: () => void): void;
-    /** Host -> all: native party bots in the roster (round 11). */
-    onPartyBots(callback: (bots: string[]) => void): void;
+    /** Host -> all: native party bots in the roster (round 11). Round 27 (item 2):
+     * `maps` carries the host's map per bot for the off-map HUD hide/grey. */
+    onPartyBots(callback: (bots: string[], maps?: { [botName: string]: string }) => void): void;
     /** Round 13: leader-streamed live bot state. `from` is the leader's username
      * (the sender never receives its own block, but the check is belt-and-braces). */
     onBotState(callback: (data: { map?: string, from?: string, bots: IBotStateEntry[] }) => void): void;
@@ -178,10 +347,44 @@ export interface IConnection {
     onFriendList(callback: (friends: Array<{ name: string, online: boolean }>) => void): void;
     onFriendActionResult(callback: (result: any) => void): void;
     onFriendRequest(callback: (from: string) => void): void;
-    onFriendRequests(callback: (requests: Array<{ name: string, online: boolean }>) => void): void;
+    /** Round 23 wave 3: the requests payload now carries BOTH directions
+     * ({incoming, outgoing}) so the 申请管理 tab can render each section. */
+    onFriendRequests(callback: (requests: {
+        incoming: Array<{ name: string, online: boolean }>,
+        outgoing: Array<{ name: string, online: boolean }>,
+    }) => void): void;
+    /** Round 23 wave 3: search-first add-friend flow — server replies to the
+     * requester only, capped at 8 matches, exact first. level may be absent
+     * (not persisted; omitted when the target has never uploaded a profile). */
+    onSearchPlayersResult(callback: (result: { query: string, players: Array<{ name: string, online: boolean, level?: number }> }) => void): void;
+    /** Round 23 wave 3: friendship established (accept OR mutual auto-accept) —
+     * `name` is the OTHER user. */
+    onFriendAdded(callback: (name: string) => void): void;
+    /** Round 23 wave 3: an outgoing request I sent was withdrawn by the other side. */
+    onFriendRequestWithdrawn(callback: (name: string) => void): void;
+    /** Round 23 wave 3: my outgoing request was declined by the target. */
+    onFriendRequestDeclined(callback: (name: string) => void): void;
+    /** Round 23 wave 3: party action outcomes (invite accepted/declined/busy/full) —
+     * consumed for the invite busy-check + button re-enable. */
+    onPartyActionResult(callback: (result: any) => void): void;
     // ---- lobby query callbacks ----
     onRoomPlayers(callback: (players: string[], host?: string) => void): void;
     onOnlineCount(callback: (count: number) => void): void;
+}
+
+/** Round 25: network-quality tier for the HUD badges (green..red). */
+export type NetTier = 'green' | 'yellow' | 'orange' | 'red';
+
+/** Round 25: current network quality, read by the HUD badges. `ping` = median RTT
+ * of the answered probes in the sliding window (-1 when none resolved yet),
+ * `lossPct` = unanswered / resolved probes (0..100), `tier` = the derived color
+ * tier (green good ... red terrible), `known` = false until at least one probe has
+ * resolved — badges hide until then. */
+export interface INetQuality {
+    ping: number;
+    lossPct: number;
+    tier: NetTier;
+    known: boolean;
 }
 
 export interface IChangeMapResult {
@@ -217,4 +420,19 @@ export interface IBotStateEntry {
     a: string;
     hp: number; mh: number;
     lv: number; ex: number;
+}
+
+/** Round 24 (loot fairness): one RAW entry of an enemy's drop table, relayed from
+ * the host's death chain. Members roll the table with THEIR OWN stats — the host
+ * no longer resolves items (its stats don't match the member's odds). Mirrors the
+ * fields the engine's EnemyType.resolveItemDrops reads: item (item id, string),
+ * prob (drop probability 0..1), min/max (amount range), rank (combat-rank gate,
+ * '' when none), boosted (only drops when the enemy was BOOSTED). */
+export interface ILootDrop {
+    item: string;
+    prob: number;
+    min: number;
+    max: number;
+    rank: string;
+    boosted: boolean;
 }

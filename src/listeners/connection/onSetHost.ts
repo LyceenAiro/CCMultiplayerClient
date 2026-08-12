@@ -29,6 +29,9 @@ export class OnSetHostListener {
 			// New sync: our puppet enemies are position-locked + animation-pinned, so
 			// respawn them as fresh AI-driven enemies before we take over as authority.
 			try { this.main.onPromotedToHost && this.main.onPromotedToHost(); } catch (e) { /* ignore */ }
+			// Round 21: host tick-rate latch — read the option once at host-acquire
+			// and push it into netSync (enemy block cadence), never read live.
+			try { if (this.main.netSync) this.main.netSync.setBlockInterval(this.main.getHostTickInterval()); } catch (e) { /* ignore */ }
 			console.log('[multiplayer] This user is now the host of ' + (map || 'this map') + '!');
 		} else {
 			this.lockEntities();

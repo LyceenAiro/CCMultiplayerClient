@@ -1,14 +1,15 @@
 import type { Multiplayer } from '../multiplayer';
 
-// Round 20: GHOST CHESTS (party-aware chest visibility).
+// Round 21: GHOST CHESTS (party-aware chest visibility).
 //
 // Goal (user request): when the LOCAL player has opened a chest but some party
-// teammates have NOT, the chest is rendered at 25% opacity ("ghost") at its
-// position. The local player cannot open it (already open in their save vars)
-// but can use it to guide teammates. When EVERY party member has opened it, the
-// chest disappears entirely for anyone who already opened it. Teammates who have
-// not opened it still see their own normal 100% closed chest (their save vars
-// are independent per player). Solo play = feature inactive.
+// teammates have NOT, a SEPARATE ghost chest is rendered at 25% opacity in the
+// CLOSED, floating/idle pose at the chest's position. The real opened-chest wreck
+// is left 100% UNMODIFIED — the engine renders it normally (no alpha fade). The
+// ghost cannot be opened; it exists purely to guide teammates to the spot. When
+// EVERY party member has opened it, the ghost is killed and the wreck stays as-is.
+// Teammates who have not opened it still see their own normal 100% closed chest
+// (their save vars are independent per player). Solo play = feature inactive.
 //
 // Engine facts (verified against game.compiled.js):
 //  - ig.ENTITY.Chest is an ig.AnimatedEntity with NO collision and no AI. Its
@@ -21,13 +22,22 @@ import type { Multiplayer } from '../multiplayer';
 //    (sets isOpen, spawns drops, ig.vars.add(chestVariable,1), anim "open"->end).
 //    We wrap it to learn when WE opened a chest (and cache its info BEFORE any
 //    hideCondition can hide/kill the live entity).
+//  - Ghost pose: we spawn with a FAKE variable ("__mpGhostVar_" + key) that
+//    ig.vars never holds, so init() sees isOpen=false and renders the CLOSED idle
+//    pose, floating (coll.float.height=6, variance=2). We then set isOpen=true in
+//    the same synchronous turn post-spawn: onInteraction becomes a no-op (blocks
+//    opening), _reallyOpenUp's !isOpen guard rejects it, the Detector's FULL_CHEST
+//    scan (!a.isOpened()) skips it, and any later show() cannot re-register the
+//    interaction. Visually safe because init already picked the idle anim and
+//    _initGfx skips its anim-reset branch when isOpen. The prompt/entry show()
+//    added is removed via sc.mapInteract.removeEntry so it never reaches a focus
+//    pass.
 //  - ig.game.spawnEntity('Chest', x, y, z, settings) uses the same path the map
-//    loader uses. NOTE: spawnEntity registers `mapEntities[mapId] = entity`, so
-//    spawning a ghost with a mapId that a LIVE entity already holds would clobber
-//    the live entry — therefore ghosts are ONLY spawned when no live chest for
-//    that mapId exists.
-//  - animState.alpha is the live fade field (init sets it to 1); netSync already
-//    fades mirrors this way (updateRemoteMirrorFade).
+//    loader uses. NOTE: spawnEntity registers `mapEntities[mapId] = entity`, so we
+//    deliberately do NOT pass mapId (it stays 0) -> that registration is skipped
+//    and the live wreck's mapEntities slot is never clobbered.
+//  - animState.alpha is the fade field (init sets it to 1); the ghost's own alpha
+//    is set to 0.5 for the ghost look.
 
 export interface IGhostChestsModule {
 	/** A party teammate opened a chest (server-relayed chestOpenedBy). */
@@ -64,9 +74,6 @@ const chestInfo: { [key: string]: ChestInfo } = Object.create(null);
 const openedBy: { [key: string]: Set<string> } = Object.create(null);
 /** Ghost chest entities we spawned (Set so we can kill them all on cleanup). */
 const ghosts: Set<any> = new Set();
-/** Live chest entities whose animState.alpha we changed -> the alpha we wrote
- * (so a later restore returns exactly 1). */
-const managedAlphas: Map<any, number> = new Map();
 
 let lastMap = '';
 let lastRosterSize = 0;
@@ -195,7 +202,6 @@ function pump(): void {
 			lastMap = map;
 			// loadLevel killed the old map's entities; drop stale refs and restart.
 			ghosts.clear();
-			managedAlphas.clear();
 			lastReconcileAt = 0;
 			reconcilePending = true;
 			announcePending = true;
@@ -257,7 +263,7 @@ function reconcile(map: string): void {
 	for (const key in chestInfo) { if (key.indexOf(map + ':') === 0) keys.add(key); }
 
 	for (const key of keys) {
-		const info = chestInfo[key];
+		let info = chestInfo[key];
 		const live = liveByKey[key];
 		const variable = info ? info.variable : (live ? live.chestVariable : '');
 		if (!variable) continue;
@@ -267,26 +273,28 @@ function reconcile(map: string): void {
 
 		if (!openedByMe) {
 			// We have not opened it -> the normal 100% closed chest is ours to show.
-			// Defensively undo anything we did to the live entity / any stray ghost.
-			if (live) setAlpha(live, 1);
+			// The real wreck is never touched; just clear any stray ghost for the key.
 			killGhostForKey(key);
 			continue;
 		}
 
-		// We opened it. Ghost it while ANY teammate still lacks it; hide once all have it.
+		// We opened it. Ghost it (as a separate closed-pose chest at 0.5) while ANY
+		// teammate still lacks it; kill the ghost once all have it. The real wreck is
+		// always left 100% UNMODIFIED.
 		const teammateMissing = teammates.some((t) => {
 			const set = openedBy[key];
 			return !set || !set.has(t);
 		});
 
 		if (teammateMissing) {
-			if (live) {
-				setAlpha(live, 0.25);
-			} else if (info) {
-				spawnGhost(info, key);
+			// Cache info from the live wreck if we don't have it yet, then spawn the
+			// ghost REGARDLESS of whether a live wreck still exists.
+			if (!info && live) {
+				cacheFromChest(live, key);
+				info = chestInfo[key];
 			}
+			if (info) spawnGhost(info, key);
 		} else {
-			if (live) setAlpha(live, 0);
 			killGhostForKey(key);
 		}
 	}
@@ -340,29 +348,14 @@ function chestTypeName(chest: any): string {
 	return 'default';
 }
 
-/** Set a live chest entity's alpha, tracking restores so untouched chests (e.g.
- * one driven by its own hideManager) are never written. */
-function setAlpha(e: any, alpha: number): void {
-	try {
-		if (!e || !e.animState) return;
-		if (alpha === 1) {
-			// Restore only what WE changed.
-			if (managedAlphas.has(e)) {
-				e.animState.alpha = 1;
-				managedAlphas.delete(e);
-			}
-		} else {
-			e.animState.alpha = alpha;
-			managedAlphas.set(e, alpha);
-		}
-	} catch (_) { /* ignore */ }
-}
-
-/** Spawn a ghost chest at a cached position. Passing the REAL variable name makes
- * init open-locked for us (truthy var -> isOpen, "end" pose, no interaction).
- * ONLY call when no live chest exists for the mapId (spawnEntity would otherwise
- * overwrite mapEntities[mapId] with the ghost). Idempotent per key: a live ghost
- * for the same key is never duplicated (the pump re-runs every ~0.5s). */
+/** Spawn a ghost chest at a cached position. The ghost is a SEPARATE chest in the
+ * CLOSED idle/float pose at 25% opacity — the real wreck is never touched. A FAKE
+ * variable ("__mpGhostVar_" + key) that ig.vars never holds makes init() see
+ * isOpen=false and render the closed idle pose with the float (coll.float.height=6,
+ * variance=2). mapId is deliberately NOT passed (stays 0) so spawnEntity's
+ * mapEntities registration is skipped and the live wreck's mapEntities slot is never
+ * clobbered. Idempotent per key: a live ghost for the same key is never duplicated
+ * (the pump re-runs every ~0.5s). */
 function spawnGhost(info: ChestInfo, key: string): any {
 	try {
 		for (const g of ghosts) {
@@ -372,14 +365,29 @@ function spawnGhost(info: ChestInfo, key: string): any {
 		if (!game || typeof game.spawnEntity !== 'function') return null;
 		const ghost = game.spawnEntity('Chest', info.x, info.y, info.z, {
 			chestType: info.chestType,
-			variable: info.variable,
-			mapId: info.mapId,
+			variable: '__mpGhostVar_' + key,
+			noTrack: true,
 		});
 		if (!ghost) return null;
+		// Post-spawn, in the SAME synchronous turn (engine has not updated yet):
+		//  a) mark the entity as ours.
 		ghost._mpGhost = true;
 		ghost._mpGhostKey = key;
+		//  b) isOpen=true blocks onInteraction (returns true), _reallyOpenUp
+		//     (if(!this.isOpen) guard), the Detector FULL_CHEST scan (!a.isOpened()),
+		//     and any later show() re-registering the interaction. Visually safe: init
+		//     already set the closed idle anim, and _initGfx skips its anim-reset
+		//     branch when isOpen.
+		ghost.isOpen = true;
+		//  c) drop the interaction prompt/entry show() added during spawn (it never
+		//     survives to the next frame's focus pass -> no prompt race).
+		if (ghost.interactEntry) {
+			try { sc.mapInteract.removeEntry(ghost.interactEntry); } catch (_) { /* ignore */ }
+		}
+		//  d) 50% opacity ghost look (round 22: raised from 0.25 per user request).
+		if (ghost.animState) ghost.animState.alpha = 0.5;
+		//  e) track it for cleanup/dedupe.
 		ghosts.add(ghost);
-		if (ghost.animState) ghost.animState.alpha = 0.25;
 		return ghost;
 	} catch (_) { return null; }
 }
@@ -397,19 +405,14 @@ function killGhostForKey(key: string): void {
 	} catch (_) { /* ignore */ }
 }
 
-/** Kill every ghost and restore every managed live chest to full alpha. */
+/** Kill every ghost. (Real wrecks are never touched, so there is nothing to
+ * restore.) */
 function cleanupLocalVisuals(): void {
 	try {
 		for (const g of ghosts) {
 			try { if (g && !g._killed && typeof g.kill === 'function') g.kill(); } catch (_) { /* ignore */ }
 		}
 		ghosts.clear();
-	} catch (_) { /* ignore */ }
-	try {
-		for (const e of managedAlphas.keys()) {
-			try { if (e && e.animState && !e._killed) e.animState.alpha = 1; } catch (_) { /* ignore */ }
-		}
-		managedAlphas.clear();
 	} catch (_) { /* ignore */ }
 }
 

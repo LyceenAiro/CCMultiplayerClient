@@ -42,10 +42,25 @@ interface IMpOptions {
     leaderGold: boolean;
     /** Round 16: show the local client's latency (ms) on the own name tag. */
     showPing: boolean;
+    /** Round 21: host enemy-block tick rate (15/30/60 Hz). Latched at the next
+     * host-acquire (becoming the map host), never read live. */
+    hostTickRate: number;
+    /** Round 23: own playerState send rate (10/20/30/60 Hz). HOT-APPLIED — netSync
+     * reads it live every tick (getPlayerStateMs), so a change takes effect on the
+     * next packet with no latch/rejoin. */
+    playerStateRate: number;
+    /** Round 21: show the bottom-right network debug overlay (up/down bits per
+     * second + packet loss %). Read live by the HUD pump. */
+    showNetDebug: boolean;
+    /** Round 21: extend the network debug overlay with cumulative up/down totals. */
+    showNetDebugCumulative: boolean;
     /** Name-tag backing opacity: one of 0 / 0.25 / 0.5 / 0.75 / 1. */
     tagAlpha: number;
     /** Name-tag font key: 'tiny' | 'small' | 'font' (ascending sizes). */
     tagSize: string;
+    /** Round 24: show the save-success toast when the server confirms an upload
+     * (read live at save time in multiplayer.ts — no latch/rebuild needed). */
+    showSaveToast: boolean;
 }
 
 const DEFAULTS: IMpOptions = {
@@ -54,8 +69,13 @@ const DEFAULTS: IMpOptions = {
     showBotNames: true,
     leaderGold: true,
     showPing: false,
+    hostTickRate: 30,
+    playerStateRate: 10,
+    showNetDebug: false,
+    showNetDebugCumulative: false,
     tagAlpha: 0.5,
     tagSize: 'tiny',
+    showSaveToast: true,
 };
 
 let cached: IMpOptions | null = null;
@@ -68,8 +88,13 @@ function loadOptions(): IMpOptions {
         showBotNames: DEFAULTS.showBotNames,
         leaderGold: DEFAULTS.leaderGold,
         showPing: DEFAULTS.showPing,
+        hostTickRate: DEFAULTS.hostTickRate,
+        playerStateRate: DEFAULTS.playerStateRate,
+        showNetDebug: DEFAULTS.showNetDebug,
+        showNetDebugCumulative: DEFAULTS.showNetDebugCumulative,
         tagAlpha: DEFAULTS.tagAlpha,
         tagSize: DEFAULTS.tagSize,
+        showSaveToast: DEFAULTS.showSaveToast,
     };
     try {
         const raw = window.localStorage.getItem(LS_KEY);
@@ -83,8 +108,16 @@ function loadOptions(): IMpOptions {
                 if (typeof parsed.leaderGold === 'boolean') out.leaderGold = parsed.leaderGold;
                 // Round-16 key: absent on older saves -> default (off).
                 if (typeof parsed.showPing === 'boolean') out.showPing = parsed.showPing;
+                // Round-21 key: allowlist 15/30/60 Hz only; anything else -> default 30.
+                if (parsed.hostTickRate === 15 || parsed.hostTickRate === 30 || parsed.hostTickRate === 60) out.hostTickRate = parsed.hostTickRate;
+                // Round-23 key: allowlist 10/20/30/60 Hz only; anything else -> default 10.
+                if ([10, 20, 30, 60].indexOf(parsed.playerStateRate) !== -1) out.playerStateRate = parsed.playerStateRate;
+                if (typeof parsed.showNetDebug === 'boolean') out.showNetDebug = parsed.showNetDebug;
+                if (typeof parsed.showNetDebugCumulative === 'boolean') out.showNetDebugCumulative = parsed.showNetDebugCumulative;
                 if (typeof parsed.tagAlpha === 'number' && [0, 0.25, 0.5, 0.75, 1].indexOf(parsed.tagAlpha) !== -1) out.tagAlpha = parsed.tagAlpha;
                 if (typeof parsed.tagSize === 'string' && ['tiny', 'small', 'font'].indexOf(parsed.tagSize) !== -1) out.tagSize = parsed.tagSize;
+                // Round-24 key: absent on older saves -> default (on).
+                if (typeof parsed.showSaveToast === 'boolean') out.showSaveToast = parsed.showSaveToast;
             }
         }
     } catch (_) { /* localStorage unavailable -> defaults */ }
@@ -177,6 +210,14 @@ const TAG_ALPHA_LABELS = ['0%', '25%', '50%', '75%', '100%'];
 /** Tag font choices mapped to real sc.fontsystem fonts (7/13/16px, ascending). */
 const TAG_SIZE_KEYS = ['tiny', 'small', 'font'];
 const TAG_SIZE_LABELS = [t('sizeSmall'), t('sizeMedium'), t('sizeLarge')];
+/** Round 21: host enemy-block tick-rate choices (15/30/60 Hz). Display labels are
+ * plain ASCII (`30 tick`) — the rate is a number the label names directly. */
+const HOST_TICK_VALUES = [15, 30, 60];
+const HOST_TICK_LABELS = ['15 tick', '30 tick', '60 tick'];
+/** Round 23: own playerState send-rate choices (10/20/30/60 Hz). Plain ASCII labels
+ * like the host tick rate. Hot-applies: netSync reads the option live every tick. */
+const PLAYER_STATE_RATES = [10, 20, 30, 60];
+const PLAYER_STATE_LABELS = ['10 Hz', '20 Hz', '30 Hz', '60 Hz'];
 
 /** A choice row for the mod tab: a label + a value readout flanked by two small
  * arrow buttons, modeled on buildToggleRow + the native OBJECT_SLIDER option gui.
@@ -383,6 +424,26 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optLeaderGold'), t('optLeaderGoldDesc'), 'leaderGold', refreshTags);
                     this.list.addButton(rows[r], true); r++;
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optShowPing'), t('optShowPingDesc'), 'showPing', refreshTags);
+                    this.list.addButton(rows[r], true); r++;
+                    // Round 21: host tick rate. No live action — latched at the next
+                    // host-acquire (getHostTickInterval reads it then), so the rows'
+                    // onApplied is a no-op.
+                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optHostTick'), t('optHostTickDesc'), 'hostTickRate', HOST_TICK_LABELS, HOST_TICK_VALUES, () => { /* latched at next host-acquire */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // Round 23: own playerState send rate. HOT-APPLIES — netSync reads it
+                    // live every tick (shouldSendPlayerState's floor), so the rows' onApplied
+                    // can be a no-op (the next packet uses the new rate immediately).
+                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optPlayerStateRate'), t('optPlayerStateRateDesc'), 'playerStateRate', PLAYER_STATE_LABELS, PLAYER_STATE_RATES, () => { /* netSync reads live every tick */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // Round 21: network debug overlay toggles. The HUD pump reads the
+                    // options live each second, so a change needs no immediate action.
+                    rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optNetDebug'), t('optNetDebugDesc'), 'showNetDebug', () => { /* HUD pump reads live */ });
+                    this.list.addButton(rows[r], true); r++;
+                    rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optNetDebugCum'), t('optNetDebugCumDesc'), 'showNetDebugCumulative', () => { /* HUD pump reads live */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // Round 24: save-success toast toggle. No immediate action — the
+                    // gate in multiplayer.ts's onSaveSaved reads it live at save time.
+                    rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optShowSaveToast'), t('optShowSaveToastDesc'), 'showSaveToast', () => { /* read live at save time */ });
                     this.list.addButton(rows[r], true); r++;
                     rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optTagAlpha'), t('optTagAlphaDesc'), 'tagAlpha', TAG_ALPHA_LABELS, TAG_ALPHA_VALUES, refreshTags);
                     this.list.addButton(rows[r], true); r++;
@@ -635,6 +696,13 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const players = (m as any).players || {};
         for (const name in players) {
             try {
+                // Round 22: only tag mirrors actually on THIS map. When the
+                // playersOnThisMap roster is defined and non-empty (maintained by
+                // onPlayerChangeMap on enters/leaves/loads), skip a name not on it —
+                // matches the netSync stale-stream gate so a departed teammate's tag
+                // can't be re-shown by addTagAt from a stale cached entry.
+                const onMap = (m as any).playersOnThisMap;
+                if (onMap && Object.keys(onMap).length > 0 && !onMap[name]) continue;
                 const pl = players[name];
                 const ent = pl && pl.entity;
                 // Round 20: hide the tag the very first frame the death flag arrives
@@ -716,4 +784,106 @@ export function startNameTagLoop(getMain: () => Multiplayer | undefined): void {
     if ((s as any)._mpNameTagLoop) return;
     (s as any)._mpNameTagLoop = true;
     s.registerUpdate(() => { applyNameTagsNow(getMain); });
+}
+
+// --------------------------------------------------------------- network debug overlay
+
+/** Round 21: bit counter -> compact human string. Units step by 1024:
+ * ['bit','kb','Mb','Gb']; values below 1024 show as a plain integer + 'bit',
+ * anything else as one decimal + the unit. Rates (bits/sec) are formatted here and
+ * the caller appends `/s`. Unit text stays ASCII; the ↑/↓ direction glyphs are
+ * added by applyNetHudNow, not here. */
+function formatBits(bits: number): string {
+    if (!isFinite(bits) || bits < 0) bits = 0;
+    const units = ['bit', 'kb', 'Mb', 'Gb'];
+    let v = bits;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    if (u === 0) return Math.round(v) + 'bit';
+    return v.toFixed(1) + units[u];
+}
+
+let netHudBox: any = null;
+let netHudText: any = null;
+let netHudTimer = 0;
+let netHudLast = '';
+
+/** Lazily build the bottom-right debug overlay: one dark-backed GuiElementBase
+ * holding a single tiny-font text element — the same container + hook mechanics the
+ * name tags use (both are added to ig.gui and positioned in screen coords). */
+function ensureNetHud(): any {
+    if (netHudBox) return netHudBox;
+    netHudBox = new (ig as any).GuiElementBase();
+    (ig as any).gui.addGuiElement(netHudBox);
+    netHudText = new (sc as any).TextGui('', { font: (sc as any).fontsystem.tinyFont });
+    netHudText.setPos(6, 4);
+    netHudBox.addChildGui(netHudText);
+    netHudBox.updateDrawables = (drawer: any) => {
+        try { drawer.addColor('rgba(0,0,0,0.5)', 0, 0, netHudBox.hook.size.x, netHudBox.hook.size.y); } catch (_) { /* ignore */ }
+    };
+    try { netHudBox.hook.zIndex = 6; } catch (_) { /* ignore */ }
+    try { netHudBox.hook._visible = false; } catch (_) { /* ignore */ }
+    return netHudBox;
+}
+
+/** Round 21: one 1s pass of the network debug overlay. Visible only when 显示网络调试
+ * is on, the connection is open and exposes getNetStats, in-game and no menu is up.
+ * Text is only re-set (and the box re-fit + re-anchored bottom-right) when the
+ * string actually changed — setText every second would be needless churn. */
+function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
+    try {
+        const m = getMain();
+        const show = !!getMpOption('showNetDebug') && !!m && inGameOk() && !anyMenuOpen();
+        const conn: any = m && m.connection;
+        if (!show || !conn || typeof conn.isOpen !== 'function' || !conn.isOpen() || typeof conn.getNetStats !== 'function') {
+            if (netHudBox) { try { netHudBox.hook._visible = false; } catch (_) { /* ignore */ } }
+            return;
+        }
+        const s = conn.getNetStats();
+        // Round 22: arrow glyphs for up/down (user-requested; ↑ ↓ render in the game
+        // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us.
+        let str = '↑ ' + formatBits(s.upBitsSec) + '/s  ↓ ' + formatBits(s.downBitsSec) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
+        if (getMpOption('showNetDebugCumulative')) {
+            str += '\n↑ ' + formatBits(s.upBitsTotal) + '  ↓ ' + formatBits(s.downBitsTotal);
+            // Item 3: display the two per-stream entityState rates separately. The old
+            // "TICK n/s" summed the fixed 15Hz BASE stream + the option's HOSTILE stream,
+            // reading ~75 in combat at a 60Hz setting (a display artifact, not an
+            // over-send). Prefer the split fields the connector now reports; fall back
+            // to the combined count only when they're absent (older connector).
+            const sa: any = s as any;
+            if (typeof sa.tickRateHostile === 'number') {
+                str += '  TICK ' + Math.round(sa.tickRateHostile) + '(H)/s ' + Math.round(sa.tickRateBase || 0) + '(B)/s';
+            } else {
+                str += '  TICK ' + Math.round(sa.tickRate || 0) + '/s';
+            }
+        }
+        if (str !== netHudLast) {
+            netHudLast = str;
+            ensureNetHud();
+            netHudText.setText(str);
+            try {
+                const w = netHudText.hook.size.x + 12;
+                const h = netHudText.hook.size.y + 8;
+                netHudBox.setSize(w, h);
+                netHudBox.setPos(Math.max(0, (ig as any).system.width - w - 8), Math.max(0, (ig as any).system.height - h - 8));
+            } catch (_) { /* ignore */ }
+        }
+        try { netHudBox.hook._visible = true; } catch (_) { /* ignore */ }
+    } catch (_) { /* never break the update loop */ }
+}
+
+/** Round 21: start the 1s-cadence network-debug HUD pump (idempotent). */
+export function startNetHudLoop(getMain: () => Multiplayer | undefined): void {
+    const s: any = (typeof simplify !== 'undefined') ? (simplify as any) : null;
+    if (!s || typeof s.registerUpdate !== 'function') return;
+    if ((s as any)._mpNetHudLoop) return;
+    (s as any)._mpNetHudLoop = true;
+    s.registerUpdate(() => {
+        try {
+            netHudTimer += ig.system.tick;
+            if (netHudTimer < 1) return;
+            netHudTimer = 0;
+            applyNetHudNow(getMain);
+        } catch (_) { /* never break the update loop */ }
+    });
 }

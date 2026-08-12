@@ -1,7 +1,7 @@
 {
 	"name": "multiplayer",
 	"displayName": "CrossCode Multiplayer",
-	"version": "1.20.0",
+	"version": "1.53.0",
 	"description": "A multiplayer mod for CrossCode. Adds online co-op by synchronizing players, enemies and projectiles over a socket.io relay server.",
 	"license": "MIT",
 	"author": "CCDirectLink",

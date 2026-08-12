@@ -35,10 +35,14 @@ import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
 import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
-import { dropNameTag, wipeAllNameTags } from './ui/mpOptions';
+import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
+import { closeMpWindows } from './ui/socialMenuInject';
 import { NetSync } from './sync/netSync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
+import { saveUploadQueue } from './sync/saveUploadQueue';
+import { showMpToast } from './ui/toasts';
+import { displayChat, clearChat } from './ui/chatBox';
 import { t } from './i18n';
 
 // CrossCode ships jQuery globally (declared in types.d.ts); overlays use it directly.
@@ -48,7 +52,7 @@ import { t } from './i18n';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.20.0';
+export const MP_VERSION = '1.53.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -64,6 +68,58 @@ export class Multiplayer {
 	 *  onPlayerChangeMap's loadingComplete, updated on enters/leaves). A later
 	 *  netSync gate consumes it. */
 	public playersOnThisMap: { [name: string]: boolean } = {};
+	/** Round 27 (item 2): the map each remote party MEMBER is currently on
+	 *  (username -> mapName). Seeded/updated by the per-second checkBotMaps publish
+	 *  (this client's OWN map via the cached memberMap, and every relayed packet for
+	 *  the remote members) and cleared on map change / logout. The party HUD reads
+	 *  it to hide an off-map member's HP/SP/EXP bars + grey their net diamond. */
+	public memberMapByName: { [name: string]: string } = {};
+	/** Round 27 (item 2): the HOST's map for each party BOT (botName -> mapName),
+	 *  from the extended partyBots broadcast. Same HUD consumer as memberMapByName. */
+	public botMapByName: { [name: string]: string } = {};
+	/** Round 27 (item 2): true when `name` (a party member or bot) is on THIS map —
+	 *  so its HP/SP/EXP bars show and its net diamond stays colored. Defaults TRUE
+	 *  (visible) when no map signal has arrived yet, so nothing hides prematurely.
+	 *  Precedence: our own remote mirrors use playersOnThisMap; a relayed memberMap
+	 *  then overrides (it can mark a shared-town non-mirror off-map); bots use
+	 *  botMapByName (falling back to _mpLeaderMap before the first tagged partyBots). */
+	public isPartyMateOnMap(name: string): boolean {
+		try {
+			if (!name || name === this.name) return true; // self is always on our map
+			const party: any = (sc as any).party;
+			const mdl = party && party.models ? party.models[name] : null;
+			// A REAL network member (mirror): same-map = we host their mirror (the
+			// roster onPlayerChangeMap maintains). Their relayed map — which also marks
+			// a shared-town non-mirror member — overrides when present. ROUND 31 (item 3):
+			// gate on the PARTY ROSTER (partyMembers), not just _mpName — a MOD bot (an
+			// offline friend invited as a follower) gets _mpName set in ensureMpModel but
+			// is never in the live roster and never relays memberMap/playersOnThisMap, so
+			// it fell to the line-97 hard `false` on EVERY map (host included), hiding its
+			// bars + greying the diamond permanently. Roster-gating sends those bots to the
+			// bot branch below (whose host guard marks the leader's own bots on-map).
+			if (mdl && mdl._mpName && this.partyMembers && this.partyMembers.indexOf(name) !== -1) {
+				if (this.memberMapByName[name] !== undefined) return this.memberMapByName[name] === this.currentMapName;
+				if (this.playersOnThisMap && this.playersOnThisMap[name] === true) return true;
+				return false; // _mpName but not a live mirror and no map signal -> off-map
+			}
+			// A BOT: its owner's (the host's) map. Prefer the tagged partyBots maps;
+			// fall back to the leader's confirmed map until the first tagged broadcast.
+			// ROUND 31 (item 3): the host guard must run BEFORE the botMapByName lookup —
+			// when WE host, every bot is definitionally on our map, and botMapByName is
+			// only refreshed on the 15s partyBots publish (checkBotRoster), so after we
+			// cross a map the cache still held the PREVIOUS map and the lookup below
+			// misjudged our OWN bots off-map for up to ~15s (hiding bars + grey diamond).
+			if (this.host) return true;
+			const bm = this.botMapByName[name];
+			if (bm !== undefined) return bm === this.currentMapName;
+			if (this._mpLeaderMap !== '') return this._mpLeaderMap === this.currentMapName;
+			return true;
+		} catch (_) { return true; }
+	}
+	/** Round 27 (item 2): per-second cache of OUR map so the memberMap publish (and
+	 *  any reader) can compare without re-reading ig.game mid-frame. */
+	private _mpOurMapCached = '';
+	private _mpLastMemberMapAt = 0;
 	public config: MultiplayerConfig;
 	public connection!: IConnection;
 	public name?: string;
@@ -101,7 +157,60 @@ export class Multiplayer {
 	private nextEID = 1;
 	private entitySpawnListener!: OnEntitySpawnListener;
 	private loadScreenHook = new LoadScreenHook();
-	private pendingSaveRestore?: string;
+	/** Round 23: the server STREAMS the save as paced saveDownload parts instead of
+	 * embedding it in handshakeResponse. The connector reassembles parts and fires
+	 * onSaveDownload once (or null for no save); this promise is created in connect()
+	 * and resolved by that callback, so launchGame can AWAIT it (with a timeout
+	 * fallback) before restoring. undefined when connect() never wired the listener. */
+	private _saveDownloadPromise?: Promise<string | undefined>;
+	/** Round 24 (save-clobber guard): false while the server save is STILL downloading
+	 * (restore not yet settled — download pending when the game starts fresh). ITEM 3
+	 * removed this gate from allowUpload — it no longer suppresses any upload — but
+	 * connect()/launchGame still write it per session; those writes are now inert and
+	 * kept only so the restore lifecycle looks unchanged. */
+	private _saveRestoreSettled = false;
+	/** Round 24: only log the upload-suppression warning once per session. Inert since
+	 * item 3 removed the round-24 gate from allowUpload. */
+	private _saveRestoreSuppressLogged = false;
+	/** Round 27: full-screen blocking overlay shown while the cloud save downloads
+	 * (launchGame holds the title -> game transition until the stream settles, so
+	 * the player can never enter the world on a fresh/stale save first). */
+	private _saveBlockEl: any = null;
+	private _saveBlockFill: any = null;
+	private _saveBlockInfo: any = null;
+	/** Round 27: true while the block overlay is up — onConnectionLost unblocks
+	 * with a failure message instead of letting a dead stream soft-lock the title. */
+	private _mpSaveBlocked = false;
+	/** Round 27: guards the fallback game start against a disconnect/resolve race
+	 * (whichever unblocks first starts the game; the other becomes a no-op). */
+	private _mpSaveBlockStarted = false;
+	/** Round 23: the upload reason for the NEXT save the storage hook fires (the
+	 * onStorageSave hook is the single upload choke point; the trigger knows WHY it
+	 * saved — area/landmark/manual/exit/other — and sets this first). Consumed once. */
+	private _mpPendingSaveReason: 'area' | 'landmark' | 'manual' | 'exit' | 'other' = 'other';
+	/** ROUND 30 (item 6): true while the CURRENT onStorageSave fire carries an
+	 * explicitly stamped reason (setSaveReason before a saveNow/saveCurrentLocation
+	 * checkpoint save). A hook fire with this false is the ENGINE's own unstamped
+	 * map-change checkpoint save — allowUpload treats it as an area save so the 60s
+	 * limit actually throttles rapid map changes. Set true in setSaveReason, reset
+	 * in the hook (consumeSaveReason), never written elsewhere. */
+	private _mpStampedThisHook = false;
+	/** ITEM 1: Date.now() deadline before which NO save upload happens at all (covers
+	 * "登录、进入游戏" — login + entering the game). Armed at identify success in
+	 * connect() and re-armed when ig.game.start() fires (launchGame/unblockSaveBlock),
+	 * so the 5s window starts at whichever moment is latest. While Date.now() < this,
+	 * allowUpload returns false for EVERY reason (exit included). */
+	private _saveSuppressUntil = 0;
+	/** ITEM 1: log the 5s upload suppression once per suppression window. */
+	private _saveSuppressLogged = false;
+	/** ITEM 3: SHARED 60s anti-spam timer for area-change + teleport-point (landmark)
+	 * unlock saves — at most one such upload per 60s. Starts at 0 so the FIRST save of
+	 * the kind always uploads. Deliberately NOT reset on reconnect (anti-spam, not
+	 * per-session). */
+	private _lastAutoSaveAt = 0;
+	/** ITEM 3: INDEPENDENT 60s anti-spam timer for MANUAL saves, separate from the
+	 * map-move timer. Same zero-start / never-reset semantics. */
+	private _lastManualSaveAt = 0;
 	private _readyHookInstalled = false;
 	private _pendingReady: Array<() => void> = [];
 	private socialOverlay!: SocialOverlay;
@@ -130,6 +239,25 @@ export class Multiplayer {
 	}
 	public getAreaTypeOfMap(mapName: string): number {
 		return areaTypeOfMap(mapName);
+	}
+	/** Round 23 wave 4 (party chat): true when the game is in a playable state
+	 * (player entity exists, not teleporting). Mirrors mpOptions.inGameOk so the
+	 * chat module (which cannot import mpOptions — import cycle) has a gate. */
+	public inGameOk(): boolean {
+		try {
+			const g: any = (ig as any).game;
+			if (!g || !g.playerEntity) return false;
+			if (typeof g.isTeleporting === 'function' && g.isTeleporting()) return false;
+			return true;
+		} catch (_) { return false; }
+	}
+	/** Round 23 wave 4 (party chat): true when any native menu is open. Mirrors
+	 * mpOptions.anyMenuOpen (same cycle reason as inGameOk). */
+	public anyMenuOpen(): boolean {
+		try {
+			const menu: any = (sc as any).menu;
+			return !!(menu && menu.menuStack && menu.menuStack.length > 0);
+		} catch (_) { return false; }
 	}
 
 	constructor(config?: MultiplayerConfig) {
@@ -210,6 +338,11 @@ export class Multiplayer {
 		// host). We always start as our own host so enemies spawn locally.
 		this.host = true;
 
+		// Round 21: a fresh session starts at the chosen host tick rate (netSync is
+		// created in initializeListeners above, so this is the boot host-acquire
+		// latch — the option is read once here, not live).
+		try { if (this.netSync) this.netSync.setBlockInterval(this.getHostTickInterval()); } catch (_) { /* ignore */ }
+
 		// Round 16 (issue 4): read the server's per-extra-party-member enemy max-HP
 		// fraction off the handshake (handshakeResponse.hpScale, default 0.5) and hand
 		// it to netSync, which scales monster max/current HP by party size at spawn —
@@ -217,13 +350,40 @@ export class Multiplayer {
 		if (typeof result.hpScale === 'number' && isFinite(result.hpScale)) this.mpHpScale = result.hpScale;
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
 
-		// If the server has a save for us, restore it instead of starting fresh.
-		if (result.save && result.save.data) {
-			this.pendingSaveRestore = result.save.data;
-			console.log('[multiplayer] Server save found; will restore on game start');
-		} else {
-			console.log('[multiplayer] No server save; starting from local/new game');
-		}
+		// Round 23: the server no longer embeds the save in handshakeResponse — it
+		// streams it as paced saveDownload parts right after the handshake. Register
+		// the download listener NOW (the connector buffers parts until then) and store
+		// the RESULT as a promise so launchGame/onceGameReady can await it (with a
+		// timeout fallback) before restoring.
+		// Round 24: re-arm the save-clobber guard per session (inert since item 3 —
+		// the writes are kept only so the restore lifecycle looks unchanged).
+		this._saveRestoreSettled = false;
+		this._saveRestoreSuppressLogged = false;
+		// ITEM 1: from the moment the player logs in, NO save uploads for 5s. The
+		// game-start path re-arms it too (launchGame/unblockSaveBlock), so the window
+		// really starts when the game enters the world, whichever happens last.
+		this._saveSuppressUntil = Date.now() + 5000;
+		this._saveSuppressLogged = false;
+		// Round 27: re-arm the download-block state per session (flags consumed by
+		// launchGame's overlay gate and onConnectionLost's unblock path).
+		this._mpSaveBlocked = false;
+		this._mpSaveBlockStarted = false;
+		// Round 27 (item 5): re-arm the exit-to-title upload state per session so a prior
+		// session's in-flight exit can't bleed into this one.
+		this._mpExitUploadActive = false;
+		this._mpExitUploadResolve = null;
+		this._mpSuppressNextExitUpload = false;
+		let resolveDownload: (data: string | undefined) => void = () => { /* no-op */ };
+		this._saveDownloadPromise = new Promise<string | undefined>((res) => { resolveDownload = res; });
+		this.connection.onSaveDownload((download) => {
+			const data = download && download.slot === 'autoSlot' ? download.data : undefined;
+			if (data) {
+				console.log('[multiplayer] Server save downloaded (' + data.length + ' bytes); will restore on game start');
+			} else {
+				console.log('[multiplayer] No server save; starting from local/new game');
+			}
+			resolveDownload(data);
+		});
 	}
 
 	public registerEntity(entity: ig.Entity): number {
@@ -424,6 +584,12 @@ export class Multiplayer {
 			(entity as any)._mpMirror = true;
 			entity.proxies = ig.game.playerEntity.proxies;
 			this.lockEntity(entity, position);
+			// Round 21 (issue 1): 1s no-collision grace after mirror SPAWN (covers remote
+			// player map-enter, remote revival re-spawn, and pvp-isolation exit re-spawns).
+			// The single per-frame coll decision-maker (netSync.updateRemoteMirrorFade)
+			// forces this mirror's coll.type to IGNORE until the deadline so the local
+			// player can't overlap it. Expires by time — no explicit cleanup needed.
+			(entity as any)._mpNoCollUntil = Date.now() + 1000;
 			this.players[player] = { name: player,
 				position: { x: position.x, y: position.y, z: position.z },
 				entity } as IPlayer;
@@ -467,7 +633,125 @@ export class Multiplayer {
 			// Expose the instance for the NetSync enemy-puppet inject (Enemy.update runs
 			// outside our class scope, so it reaches the host flag via this global).
 			(window as any).__mpMain = this;
+			// ROUND 53 (diagnostics, READ-ONLY): __mpnav() probes WHY an engaged enemy
+			// holding a member's mirror never closes to attack range. CrossCode's approach
+			// is gated by NAVIGATE_TO_TARGET -> NavPath.redoPath -> A* (j), which returns
+			// EMPTY when either entity's nav node (module-local helper `c`) is null /
+			// airNode, and STICKS via ig.navigation.cachedFailure once a pair has failed.
+			// This dump replicates helper `c` + the reachability walk (g) from the console
+			// so we can see, per engaged enemy, which hop actually blocks the approach.
+			// Purely reads state + console.table; never mutates anything.
+			(window as any).__mpnav = () => {
+				try {
+					const g: any = ig.game;
+					const nav: any = (ig as any).navigation;
+					const lvlNav = (li: number) => { for (; g.levels[li] && !g.levels[li].navigation;) li--; return g.levels[li] && g.levels[li].navigation; };
+					const cNode = (e: any) => { // exact replica of nav helper c(entity)
+						try {
+							let z = (e.jumping ? e.coll.pos.z : e.coll.baseZPos) + 8;
+							let li = g.getLevelIdx(z);
+							let d = lvlNav(li);
+							if (!d) { li = g.getLevelIdx(z + 16); d = lvlNav(li); if (!d) return { node: null, lvl: li, how: 'noNavLevel' }; }
+							const H = e.getCenter(); const zh = d.zHeight;
+							const a = e.coll; const off = zh;
+							const P = [
+								[H.x, H.y - off, 'ctr'],
+								[a.pos.x, a.pos.y - off, 'c1'],
+								[a.pos.x + a.size.x, a.pos.y - off, 'c2'],
+								[a.pos.x, a.pos.y + a.size.y - off, 'c3'],
+								[a.pos.x + a.size.x, a.pos.y + a.size.y - off, 'c4'],
+								[a.pos.x - 8, H.y - off, 'c5'],
+								[a.pos.x + a.size.x + 8, H.y - off, 'c6'],
+								[H.x, a.pos.y - 8 - off, 'c7'],
+								[H.x, a.pos.y + a.size.y + 8 - off, 'c8']];
+							for (const [x, y, how] of P) { const n = d.getNode(x as number, y as number); if (n && !n.airNode) return { node: n, lvl: li, how }; }
+							return { node: null, lvl: li, how: 'allAirOrNull' };
+						} catch (err) { return { node: null, lvl: -1, how: 'throw:' + (err && (err as any).message) }; }
+					};
+					const mirrors: any[] = g.entities.filter((x: any) => x && x._mpMirror && !x._killed);
+					const engs: any[] = g.entities.filter((x: any) => x && !x._killed && !x._mpMirror && !x._mpPuppet && x.target && x.target._mpMirror);
+					const fmt = (e: any, r: any) => ({
+						pos: e ? Math.round(e.coll.pos.x) + ',' + Math.round(e.coll.pos.y) + ' z=' + Math.round(e.coll.pos.z) : '-',
+						baseZ: e ? Math.round(e.coll.baseZPos) : '-', lvl: r.lvl, how: r.how,
+						node: r.node ? ('id' + r.node.id + ' h' + r.node.height + (r.node.airNode ? ' AIR' : '')) : 'NULL',
+						jump: e ? !!e.jumping : '-'
+					});
+					console.log('[mpnav] mirrors=' + mirrors.length + ' engagedOnMirror=' + engs.length + ' nav.empty=' + (nav && nav.empty) + ' mapVer=' + (nav && nav.mapVersion));
+					for (const m of mirrors) { const r = cNode(m); console.log('[mpnav] MIRROR ' + m.name, fmt(m, r)); }
+					for (const e of engs) {
+						const tgt = e.target;
+						const er = cNode(e); const tr = cNode(tgt);
+						let reach: any = '-', path: any = '-', cached: any = '-';
+						try { reach = nav.isTargetReachable(e, tgt, 200, false); } catch (err) { reach = 'throw'; }
+						if (er.node && tr.node) {
+							try { cached = !!nav.isCachedFailure(er.node, tr.node, e); } catch (_) { cached = '?'; }
+							try { const p = new (ig as any).NavPath(e); p.toEntity(tgt, 70); path = p.path ? ('len=' + p.path.nodes.length) : 'NULL'; } catch (err) { path = 'throw:' + (err && (err as any).message); }
+						} else path = 'n/a(node null)';
+						let st = '-', act = '-';
+						try { st = e.currentState && e.currentState.name; } catch (_) { }
+						try { act = e.currentAction && e.currentAction.name; } catch (_) { }
+						console.log('[mpnav] ENEMY uid=' + e.uid + ' type=' + (e.enemyType && e.enemyType.name || e.enemyType) + ' -> tgt=' + (tgt && tgt.name),
+							'dist=' + Math.round(e.distanceTo(tgt)), 'state=' + st, 'action=' + act, 'reach200=' + reach, 'AStar=' + path, 'cachedFail=' + cached);
+						console.log('    enemy ', fmt(e, er));
+						console.log('    target', fmt(tgt, tr));
+					}
+					if (!engs.length) console.log('[mpnav] no enemy currently targets a mirror — reproduce the freeze, then re-run __mpnav()');
+				} catch (e) { console.error('[mpnav] failed', e); }
+			};
 		}
+		// ROUND 53 (diagnostics, READ-ONLY): __mpai() answers the OTHER half __mpnav
+		// can't — when NO enemy targets the mirror, WHY? The freeze dump showed
+		// engagedOnMirror=0 with a healthy mirror node, so the real bug is that the
+		// enemy never SELECTS the member's mirror as its target. This lists every
+		// live non-mirror enemy near the member's mirror and, for each, reports what
+		// it currently targets, how far it is from the mirror, and which gate blocks
+		// acquisition (holds another target / cross-block / out of detect+lose range /
+		// z-delta / no onDistance). Purely reads + console.log; never mutates.
+		(window as any).__mpai = () => {
+			try {
+				const g: any = ig.game;
+				const pl: any = g.playerEntity;
+				const mirs: any[] = g.entities.filter((x: any) => x && x._mpMirror && !x._killed);
+				const mir: any = mirs[0];
+				if (!mir) { console.log('[mpai] no live mirror on this client'); return; }
+				const mpos = mir.coll.pos;
+				const near: any[] = g.entities.filter((e: any) => {
+					try {
+						return e && !e._killed && !e._mpMirror && !e._mpPuppet && e.enemyType
+							&& e.targetDetect && e.coll && Math.abs(e.coll.pos.x - mpos.x) < 700 && Math.abs(e.coll.pos.y - mpos.y) < 700;
+					} catch (_) { return false; }
+				});
+				console.log('[mpai] mirror=' + (mir && mir.name) + ' @ ' + Math.round(mpos.x) + ',' + Math.round(mpos.y) + ' z=' + Math.round(mpos.z) + ' | host @ ' + (pl ? Math.round(pl.coll.pos.x) + ',' + Math.round(pl.coll.pos.y) + ' z=' + Math.round(pl.coll.pos.z) : '-') + ' | enemiesNear=' + near.length);
+				for (const e of near) {
+					let tn = '(none)', td2 = -1;
+					try { const t = e.target; tn = t ? (t._mpMirror ? ('MIRROR:' + t.name) : (t === pl ? 'HOST' : (t.name || t.constructor && t.constructor.name || '?'))) : '(none)'; td2 = t ? Math.round(e.distanceTo(t)) : -1; } catch (_) { }
+					const dMir = Math.round(e.distanceTo(mir));
+					const dz = Math.round(Math.abs(e.coll.pos.z - mir.coll.pos.z));
+					let sameBlock = true;
+					try { sameBlock = g.getLevelIdx(e.coll.pos.z) === g.getLevelIdx(mir.coll.pos.z); } catch (_) { sameBlock = true; }
+					const td = e.targetDetect || {};
+					const dd = td.detectDistance || 0, ld = td.loseDistance || 0;
+					const acquire = Math.max(dd, ld);
+					let why = '';
+					if (e.target && e.target !== mir) why = 'holds ' + tn + ' (acquire branch needs !target)';
+					else if (!sameBlock) why = 'cross-block';
+					else if (!(dMir < acquire)) why = 'mirror ' + dMir + 'px > acquire ' + acquire + ' (detect ' + dd + ' / lose ' + ld + ')';
+					else if (td.detectZDelta && dz >= td.detectZDelta) why = 'z-delta ' + dz + ' >= ' + td.detectZDelta;
+					else if (!(td.onDistance || td.onCloseBattle)) why = 'no onDistance/onCloseBattle';
+					else why = 'SHOULD-ACQUIRE (all gates pass)';
+					let st = '-', act = '-';
+					try { st = e.currentState && e.currentState.name; } catch (_) { }
+					try { act = e.currentAction && e.currentAction.name; } catch (_) { }
+					console.log('[mpai] uid=' + e.uid + ' type=' + (e.enemyType && e.enemyType.name || e.enemyType)
+						+ ' | tgt=' + tn + (td2 >= 0 ? ' (' + td2 + 'px)' : '')
+						+ ' | dMirror=' + dMir + ' dz=' + dz + ' sameBlock=' + sameBlock
+						+ ' | detect=' + dd + ' lose=' + ld + ' | ' + st + '/' + act
+						+ ' | engaged=' + (e._mpEngaged && e._mpEngaged.name || '-')
+						+ ' | WHY=' + why);
+				}
+				if (!near.length) console.log('[mpai] no enemies within 700px of the mirror — stand test2 near the frozen enemy and re-run');
+			} catch (err) { console.error('[mpai] failed', err); }
+		};
 		this.initializeConnectionHooks();
 		// New whole-state sync (players + host enemy block). Re-wired each connect so it
 		// binds to the current socket; the inject inside is once-guarded.
@@ -491,9 +775,10 @@ export class Multiplayer {
 		// Round 17 (issue 1): the HOST's real enemy started an attack — relayed to the
 		// instance. Replay it on the matching member-side puppet toward the local player
 		// (puppets no longer run local AI; this keeps round-2 monster-attacks-members at
-		// host-determined moments).
-		this.connection.onEnemyAttack((uid, anim) => {
-			try { this.netSync && this.netSync.applyEnemyAttack(uid, anim); } catch (_) { /* ignore */ }
+		// host-determined moments). Round 22 (RC1): `t` = the targeted member's username
+		// (null = host/bot/unknown) — only that member schedules the local hit.
+		this.connection.onEnemyAttack((uid, anim, t) => {
+			try { this.netSync && this.netSync.applyEnemyAttack(uid, anim, t); } catch (_) { /* ignore */ }
 		});
 		// Host migration: respawn puppet enemies as real AI-driven ones.
 		this.onPromotedToHost = () => { try { this.netSync && this.netSync.promoteToHost(); } catch (e) { /* ignore */ } };
@@ -635,7 +920,30 @@ export class Multiplayer {
 		this.socialOverlay.registerOnce();
 		this.socialOverlay.wireConnection();
 
-		this.registerLobbySocial();
+		// Round 23: point the chunked save-upload queue at the CURRENT connection
+		// (re-wired every connect — the connection object is recreated per session).
+		saveUploadQueue.attach(this.connection);
+
+		// Round 23: the server confirmed a save upload finished persisting — show the
+		// generic save-success toast (wave 3 reuses this toast module for other events).
+		// Round 24: gated on the mod option (default ON) so players can silence it.
+		this.connection.onSaveSaved((slot, bytes) => {
+			try {
+				if (!getMpOption('showSaveToast')) return;
+				showMpToast({ title: t('toastSaveDone'), subtitle: slot && slot !== 'autoSlot' ? slot : undefined });
+			} catch (_) { /* a toast must never break the frame */ }
+		});
+
+		// Round 27 (item 5): the exit-to-title upload dialog resolves on the server's
+		// saveSaved/saveFailed ack — wire those listeners now (the connection is fresh
+		// per session, so this re-wires each connect without stacking).
+		this.wireExitUploadAcks();
+
+		// Round 27: belt-and-braces on the whole registration list — the
+		// per-registration isolation inside registerLobbySocial already prevents a
+		// throw from escaping, but a future non-registration step must never be able
+		// to abort the connect sequence either.
+		try { this.registerLobbySocial(); } catch (e) { console.error('[multiplayer] lobby wiring failed:', e); }
 	}
 
 	/**
@@ -651,7 +959,22 @@ export class Multiplayer {
 	private registerLobbySocial(): void {
 		const conn = this.connection;
 
-		conn.onPartyUpdate((party) => {
+		// Round 27 (toast wiring fix): EVERY conn.on* registration below is isolated
+		// in its own try/catch. A single failing registration/handler install must
+		// never silently kill the registrations after it — the friend/party toasts
+		// are wired late in this list, and registerLobbySocial() runs on every
+		// connect, so one bad step would leave them unwired while the save toast
+		// (registered earlier in initializeConnectionHooks) still worked.
+		const safeWire = <A extends any[]>(reg: (fn: (...args: A) => void) => void, fn: (...args: A) => void): void => {
+			try { reg(fn); } catch (e) { console.error('[multiplayer] lobby wiring error:', e); }
+		};
+
+		safeWire(conn.onPartyUpdate.bind(conn), (party) => {
+			// Round 23 wave 3: roster-change toasts (member joined / left-with-manner).
+			// Diffed BEFORE the roster is overwritten so we know what changed. The
+			// departure manner (lastLeft) rides the same payload from the server.
+			this.notifyPartyRosterChange(this.partyMembers.slice(), party ? party.members.slice() : [], party && party.lastLeft);
+
 			this.partyMembers = party ? party.members.slice() : [];
 			this.partyLeader = party ? party.leader : undefined;
 			this.applyPartyRoster(this.partyMembers);
@@ -667,6 +990,10 @@ export class Multiplayer {
 				// projected position. The per-frame applyNameTagsNow rebuilds fresh for
 				// whatever is still live next frame.
 				try { wipeAllNameTags(); } catch (_) { /* ignore */ }
+				// Round 23 wave 4: party disband/kick -> clear the party-chat overlay and
+				// close the input (a disbanded party has nobody left to talk to; no chat
+				// residue may leak into the next party/session).
+				try { clearChat(); } catch (_) { /* ignore */ }
 				// Round 16: party lost on a wild map -> self-reload it as solo host
 				// (kick received / voluntary leave / 2-person disband all surface here).
 				// The teleport wrapper awaits changeMapResponse, which flips host=true
@@ -686,9 +1013,20 @@ export class Multiplayer {
 			this.syncBotStream();
 		});
 
+		// Round 23 wave 4: PARTY CHAT — a teammate's message arrived (server-relayed
+		// to same-instance party members only). Render it in the chat display. The
+		// server never echoes to the sender, but the self-check is belt-and-braces.
+		safeWire(conn.onChat.bind(conn), (msg) => {
+			try {
+				if (!msg || typeof msg.text !== 'string' || !msg.text) return;
+				if (msg.from === this.name) return;
+				displayChat(msg.from, msg.text);
+			} catch (_) { /* a message must never break the socket */ }
+		});
+
 		// After accepting an invite the server tells us to regroup: disband our
 		// current party (server already did) and teleport next to the leader.
-		conn.onPartyMove((data) => {
+		safeWire(conn.onPartyMove.bind(conn), (data) => {
 			this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos);
 		});
 
@@ -699,27 +1037,51 @@ export class Multiplayer {
 		// reassert stays as belt-and-braces — and it now RETRIES when it arrives
 		// mid-teleport instead of being silently dropped forever (that drop was one
 		// half of the "同图组队互不可见" bug).
-		conn.onPartyReSync(() => {
+		safeWire(conn.onPartyReSync.bind(conn), () => {
 			this.reassertWhenReady(0);
 		});
 
 		// Round 11: the HOST broadcasts the native party bots in the roster; member
 		// clients spawn their own local follower copies so everyone sees them.
-		conn.onPartyBots((bots) => {
+		safeWire(conn.onPartyBots.bind(conn), (bots, maps) => {
+			// Round 23 wave 3: toast newly-announced bots (only while we're actually
+			// in a party — the host re-broadcasts bots periodically, so gate on the
+			// roster size AND only for names we didn't already have).
+			try {
+				if (this.partyMembers && this.partyMembers.length > 1) {
+					for (const b of (bots || [])) {
+						if (this.partyBots.indexOf(b) === -1 && b && b !== this.name) {
+							showMpToast({ title: t('partyMemberJoined').replace('{name}', b) });
+						}
+					}
+				}
+			} catch (_) { /* a toast must never break the roster handler */ }
+			// Round 27 (item 2): cache the per-bot owner map for the off-map HUD.
+			if (maps) { try { this.botMapByName = maps; } catch (_) { /* ignore */ } }
 			this.applyPartyBots(bots);
 		});
 
 		// Round 13: the party LEADER streams live bot state (pos/anim/hp/level) ~15 Hz;
 		// members apply it to their local puppet copies (their own bot AI is suppressed).
-		conn.onBotState((data) => {
+		safeWire(conn.onBotState.bind(conn), (data) => {
 			this.applyBotState(data);
+		});
+
+		// Round 27 (item 2): a party member relayed their current map — cache it so the
+		// party HUD hides an off-map member's bars + greys their net diamond. Our own
+		// echo is ignored (self is always on our map).
+		if (conn.onMemberMap) safeWire(conn.onMemberMap.bind(conn), (name, map) => {
+			try {
+				if (!name || name === this.name) return;
+				this.memberMapByName[name] = map;
+			} catch (_) { /* ignore */ }
 		});
 
 		// Round 17: remote players report their own RTT once per second; the server
 		// relays it to the instance as playerPing. Cache it by name so the 显示ping值
 		// name-tag label can append it to a teammate's tag. Ignore our own echoes
 		// (the own tag always shows the LOCAL connector pingMs instead).
-		conn.onPlayerPing((name, ping, isHost) => {
+		safeWire(conn.onPlayerPing.bind(conn), (name, ping, isHost) => {
 			try {
 				if (!name || name === this.name) return;
 				// Round 20: the reporter is the map-instance host — record it so the
@@ -727,6 +1089,16 @@ export class Multiplayer {
 				// receives its own relay (the own tag reads main.host instead), and host
 				// migration self-corrects within ~1s via the next host's pingReport.
 				if (isHost) this.instanceHost = name;
+				// ROUND 32 (item 1): if WE are this instance's host, no OTHER remote player
+				// can be the host. The 30s-migration window (server waits ~30s before
+				// promoting a new host, then relays the old host's departure) leaves a
+				// STALE instanceHost == an entering member's name on our client, so their
+				// tag wrongly read " (Host)" while our own tag also read " (Host)". When
+				// we're the authoritative host, every remote ping that ISN'T flagged is
+				// definitive proof that player is not the host — demote them. (We never
+				// demote when we're NOT host: two remote candidates can both be stale, and
+				// the real host's next isHost:true relay re-asserts the correct one.)
+				else if (this.host && this.instanceHost === name) this.instanceHost = undefined;
 				if (typeof ping === 'number' && isFinite(ping) && ping >= 0) this.remotePings[name] = Math.round(ping);
 			} catch (_) { /* ignore */ }
 		});
@@ -734,14 +1106,17 @@ export class Multiplayer {
 		// Live HP/SP for the in-game party HUD (top-left bars). Fired per-change by each
 		// client about itself, so it's near-real-time (no 3s wait). Write straight onto
 		// the injected PartyMemberModel — that's exactly what HpHudBarGui/SpMiniHudGui read.
-		conn.onPlayerStats((player, stats) => {
+		safeWire(conn.onPlayerStats.bind(conn), (player, stats) => {
 			try {
 				if (!player || player === this.name) return;
 				const model: any = (sc as any).party && (sc as any).party.models && (sc as any).party.models[player];
 				if (model && model.params) {
 					const p: any = model.params;
 					const hpBefore = p.currentHp;
-					if (typeof stats.hp === 'number') p.currentHp = stats.hp;
+					// Round 22: a DEAD teammate's HP is owned by netSync as -maxHp (the
+					// HpHudBarGui flash trigger). Never overwrite it with the stale live
+					// hp/0 this notify carries, or the flash dies and the bar sits constant red.
+					if (!model._mpDead && typeof stats.hp === 'number') p.currentHp = stats.hp;
 					if (typeof stats.maxHp === 'number' && stats.maxHp > 0 && p.baseParams) p.baseParams.hp = stats.maxHp;
 					if (typeof stats.sp === 'number') p.currentSp = stats.sp;
 					if (typeof stats.maxSp === 'number' && stats.maxSp > 0) p.maxSp = stats.maxSp;
@@ -766,14 +1141,30 @@ export class Multiplayer {
 			} catch (e) { /* ignore */ }
 		});
 
-		// Friend requests surface as a single accept/decline box — handled by the
-		// Social-menu module (ui/socialMenuInject.ts wireConnection). Registering a
-		// second onFriendRequest here would stack TWO popups per request.
+		// Friend-request notifications surface via showMpToast (round 23 wave 3) —
+		// wired in the Social-menu module (ui/socialMenuInject.ts wireConnection), so
+		// the 申请管理 (Requests) tab is the single place requests are acted on.
+		// Registering a second onFriendRequest here would double-toast.
+
+		// Round 23 wave 3: friendship/lifecycle toasts pushed by the server (the
+		// Social-menu module handles the request-received toast on its own wiring).
+		safeWire(conn.onFriendAdded.bind(conn), (name) => {
+			if (!name) return;
+			showMpToast({ title: t('friendAddedToast').replace('{name}', name) });
+		});
+		safeWire(conn.onFriendRequestWithdrawn.bind(conn), (name) => {
+			if (!name) return;
+			showMpToast({ title: t('friendRequestWithdrawnToast').replace('{name}', name) });
+		});
+		safeWire(conn.onFriendRequestDeclined.bind(conn), (name) => {
+			if (!name) return;
+			showMpToast({ title: t('friendRequestDeclinedToast').replace('{name}', name) });
+		});
 
 		// Real remote-player profiles for the Social info box. Cache them AND push
 		// them onto the injected PartyMemberModel so the native info box reads the
 		// right stats/gear directly.
-		conn.onPlayerProfile((player, profile) => {
+		safeWire(conn.onPlayerProfile.bind(conn), (player, profile) => {
 			const isNew = !this.playerProfiles[player];
 			this.playerProfiles[player] = profile;
 			// If we got a profile for someone with no injected model yet (e.g. a party
@@ -795,12 +1186,12 @@ export class Multiplayer {
 		});
 
 		// Server online count — cached here so the top-bar chip always has a value.
-		conn.onOnlineCount((count) => {
+		safeWire(conn.onOnlineCount.bind(conn), (count) => {
 			this.onlineCount = count;
 		});
 
 		// Pull presence so friend online/offline dots update live.
-		conn.onPresence((player, online) => {
+		safeWire(conn.onPresence.bind(conn), (player, online) => {
 			this.friendPresence[player] = online;
 			this.updateMpContactOnline(player, online);
 			if (!online) {
@@ -1129,6 +1520,36 @@ export class Multiplayer {
 		try { if (this.socialOverlay) this.socialOverlay.showToast(message); } catch (_) { /* ignore */ }
 	}
 
+	/** Round 21 (issue 3): wipe-and-rebuild name tags. Called from netSync on ANY
+	 * player's death/revival so a tag can't survive a soft death (round-20's per-frame
+	 * visibility guards failed in play-test under latency). The per-frame pump
+	 * (applyNameTagsNow) rebuilds tags for live entities on the next frame. NetSync
+	 * calls this instead of importing wipeAllNameTags directly to avoid a
+	 * netSync -> mpOptions import cycle. */
+	public wipeTags(): void {
+		try { wipeAllNameTags(); } catch (_) { /* ignore */ }
+	}
+
+	/** Round 21: the host enemy-block tick interval (seconds) from the options tab
+	 * (hostTickRate 15/30/60 -> 1/rate). Rounds a garbage value back to 30Hz. Read
+	 * ONLY at host-acquire (the latch points call netSync.setBlockInterval with it),
+	 * never live. Routed here so the listener files and netSync never need to import
+	 * mpOptions (avoids a netSync -> mpOptions import cycle, same as wipeTags). */
+	public getHostTickInterval(): number {
+		const r = Number(getMpOption('hostTickRate')) || 30;
+		return 1 / r;
+	}
+
+	/** Round 23: the own playerState send interval (ms) from the options tab
+	 * (playerStateRate 10/20/30/60 -> 1000/rate). Rounds a garbage value back to 10Hz.
+	 * Read LIVE every tick (hot-applies on the next packet), so this is deliberately
+	 * NOT latched like getHostTickInterval. Routed here so netSync never has to import
+	 * mpOptions (avoids the netSync -> mpOptions import cycle, same as getHostTickInterval). */
+	public getPlayerStateMs(): number {
+		const r = Number(getMpOption('playerStateRate')) || 10;
+		return 1000 / r;
+	}
+
 	/**
 	 * Feeds the native Social party box from the server roster. We inject a
 	 * PartyMemberModel + contact per remote member (online, friend-status so the
@@ -1203,6 +1624,54 @@ export class Multiplayer {
 		this.refreshOpenSocialMenu();
 	}
 
+	/**
+	 * Round 23 wave 3: toast party roster changes — a NEW member (player) → "X joined
+	 * the party"; a REMOVED member → toast with the departure manner from `lastLeft`
+	 * (left / kicked / disconnected; absent defaults to left). Suppressed while we're
+	 * NOT in a party (an empty roster = disband/solo), so a kicked/left player never
+	 * toasts about their own removal and empty→empty updates stay silent.
+	 */
+	private notifyPartyRosterChange(prev: string[], next: string[], lastLeft?: { name: string, reason: string }): void {
+		try {
+			if (!this.name) return;
+			// Disband / not in a party -> suppress everything (including our own
+			// removal, which always lands here as next=[] when the party collapses).
+			if (!next.length) return;
+			// Round 24: diff against SELF-presence, not roster sizes. selfInPrev = we
+			// were already in the party; selfInNext = we still are.
+			const selfInPrev = prev.indexOf(this.name) !== -1;
+			const selfInNext = next.indexOf(this.name) !== -1;
+			// JOIN toasts: announce members arriving while WE were already in the
+			// party. When YOU join an existing party, selfInPrev is false (you weren't
+			// there before) so the pre-existing members are NOT all toasted as
+			// "joined". A new member joining your party — even as the 2nd member
+			// (prev=[self]) — IS announced.
+			if (selfInPrev) {
+				for (const n of next) {
+					if (n && n !== this.name && prev.indexOf(n) === -1) {
+						showMpToast({ title: t('partyMemberJoined').replace('{name}', n) });
+					}
+				}
+			}
+			// REMOVAL toasts run only while WE remain in the party (selfInNext) — a
+			// kicked/left player never toasts about their own removal, and a disbanded
+			// party (next=[]) is fully silent. A 2-person party where the partner
+			// departs (next=[self]) still toasts "X left". Only skip when the
+			// departure is OUR OWN (lastLeft.name === this.name).
+			if (selfInNext) {
+				for (const n of prev) {
+					if (!n || n === this.name || next.indexOf(n) !== -1) continue;
+					if (lastLeft && lastLeft.name === this.name) continue;
+					const reason = lastLeft && lastLeft.name === n ? lastLeft.reason : 'left';
+					const key = reason === 'kicked' ? 'partyMemberKicked'
+						: reason === 'disconnected' ? 'partyMemberDisconnected'
+						: 'partyMemberLeft';
+					showMpToast({ title: t(key).replace('{name}', n) });
+				}
+			}
+		} catch (_) { /* a toast must never break the roster handler */ }
+	}
+
 	/** Round 11 HOST side: detect native party BOTS (models without _mpName) in
 	 * the roster and publish changes to the instance. Runs once per second. Also
 	 * force-republishes every 15s so ordering edge cases (a member's partyUpdate
@@ -1229,12 +1698,49 @@ export class Multiplayer {
 			}
 			const key = bots.join('|');
 			const now = Date.now();
+			// Round 27 (item 2): every bot's owner is the HOST, so tag each with OUR map —
+			// the party HUD greys/hides a bot whose owner is off the member's map.
+			const maps: { [botName: string]: string } = {};
+			for (const b of bots) maps[b] = this.currentMapName;
+			// ROUND 31 (item 3): refresh the local botMapByName EVERY tick, BEFORE the
+			// publish throttle. We always have the authoritative map for our own bots;
+			// gating this write behind the 15s publish throttle left the cache holding
+			// the PREVIOUS map after we crossed, so isPartyMateOnMap's botMapByName
+			// lookup misjudged our own bots off-map (hiding bars + grey diamond) until
+			// the next publish. The network emit below stays throttled.
+			this.botMapByName = maps;
 			if (key === this._lastSentBots && now - this._lastBotPublish < 15000) return;
 			this._lastSentBots = key;
 			this._lastBotPublish = now;
 			this.partyBots = bots;
-			this.connection.partyBots(bots);
+			this.connection.partyBots(bots, maps);
 			console.log('[multiplayer] publishing party bots: ' + JSON.stringify(bots));
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Round 27 (item 2): publish OUR map for every remote party member (and read
+	 * back the map each relayed member is on), so the party HUD can hide an off-map
+	 * teammate's HP/SP/EXP bars + grey their net diamond. Emits once a second when a
+	 * party exists (also throttled on the change itself). The packet is tiny; a relay
+	 * per remote member updates that member's entry in memberMapByName. */
+	private checkBotMaps(): void {
+		try {
+			if (!this.connection || !this.connection.isOpen()) return;
+			const roster = this.partyMembers || [];
+			if (roster.length <= 1) { this._mpOurMapCached = this.currentMapName; return; }
+			const map = this.currentMapName;
+			this._mpOurMapCached = map;
+			if (!map || !ig.game || !ig.game.playerEntity) return;
+			// Skip only when BOTH the map is unchanged AND we published < 1s ago (the
+			// 1s interval re-sends so a late joiner's HUD learns our map without waiting).
+			const now = Date.now();
+			if (this._mpLastMemberMapAt && now - this._mpLastMemberMapAt < 1000
+				&& (this as any)._mpLastPublishedMap === map) return;
+			(this as any)._mpLastPublishedMap = map;
+			this._mpLastMemberMapAt = now;
+			if (typeof (this.connection as any).memberMap === 'function') {
+				(this.connection as any).memberMap(map);
+			}
 		} catch (_) { /* ignore */ }
 	}
 
@@ -1673,6 +2179,17 @@ export class Multiplayer {
 			// Shared towns never strip enemies — no reload needed.
 			if (SHARED_TOWNS.indexOf(areaPathOfMap(map)) !== -1) return;
 			if (!hasUnlockedArea(map)) this.mpForceStripNextLoad = true; // never-visited wedge guard (round 6)
+			// Close the pause/main menu BEFORE the reload (round 24): while partied,
+			// netSync swallows setPaused(true), so the backpack/menu can be open with
+			// ig.game.paused===false; teleporting reloads the map without closing it
+			// and the model lands RUNNING with the menu GUI stuck open and the
+			// movement/attack block never re-engaged. Same idiom as regroupToPartyLeader.
+			try {
+				const mdl: any = (sc as any).model;
+				if (mdl && ((mdl.isMenu && mdl.isMenu()) || (mdl.isPaused && mdl.isPaused()))) {
+					mdl.enterRunning();
+				}
+			} catch (_) { /* ignore */ }
 			console.log('[multiplayer] party lost on wild map ' + map + ' — reloading as solo host');
 			try {
 				const p: any = (ig.game as any).playerEntity;
@@ -1760,8 +2277,17 @@ export class Multiplayer {
 			const social = guiRef && typeof guiRef._getMenuFromID === 'function'
 				? guiRef._getMenuFromID(menu.currentMenu) : null;
 			if (!social) return;
-			if (social.list && typeof social.list.updatePartyMembers === 'function') {
-				social.list.updatePartyMembers();
+			// Rebuild the list rows, not just their online dots: the native
+			// updatePartyMembers leaves buttons whose contact key has been deleted
+			// alive, and hovering one then crashes the engine's unguarded
+			// sc.party.isFriend. sort() re-runs onCreateListEntries (clear + rebuild).
+			const l = social.list;
+			if (l && typeof l.sort === 'function') {
+				const sortVal = (l.tabContent && l.tabContent[l.currentTabIndex]
+					&& l.tabContent[l.currentTabIndex].sort) || 0;
+				l.sort(sortVal);
+			} else if (l && typeof l.updatePartyMembers === 'function') {
+				l.updatePartyMembers();
 			}
 			if (social.party && typeof social.party.updatePartyMembers === 'function') {
 				social.party.updatePartyMembers();
@@ -1855,8 +2381,11 @@ export class Multiplayer {
 			}
 			// Live HP/SP so the party HUD bars reflect combat in near-real-time. These
 			// ride the 3s profile (SP has no dedicated sync event; HP also gets the
-			// instant updateEntityHealth push, which wins on arrival).
-			if (typeof profile.currentHp === 'number') model.params.currentHp = profile.currentHp;
+			// instant updateEntityHealth push, which wins on arrival). Round 22: a DEAD
+			// teammate's HP is netSync's -maxHp flash state — the 3s profile would
+			// overwrite it with a stale positive; leave it alone while the dead flag is
+			// set (netSync clears it on revival).
+			if (!model._mpDead && typeof profile.currentHp === 'number') model.params.currentHp = profile.currentHp;
 			if (typeof profile.currentSp === 'number') model.params.currentSp = profile.currentSp;
 			if (typeof profile.maxSp === 'number') model.params.maxSp = profile.maxSp;
 			// Round 14: the member HUD's EXP bar re-renders ONLY on an observer
@@ -1945,6 +2474,10 @@ export class Multiplayer {
 	public saveCurrentLocation(): void {
 		try {
 			const storage = (ig as any).storage;
+			// Round 23: mark this as a MANUAL save so the onStorageSave upload (fired by
+			// saveCheckpoint -> _saveState) carries the 'manual' reason (never suppressed
+			// by the area-change anti-spam gate).
+			this.setSaveReason('manual');
 			storage.saveCheckpoint();
 			const data = storage.getSlotData(-1);
 			if (!data) {
@@ -1952,7 +2485,15 @@ export class Multiplayer {
 				return;
 			}
 			storage.saveAutoSlot(data);
-			this.connection.saveUpload('autoSlot', this.sanitizeSaveStringForUpload(data));
+			// Round 23: route the explicit upload through the chunked rate-limited queue
+			// (the onStorageSave hook already queued the same data with 'manual'; this
+			// second submit aborts-and-replaces it, so only the newest wins).
+			// ITEM 3: gated by allowUpload — the shared throttle rules (60s manual timer
+			// + combat block + the 5s post-login window). Denied here means no upload,
+			// but the local save still persisted above.
+			if (this.allowUpload('manual', true) && this.connection && this.connection.isOpen && this.connection.isOpen()) {
+				saveUploadQueue.submit('autoSlot', this.sanitizeSaveStringForUpload(data), 'manual');
+			}
 			console.log('[multiplayer] Saved current location (' + ig.game.mapName + ') and uploaded to server');
 		} catch (e) {
 			console.error('[multiplayer] saveHere failed', e);
@@ -2097,21 +2638,134 @@ export class Multiplayer {
 	}
 
 	/** Force a save and upload it to the server. Used by the event triggers
-	 * (area change / teleport-point unlock), the periodic backup and available as
+	 * (area change / teleport-point unlock), the manual save buttons and available as
 	 * mp.saveNow. Checkpoint-safe: see saveWithoutMovingCheckpoint. */
 	public saveNow(reason: string): void {
 		try {
 			const conn = this.connection;
 			if (!conn || !conn.isOpen || !conn.isOpen()) return;
+			// Round 23: stamp the upload reason so the onStorageSave hook (which the
+			// checkpoint save triggers) can send the correct reason to the server
+			// (area saves are gated by the server's change-storm anti-spam; the rest
+			// always persist).
+			this.setSaveReason(this.mapSaveReason(reason));
 			if (this.saveWithoutMovingCheckpoint()) {
 				console.log('[multiplayer] saved + uploaded (' + reason + ')');
 			}
 		} catch (e) { /* a save must never break the frame */ }
 	}
 
+	/** Round 23: the upload reason for the NEXT save the storage hook fires. */
+	private setSaveReason(code: 'area' | 'landmark' | 'manual' | 'exit' | 'other'): void {
+		this._mpPendingSaveReason = code;
+		// ROUND 30 (item 6): a stamped reason marks the NEXT hook fire as ours — an
+		// unstamped hook fire (engine checkpoint save on map change) is throttled as
+		// an area save instead of slipping through as 'other'.
+		this._mpStampedThisHook = true;
+	}
+
+	/** Round 23: read + reset the pending save reason (defaults to 'other'). */
+	private consumeSaveReason(): 'area' | 'landmark' | 'manual' | 'exit' | 'other' {
+		const r = this._mpPendingSaveReason;
+		this._mpPendingSaveReason = 'other';
+		// ROUND 30 (item 6): mirror the consume — the next (unstamped) hook fire must
+		// read as the ENGINE's map-change checkpoint save, not a stale 'other'.
+		this._mpStampedThisHook = false;
+		return r;
+	}
+
+	/** Round 23: map a human-readable saveNow reason to the server reason code. */
+	private mapSaveReason(reason: string): 'area' | 'landmark' | 'manual' | 'exit' | 'other' {
+		if (reason.indexOf('area') !== -1) return 'area';
+		if (reason.indexOf('teleport') !== -1 || reason.indexOf('landmark') !== -1) return 'landmark';
+		if (reason.indexOf('manual') !== -1) return 'manual';
+		if (reason.indexOf('exit') !== -1 || reason.indexOf('logout') !== -1) return 'exit';
+		return 'other';
+	}
+
+	/** ITEM 3 (anti-spam rework): may a save be uploaded right now? This is the single
+	 * choke point — the onStorageSave hook AND saveCurrentLocation's explicit submit
+	 * both gate on it, so every save upload respects the same rules:
+	 *  - the 5s post-login window (item 1) blocks EVERY reason, exit included;
+	 *  - 'exit' saves are never throttled by the 60s timers (only the 5s rule can hold
+	 *    them back — the user asked for NO uploads at all for 5s after login);
+	 *  - 'area' (map move) and 'landmark' (new teleport point) share ONE 60s timer;
+	 *  - 'manual' has its own 60s timer AND is blocked entirely while in combat;
+	 *  - 'other' (and anything unknown) is never throttled.
+	 * ROUND 30 (item 6): the engine ALSO fires an unstamped checkpoint save on every
+	 * map change (loadSlot -> saveCheckpoint -> _saveState), which used to slip
+	 * through as 'other' and upload every time — the 60s area limit never bit. An
+	 * unstamped save from the storage hook is treated as an AREA save (same 60s
+	 * shared timer) so rapid map changes actually throttle.
+	 * The LOCAL save still happens regardless — only the UPLOAD is gated.
+	 * `stamped` = the CURRENT hook fire carried an explicit stamped reason (captured
+	 * BEFORE consumeSaveReason reset it) — allowUpload needs it to tell a genuine
+	 * engine checkpoint save ('other' + unstamped) apart from an explicit saveNow. */
+	private allowUpload(reason: string, stamped: boolean): boolean {
+		try {
+			const now = Date.now();
+			// ITEM 1: no uploads at all for the first 5s after login / entering the game.
+			if (now < this._saveSuppressUntil) {
+				if (!this._saveSuppressLogged) {
+					this._saveSuppressLogged = true;
+					console.debug('[multiplayer] save uploads suppressed (5s after login): ' + reason);
+				}
+				return false;
+			}
+			if (reason === 'exit') return true; // exit saves always go through
+			if (reason === 'area' || reason === 'landmark') {
+				if (now - this._lastAutoSaveAt >= 60000) {
+					this._lastAutoSaveAt = now;
+					return true;
+				}
+				console.debug('[multiplayer] ' + reason + ' save upload throttled (shared 60s)');
+				return false;
+			}
+			if (reason === 'manual') {
+				if (this.inCombat()) {
+					console.debug('[multiplayer] manual save upload blocked during combat');
+					return false;
+				}
+				if (now - this._lastManualSaveAt >= 60000) {
+					this._lastManualSaveAt = now;
+					return true;
+				}
+				console.debug('[multiplayer] manual save upload throttled (60s)');
+				return false;
+			}
+			if (reason === 'other' && !stamped) {
+				// ROUND 30 (item 6): an UNSTAMPED storage-hook save = the engine's own
+				// map-change checkpoint save (loadSlot -> saveCheckpoint on every teleport).
+				// Treat it as 'area' so the shared 60s timer throttles it exactly like the
+				// event-driven area save — rapid map changes no longer each upload.
+				if (now - this._lastAutoSaveAt >= 60000) {
+					this._lastAutoSaveAt = now;
+					return true;
+				}
+				console.debug('[multiplayer] engine checkpoint save upload throttled (shared 60s)');
+				return false;
+			}
+			return true; // explicit 'other' (saveNow with an unknown reason): never throttled
+		} catch (_) {
+			return true; // a broken throttle must never block a save
+		}
+	}
+
+	/** True while the local player is in combat (the engine's combat-mode flag — the
+	 * same check netSync.localInCombat() uses, verified against src/sync/netSync.ts).
+	 * Never throws: a read failure means NOT in combat, so a broken read can never
+	 * block saving. */
+	private inCombat(): boolean {
+		try {
+			const m: any = sc as any;
+			return !!(m.model && m.model.isCombatMode && m.model.isCombatMode());
+		} catch (_) { return false; }
+	}
+
 	/** Uploads the save to the server whenever the game saves, plus event-driven
-	 * saves (area change, teleport-point unlock — round 6) and a periodic backup.
-	 * Restore happens in launchGame() via pendingSaveRestore.
+	 * saves (area change, teleport-point unlock — round 6). All uploads route through
+	 * the chunked rate-limited queue (sync/saveUploadQueue.ts). Restore happens in
+	 * launchGame() via the streamed saveDownload.
 	 * NOTE: callbacks read `this.connection` DYNAMICALLY — capturing the connection
 	 * at register time (a per-process hook) silently dead-ended every upload after
 	 * the first reconnect, which is why auto/exit saves "never worked". */
@@ -2129,7 +2783,25 @@ export class Multiplayer {
 						const conn = this.connection;
 						if (!conn || !conn.isOpen || !conn.isOpen()) return;
 						this.sanitizePartyForUpload(save);
-						// Upload the ENCRYPTED form (same as the 60s backup and what
+						// Round 23: route through the chunked rate-limited queue with the
+						// reason the trigger stamped (area/landmark/manual/exit/other) — the
+						// server gates area saves against change-storms but always persists the
+						// rest.
+						const stamped = this._mpStampedThisHook;
+						const reason = this.consumeSaveReason();
+						// Round 27 (item 5): the exit-to-title upload dialog builds its save via
+						// saveWithoutMovingCheckpoint, which fires THIS hook. Suppress that one
+						// shot so the save is uploaded ONLY by the dialog's flush() (tracked by
+						// the server's saveSaved ack), never double-uploaded. Consumed once.
+						if (this._mpSuppressNextExitUpload) {
+							this._mpSuppressNextExitUpload = false;
+							return;
+						}
+						// ITEM 1/3: the upload choke point — the 5s post-login window and the
+						// per-kind 60s timers are enforced here (see allowUpload). A denied
+						// upload still leaves the LOCAL save intact.
+						if (!this.allowUpload(reason, stamped)) return;
+						// Upload the ENCRYPTED form (same as the old 60s backup and what
 						// ig.SaveSlot expects on restore). Uploading raw JSON here made
 						// restore silently fail: SaveSlot.init only treats a string
 						// starting "[-!_0_!-]" as encrypted, so plaintext JSON became a
@@ -2137,12 +2809,12 @@ export class Multiplayer {
 						// undefined -> no teleport, no error, fresh game (lost save).
 						const tools: any = (ig as any).StorageTools;
 						if (tools && typeof tools.encryptSlotData === 'function') {
-							conn.saveUpload('autoSlot', tools.encryptSlotData(save));
+							saveUploadQueue.submit('autoSlot', tools.encryptSlotData(save), reason);
 							return;
 						}
 						// Fallback (tools missing): plaintext JSON, kept for safety.
 						const json = JSON.stringify(save);
-						if (json && json.length > 8) conn.saveUpload('autoSlot', json);
+						if (json && json.length > 8) saveUploadQueue.submit('autoSlot', json, reason);
 					} catch (e) { /* ignore */ }
 				},
 			});
@@ -2154,11 +2826,14 @@ export class Multiplayer {
 		// unlocking a teleport point/landmark both trigger a fresh checkpoint save +
 		// upload, so the server copy is never far behind the live game. Once-guarded:
 		// registerSaveSync runs once per process but reconnects swap the connection.
+		// ITEM 3: the 1500ms save debounce was REMOVED (all prior save restrictions
+		// were scrapped); the anti-spam is now enforced solely by allowUpload's 60s
+		// timers at the upload choke point. The 500ms poll spacing below is just how
+		// often we diff area/landmarks — it is not a save throttle.
 		if (!(this as any)._saveTriggersInstalled) {
 			(this as any)._saveTriggersInstalled = true;
 			let lastArea = '';
 			let lastLandmarks = '';
-			let lastSaveAt = 0;
 			let lastCheckAt = 0;
 			simplify.registerUpdate(() => {
 				try {
@@ -2169,7 +2844,6 @@ export class Multiplayer {
 					const now = Date.now();
 					if (now - lastCheckAt < 500) return; // poll, not per-frame
 					lastCheckAt = now;
-					if (now - lastSaveAt < 1500) return; // debounce bursty vars changes
 					const area = currentAreaPath();
 					let landmarks = '';
 					try {
@@ -2177,10 +2851,8 @@ export class Multiplayer {
 						if (al) landmarks = JSON.stringify(al);
 					} catch (_) { /* ignore */ }
 					if (lastArea && area !== lastArea) {
-						lastSaveAt = now;
 						this.saveNow('area changed: ' + area);
 					} else if (lastLandmarks && landmarks !== lastLandmarks) {
-						lastSaveAt = now;
 						this.saveNow('teleport point unlocked');
 					}
 					lastArea = area;
@@ -2189,14 +2861,12 @@ export class Multiplayer {
 			});
 		}
 
-		// Periodic backup every 60s. saveCheckpoint() makes it FRESH (the old code
-		// uploaded getAutoSlotData(), which only changes when the game itself writes
-		// the autoslot — usually stale or empty).
-		setInterval(() => { this.saveNow('periodic backup'); }, 60000);
-
 		// Round 11: while hosting, publish the native party BOT roster so member
 		// clients can spawn their own follower copies (checked once per second).
 		setInterval(() => { this.checkBotRoster(); }, 1000);
+		// Round 27 (item 2): publish our map for each party member once a second so
+		// off-map teammates' HUD bars hide + net diamonds grey (see checkBotMaps).
+		setInterval(() => { this.checkBotMaps(); }, 1000);
 	}
 
 	/**
@@ -2271,6 +2941,17 @@ export class Multiplayer {
 		if (game && typeof game.gotoTitle === 'function') {
 			const original = game.gotoTitle.bind(game);
 			game.gotoTitle = (...args: any[]) => {
+				// Round 27 (item 5): try the save-UPLOAD-then-title flow first. While
+				// connected to the server and NOT in a cutscene / combat, this pops the
+				// upload dialog, uploads the current save and only then returns to the
+				// title (uploadThenGotoTitle -> finalizeTitleExit -> original). During a
+				// cutscene or combat, offline, or already logged out it returns false and
+				// we fall back to the classic synchronous save-and-logout below. The
+				// upload dialog NEVER shows during cutscene/combat — the player exits
+				// straight away without saving (per the user's restriction).
+				try {
+					if (this.uploadThenGotoTitle(original, args)) return;
+				} catch (e) { console.error('[multiplayer] uploadThenGotoTitle failed; exiting directly', e); }
 				this.saveAndLogout();
 				return original(...args);
 			};
@@ -2400,8 +3081,14 @@ export class Multiplayer {
 		(this as any)._loggedOut = true;
 		try {
 			// Best-effort final save (checkpoint-safe — see saveWithoutMovingCheckpoint;
-			// the onStorageSave hook uploads while the socket is still open).
+			// the onStorageSave hook uploads while the socket is still open). Round 23:
+			// stamped 'exit' so the upload bypasses the area-save anti-spam gate.
+			this.setSaveReason('exit');
 			this.saveWithoutMovingCheckpoint();
+			// Round 23: flush the chunked upload queue synchronously (no pacing) so the
+			// final save lands BEFORE the socket closes below — a paced stream would be
+			// cut off mid-way by the close.
+			try { saveUploadQueue.flush(); } catch (_) { /* ignore */ }
 		} catch (e) { /* ignore */ }
 		try {
 			this.connection.logout();
@@ -2416,6 +3103,197 @@ export class Multiplayer {
 		console.log('[multiplayer] saved + logged out');
 	}
 
+	// ===================== Round 27 (item 5): exit-to-title save UPLOAD =====================
+	// The pause menu's "exit to title" fires ig.game.gotoTitle (wrapped above). When
+	// we're connected to the server and NOT mid-cutscene / mid-combat we mirror the
+	// login-time save-DOWNLOAD flow in reverse: pop the same full-screen dialog, upload
+	// the current save, and only once the server confirms (or a short timeout/failure
+	// forces the issue) actually return to the title. During a cutscene （剧情途中） or
+	// combat （战斗中） the player exits IMMEDIATELY without saving — no upload dialog.
+
+	/** True while the local player is in a story cutscene （剧情途中）. Read live from the
+	 * engine (sc.model.isCutscene) rather than netSync's latched flag so a cutscene that
+	 * starts/ends mid-exit is always current. Never throws: a broken read means NOT in a
+	 * cutscene, so the upload dialog can still appear. */
+	private inCutsceneNow(): boolean {
+		try {
+			const mdl: any = (sc as any).model;
+			return !!(mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene());
+		} catch (_) { return false; }
+	}
+
+	/** True while an exit-to-title upload is in flight (dialog up, awaiting the server's
+	 * saveSaved/saveFailed ack or the timeout). Re-entrant gotoTitle calls in that window
+	 * must not stack a second upload/dialog. */
+	private _mpExitUploadActive = false;
+
+	/** Registered upload-ack callbacks (wired once on connect, keyed by slot). */
+	private _mpExitUploadResolve: ((ok: boolean) => void) | null = null;
+
+	/** Wire the saveSaved / saveFailed ack listeners that settle an exit-upload. Call
+	 * once per connect (the connection is recreated per session, so re-wire each time —
+	 * socket.on is additive per fresh socket, never stacked). */
+	private wireExitUploadAcks(): void {
+		const conn: any = this.connection;
+		if (!conn || typeof conn.onSaveSaved !== 'function') return;
+		try {
+			conn.onSaveSaved((slot: string) => {
+				if (this._mpExitUploadResolve) { const r = this._mpExitUploadResolve; this._mpExitUploadResolve = null; r(true); }
+			});
+		} catch (_) { /* ignore */ }
+		try {
+			if (typeof conn.onSaveFailed === 'function') {
+				conn.onSaveFailed(() => {
+					if (this._mpExitUploadResolve) { const r = this._mpExitUploadResolve; this._mpExitUploadResolve = null; r(false); }
+				});
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/**
+	 * Attempt the "upload save, THEN return to title" flow (item 5). Returns true when it
+	 * took over (the async continuation runs finalizeTitleExit -> originalGotoTitle), so
+	 * the gotoTitle wrapper must NOT run the synchronous saveAndLogout + original itself.
+	 * Returns false to fall back to the classic path (offline / already logged out /
+	 * cutscene / combat / a broken save).
+	 */
+	private uploadThenGotoTitle(originalGotoTitle: (...a: any[]) => any, args: any[]): boolean {
+		const self = this as any;
+		// Only while actually online: offline / server-down exits keep the classic path.
+		if (self._loggedOut) return false;
+		const conn = this.connection;
+		if (!conn || !conn.isOpen || !conn.isOpen()) return false;
+		if (this._mpExitUploadActive) return false; // already exiting — don't double up
+		// THE RESTRICTION: cutscene （剧情途中） or combat （战斗中） -> exit directly, NO
+		// SAVE, no dialog. We skip the upload entirely: mark logged out (so beforeunload
+		// can't re-save), tear down the session WITHOUT saving, and run the engine's own
+		// gotoTitle ourselves. Returning true keeps the wrapper from running saveAndLogout
+		// (which WOULD save+upload, violating the restriction).
+		if (this.inCutsceneNow() || this.inCombat()) {
+			console.log('[multiplayer] exit to title during cutscene/combat — exiting WITHOUT saving');
+			this.finalizeTitleExit(originalGotoTitle, args);
+			return true;
+		}
+
+		// Build the save locally (checkpoint-safe). saveWithoutMovingCheckpoint ALSO fires
+		// the onStorageSave upload hook, which would push the same save with reason 'exit'
+		// — suppress that one-shot so ONLY our dialog-tracked flush() upload below goes out
+		// (no double stream; the dialog's progress is the one we await).
+		this._mpSuppressNextExitUpload = true;
+		this.setSaveReason('exit');
+		const saved = this.saveWithoutMovingCheckpoint();
+		if (!saved) { this._mpSuppressNextExitUpload = false; return false; } // nothing to upload -> classic path
+
+		this._mpExitUploadActive = true;
+		console.log('[multiplayer] uploading save before returning to title…');
+
+		// ITEM 1 ROOT-CAUSE FIX: the suppressed onStorageSave hook above skipped its
+		// saveUploadQueue.submit() entirely, so the queue's stream is still null and the
+		// flush() below would be a silent no-op — the server would receive nothing, never
+		// ack, and we'd always fall through the 8s timeout and report failure. Rebuild the
+		// stream here so flush() has real parts to burst. Read back the slot we just wrote
+		// (autoSlot = -1) and submit its encrypted form, exactly like the hook does.
+		try {
+			const tools: any = (ig as any).StorageTools;
+			const storage: any = (ig as any).storage;
+			const enc = (tools && storage && typeof storage.getSlotData === 'function')
+				? storage.getSlotData(-1)
+				: null;
+			if (enc && typeof enc === 'string' && enc.length > 8) {
+				saveUploadQueue.submit('autoSlot', enc, 'exit');
+			}
+		} catch (_) { /* ignore — if we can't rebuild the stream, flush() no-ops and we time out */ }
+
+		// The actual upload: one synchronous burst (no pacing) so it lands before the
+		// socket closes, exactly like saveAndLogout's flush.
+		try { saveUploadQueue.flush(); } catch (_) { /* ignore */ }
+
+		// Pop the blocking dialog (same look as the login save-download overlay).
+		this.showExitUploadBlock();
+
+		const finish = (ok: boolean) => {
+			if (!this._mpExitUploadActive) return; // a second finish (timeout vs ack) is a no-op
+			this._mpExitUploadActive = false;
+			this._mpExitUploadResolve = null;
+			if (ok) {
+				this.removeSaveBlock();
+				this.finalizeTitleExit(originalGotoTitle, args);
+			} else {
+				// Upload failed / timed out — tell the player, hold a beat, then exit anyway
+				// (never strand them on a dead upload; the save is still local either way).
+				this.showExitUploadBlockError();
+				window.setTimeout(() => {
+					this.removeSaveBlock();
+					this.finalizeTitleExit(originalGotoTitle, args);
+				}, 1600);
+			}
+		};
+
+		// Resolve on the server's ack (wired in wireExitUploadAcks on connect).
+		this._mpExitUploadResolve = (ok: boolean) => finish(ok);
+		// Hard timeout: never let a lost ack soft-lock the exit. 8s is far over a LAN
+		// round-trip + server persist, but short enough to feel snappy if the server died.
+		window.setTimeout(() => finish(this._mpExitUploadResolve === null), 8000);
+		return true;
+	}
+
+	/** The actual return-to-title after the exit-upload settles: mark logged out (so the
+	 * beforeunload hook can't re-save), tear down the session, then run the engine's own
+	 * gotoTitle. */
+	private finalizeTitleExit(originalGotoTitle: (...a: any[]) => any, args: any[]): void {
+		try {
+			const self = this as any;
+			self._loggedOut = true;
+			try { this.connection.logout(); } catch (_) { /* ignore */ }
+			try {
+				const sock: any = this.connection as any;
+				if (sock && sock.socket && typeof sock.socket.close === 'function') sock.socket.close();
+			} catch (_) { /* ignore */ }
+			this.clearMultiplayerState();
+		} catch (e) { /* ignore */ }
+		try { originalGotoTitle(...args); } catch (e) { console.error('[multiplayer] gotoTitle failed', e); }
+		console.log('[multiplayer] returned to title (save uploaded)');
+	}
+
+	/** Show the exit-upload dialog. Same overlay as the login download block, with the
+	 * title/info swapped to the upload wording (reuses _saveBlockEl so removeSaveBlock,
+	 * the style and onConnectionLost's unblock all keep working unchanged). */
+	private showExitUploadBlock(): void {
+		this.ensureSaveBlockStyle();
+		this.removeSaveBlock(); // idempotent — never stack two overlays
+		const box = $('<div class="mpSaveBlock"></div>');
+		const panel = $('<div class="mpSavePanel"></div>');
+		panel.append($('<div class="mpSaveTitle">' + t('saveUpTitle') + '</div>'));
+		panel.append($('<div class="mpSaveBar"><div class="mpSaveBarFill mpSaveBarIndet"></div></div>'));
+		const info = $('<div class="mpSaveInfo">' + t('saveUpIndeterminate') + '</div>');
+		panel.append(info);
+		box.append(panel);
+		box.appendTo(document.body);
+		this._saveBlockEl = box;
+		this._saveBlockFill = box.find('.mpSaveBarFill');
+		this._saveBlockInfo = info;
+		// Deliberately NOT setting _mpSaveBlocked: that flag belongs to the LOGIN download
+		// gate (it makes onConnectionLost fall back to starting the game locally). An exit
+		// upload must NOT trigger that path — the exit's own timeout handles a dead server.
+	}
+
+	/** Swap the exit-upload dialog to a failure notice (removed by finalizeTitleExit's
+	 * exit; the game is leaving anyway, so no separate unblock is needed). */
+	private showExitUploadBlockError(): void {
+		if (!this._saveBlockEl) return;
+		try {
+			this._saveBlockEl.addClass('mpSaveBlockErr');
+			this._saveBlockEl.find('.mpSaveBar').remove();
+			if (this._saveBlockInfo) this._saveBlockInfo.text(t('saveUpFailed'));
+			console.warn('[multiplayer] exit save upload failed/timed out; returning to title anyway');
+		} catch (_) { /* an overlay must never break the exit */ }
+	}
+
+	/** Round 27 (item 5): one-shot suppression of the onStorageSave upload that fires
+	 * inside saveWithoutMovingCheckpoint during uploadThenGotoTitle, so the save is only
+	 * uploaded by the dialog-tracked flush() (no double upload). Consumed once. */
+	private _mpSuppressNextExitUpload = false;
+
 	/**
 	 * Called when the socket drops (server closed / network lost). socket.io keeps
 	 * trying to reconnect in the background, so we allow a short grace period (in
@@ -2428,6 +3306,16 @@ export class Multiplayer {
 		if (self._disconnectHandled) return;
 		self._disconnectHandled = true;
 		console.log('[multiplayer] connection lost; waiting briefly for reconnect...');
+
+		// Round 27: if the title -> game transition is BLOCKED on the cloud save
+		// download (launchGame's overlay is up), the stream can never complete on a
+		// dead socket — unblock with a clear message and fall back to starting
+		// locally, so a connection drop can't soft-lock the title screen. The grace
+		// timer below still runs: if the server stays down it drops to title as usual.
+		if (this._mpSaveBlocked) {
+			console.warn('[multiplayer] connection lost while the cloud save was downloading; starting without restore');
+			this.unblockSaveBlock(true);
+		}
 
 		const GRACE_MS = 12000;
 		setTimeout(() => {
@@ -2446,6 +3334,8 @@ export class Multiplayer {
 		try {
 			// Best-effort save (the upload won't reach a dead server, but the local
 			// autoslot persists; checkpoint-safe — see saveWithoutMovingCheckpoint).
+			// Round 23: stamped 'other' so the upload bypasses the area-save anti-spam gate.
+			this.setSaveReason('other');
 			this.saveWithoutMovingCheckpoint();
 		} catch (e) { /* ignore */ }
 
@@ -2504,6 +3394,28 @@ export class Multiplayer {
 		this._mpBotSeenOnce = false;
 		this._mpLeaderMap = '';
 		this._mpLastBotStateAt = 0;
+		// Round 27 (item 2): the per-member/bot map signals are session-scoped — wipe
+		// them so a stale map never greys/hides a teammate in the next session.
+		this.memberMapByName = {};
+		this.botMapByName = {};
+		// Round 22: drop every cached name tag so the module-level tag cache can't
+		// leak into the next session (they project the old session's mirrors).
+		try { wipeAllNameTags(); } catch (_) { /* ignore */ }
+		// Round 23: abort any in-flight save upload + drop the connection handle
+		// (a logout/server-loss must never resume a stale upload on a dead socket).
+		try { saveUploadQueue.detach(); } catch (_) { /* ignore */ }
+		// Round 23 review: close any open social-menu mp window (accept/decline,
+		// withdraw, friend-remove confirm, add-friend box) so it can't survive
+		// into the title screen or the next session.
+		try { closeMpWindows(); } catch (_) { /* ignore */ }
+		// Round 23 wave 4: party chat is session-scoped — clear the message overlay
+		// and close the input on logout/server-loss so no chat residue leaks into
+		// the title screen or the next session.
+		try { clearChat(); } catch (_) { /* ignore */ }
+		// Round 27: drop the blocking download overlay if a logout/server-loss runs
+		// while it's up — it must never survive into the title screen or the next
+		// session (and its full-screen scrim would block all input).
+		try { this.removeSaveBlock(); } catch (_) { /* ignore */ }
 	}
 
 	/**
@@ -2532,41 +3444,258 @@ export class Multiplayer {
 		ig.interact.removeEntry(ig.interact.entries[0]);
 		ig.bgm.clear('MEDIUM_OUT'); // Clear BGM
 
-		// Restore a server-side save (if any) once the engine is up, then hand off
-		// to the game's normal start. loadSlot teleports us back to the saved map.
-		if (this.pendingSaveRestore) {
-			const data = this.pendingSaveRestore;
-			this.pendingSaveRestore = undefined;
-			this.onceGameReady(() => {
-				try {
-					// Normalize to the encrypted form before building the SaveSlot:
-					// SaveSlot.init only treats a "[-!_0_!-]"-prefixed string as
-					// encrypted, so a legacy plaintext save would otherwise become a
-					// string `data` and loadSlot would silently no-op (lost save).
-					let raw: any = data;
-					const tools: any = (ig as any).StorageTools;
-					if (typeof raw === 'string' && tools && !tools.isEncrypted(raw)) {
-						try { raw = tools.encryptSlotData(JSON.parse(raw)); } catch (e) { /* keep as-is */ }
-					}
-					const slot = new (ig as any).SaveSlot(raw);
-					// Defense-in-depth: drop any party members whose model doesn't
-					// exist at runtime (e.g. a save polluted by an older build that
-					// uploaded our _mp pseudo-players). Restoring such a save crashes
-					// the party HUD (addObserver on an undefined PartyMemberModel).
-					this.cleanRestoredParty(slot.getData());
-					(ig as any).storage.loadSlot(slot, true);
-					console.log('[multiplayer] Restored server save');
-				} catch (e) {
-					console.error('[multiplayer] Failed to restore server save, starting fresh', e);
-					ig.game.start();
-				}
-			});
-			// Start the game so loadingComplete fires; loadSlot then takes over.
-			ig.game.start();
+		// Round 23: the save arrives as a streamed saveDownload (the connector
+		// reassembles parts and resolves _saveDownloadPromise); the restore runs at
+		// loadingComplete (onceGameReady).
+		// Round 27 (fixes "当存档未从云端下载完成时会临时进入一个新存档导致bug"): NEVER let the
+		// player into the game world before the cloud save has been FULLY downloaded
+		// (or the server reported there is none — first login). The stream runs over
+		// the socket and completes independently of the game state, so we HOLD the
+		// title -> game transition here — behind a full-screen blocking overlay (the
+		// title screen underneath is unclickable) — and only call ig.game.start()
+		// once the download settles. The restore itself still runs at loadingComplete:
+		// that is the earliest point the engine can loadSlot safely, and the loading
+		// screen still blocks input while it happens, so the player never gets to
+		// play on the fresh/stale save.
+		const download = this._saveDownloadPromise;
+		if (!download) {
+			// No download wired (identify never registered the listener) — the game
+			// already starts normally; nothing to await, and no server save to restore.
+			// Uploads are still governed by allowUpload's item-1/3 rules.
+			this._saveRestoreSettled = true;
+			this.onceGameReady(() => { /* nothing to restore */ });
+			// ITEM 1: entering the game — re-arm the 5s no-upload window (covers
+			// "进入游戏" even when the login-time arm has already elapsed).
+			this._saveSuppressUntil = Date.now() + 5000;
+			this._saveSuppressLogged = false;
+			ig.game.start(); // Start the game in story mode.
 			return;
 		}
+		// A stream that already settled during login (fast / no save) needs no
+		// overlay — the promise fires synchronously-ish and the game starts right away.
+		if (this.connection.saveDownloadSettled !== true) {
+			this.showSaveBlock();
+		}
 
-		ig.game.start(); // Start the game in story mode.
+		// Round 24: the watchdog is ACTIVITY-BASED — a stalled/missing stream proceeds
+		// WITHOUT a restore only after 15s with NO new parts arriving (a large-but-valid
+		// save streaming slower than a flat window is no longer abandoned mid-stream),
+		// with a 60s absolute ceiling so a stuck stream can't hold up game start forever.
+		let settled = false;
+		let idleTimer: number | null = null;
+		let ceilingTimer: number | null = null;
+		const clearWatchdogTimers = () => {
+			if (idleTimer !== null) { try { window.clearTimeout(idleTimer); } catch (_) { /* ignore */ } idleTimer = null; }
+			if (ceilingTimer !== null) { try { window.clearTimeout(ceilingTimer); } catch (_) { /* ignore */ } ceilingTimer = null; }
+		};
+		// Round 27: `failed` distinguishes a genuinely broken stream (watchdog timeout /
+		// connection drop — the overlay shows a clear message before starting) from a
+		// clean "no server save" (raw undefined, first login). Both unblock and fall
+		// back to starting locally, so a bad stream can never soft-lock the title.
+		const finish = (raw: string | undefined, failed: boolean) => {
+			if (settled) return;
+			settled = true;
+			// Mark the restore settled once we either restored, learned there's no
+			// server save, or gave up on a stuck download (inert since item 3 — the
+			// write is kept so the restore lifecycle looks unchanged).
+			this._saveRestoreSettled = true;
+			clearWatchdogTimers();
+			this.unblockSaveBlock(failed, raw);
+		};
+		// Round 24: a flat 15s timer from game start used to abandon a large-but-valid
+		// save mid-stream (a save that legitimately streams slower than 15s). Now we
+		// only give up after 15s with NO new parts arriving — every saveDownload part
+		// resets the idle window (registered below via onSaveDownloadProgress) — and an
+		// absolute 60s ceiling still guarantees a genuinely stuck stream can't block
+		// game start forever.
+		const armIdleTimer = () => {
+			if (idleTimer !== null) { try { window.clearTimeout(idleTimer); } catch (_) { /* ignore */ } }
+			idleTimer = window.setTimeout(() => {
+				idleTimer = null;
+				console.warn('[multiplayer] no new save-download parts for 15s; starting without restore');
+				finish(undefined, true);
+			}, 15000);
+		};
+		armIdleTimer();
+		ceilingTimer = window.setTimeout(() => {
+			ceilingTimer = null;
+			console.warn('[multiplayer] server save download exceeded 60s; starting without restore');
+			finish(undefined, true);
+		}, 60000);
+		// Every part that arrives resets the idle window AND drives the progress bar
+		// on the blocking overlay (the connection is per-session here; if it's somehow
+		// gone, the 60s ceiling still bounds the wait).
+		try {
+			if (this.connection) {
+				this.connection.onSaveDownloadProgress((p) => {
+					armIdleTimer();
+					this.updateSaveBlockProgress(p);
+				});
+			}
+		} catch (_) { /* ignore */ }
+		download.then((raw) => {
+			finish(raw, false);
+		}).catch(() => {
+			finish(undefined, true);
+		});
+	}
+
+	/** Round 27: lift the download block and start the game once the cloud save has
+	 * settled. `failed` = the stream broke (watchdog timeout / socket drop) — swap
+	 * the overlay to a clear failure notice for a moment, then fall back to the
+	 * current behavior (start fresh, no restore). `raw` = the downloaded save
+	 * (undefined = the server reported NO save — first login — which is NOT a
+	 * failure: it proceeds exactly as before). */
+	private unblockSaveBlock(failed: boolean, raw?: string): void {
+		const start = () => {
+			if (this._mpSaveBlockStarted) return; // disconnect/resolve race: one start only
+			this._mpSaveBlockStarted = true;
+			this.removeSaveBlock();
+			this.onceGameReady(() => {
+				if (!failed) this.restoreServerSave(raw);
+			});
+			// ITEM 1: entering the game — re-arm the 5s no-upload window (the download
+			// block may have held game start longer than the login-time arm).
+			this._saveSuppressUntil = Date.now() + 5000;
+			this._saveSuppressLogged = false;
+			ig.game.start(); // Start the game in story mode.
+		};
+		if (failed) {
+			this.showSaveBlockError();
+			// Give the player a beat to read the failure notice before the game starts.
+			window.setTimeout(() => { start(); }, 2500);
+		} else {
+			start();
+		}
+	}
+
+	/** Round 23: restore a downloaded server save through the engine's own
+	 * ig.SaveSlot / ig.storage.loadSlot pipeline (teleport back to the saved map),
+	 * called from onceGameReady (loadingComplete) after launchGame's blocking
+	 * download gate has settled. */
+	private restoreServerSave(raw: string | undefined): void {
+		if (!raw) return;
+		try {
+			// Normalize to the encrypted form before building the SaveSlot:
+			// SaveSlot.init only treats a "[-!_0_!-]"-prefixed string as
+			// encrypted, so a legacy plaintext save would otherwise become a
+			// string `data` and loadSlot would silently no-op (lost save).
+			let data: any = raw;
+			const tools: any = (ig as any).StorageTools;
+			if (typeof raw === 'string' && tools && !tools.isEncrypted(raw)) {
+				try { data = tools.encryptSlotData(JSON.parse(raw)); } catch (e) { /* keep as-is */ }
+			}
+			const slot = new (ig as any).SaveSlot(data);
+			// Defense-in-depth: drop any party members whose model doesn't
+			// exist at runtime (e.g. a save polluted by an older build that
+			// uploaded our _mp pseudo-players). Restoring such a save crashes
+			// the party HUD (addObserver on an undefined PartyMemberModel).
+			this.cleanRestoredParty(slot.getData());
+			(ig as any).storage.loadSlot(slot, true);
+			console.log('[multiplayer] Restored server save');
+		} catch (e) {
+			console.error('[multiplayer] Failed to restore server save, starting fresh', e);
+			ig.game.start();
+		}
+	}
+
+	// ---- Round 27: blocking "downloading cloud save" overlay ----
+
+	/** Inject the block-overlay stylesheet exactly once (same idempotent pattern as
+	 * ensureLoginStyle / socialOverlay.ensureCommStyle: dark navy panel, cyan border,
+	 * CJK-safe font stack). The scrim is FULL-SCREEN so the title screen underneath
+	 * stays unclickable while the save is still downloading — otherwise the player
+	 * could start a game on the stale/fresh save and bypass the block entirely. */
+	private ensureSaveBlockStyle(): void {
+		if (document.getElementById('mpSaveBlockStyle')) return;
+		const style = document.createElement('style');
+		style.id = 'mpSaveBlockStyle';
+		style.textContent = `
+.mpSaveBlock {
+    position: fixed; left: 0; top: 0; width: 100%; height: 100%;
+    background: rgba(3, 10, 18, 0.78);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 20000;
+}
+.mpSavePanel {
+    width: 420px; max-width: 90vw;
+    background: rgba(6, 18, 30, 0.96);
+    border: 2px solid #6fc7ff; border-radius: 6px;
+    box-shadow: 0 0 18px rgba(111, 199, 255, 0.35), inset 0 0 26px rgba(13, 42, 66, 0.8);
+    color: #eaf7ff; font-family: 'Noto Sans SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+    padding: 18px 20px 16px 20px; text-align: center;
+}
+.mpSaveTitle { font-size: 15px; letter-spacing: 2px; color: #dff3ff; margin-bottom: 14px; }
+.mpSaveBar { height: 10px; border: 1px solid #6fc7ff; border-radius: 5px;
+    background: rgba(8, 26, 44, 0.9); overflow: hidden; }
+.mpSaveBarFill { height: 100%; width: 0%; border-radius: 5px;
+    background: linear-gradient(90deg, #3aa0e0, #7fd0ff); transition: width 0.2s ease-out; }
+.mpSaveBarIndet { width: 40%; animation: mpSaveIndet 1.2s ease-in-out infinite; }
+@keyframes mpSaveIndet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.mpSaveInfo { font-size: 12px; color: #8fd6ff; margin-top: 10px; min-height: 16px; }
+.mpSaveBlockErr .mpSavePanel { border-color: #ff9d9d; box-shadow: 0 0 18px rgba(255, 157, 157, 0.35), inset 0 0 26px rgba(13, 42, 66, 0.8); }
+.mpSaveBlockErr .mpSaveInfo { color: #ffb3b3; }
+`;
+		document.head.appendChild(style);
+	}
+
+	/** Show the full-screen block overlay. Indeterminate animation until the first
+	 * part arrives (the server signals "no save" via total:0, so the total is
+	 * always eventually known). */
+	private showSaveBlock(): void {
+		this.ensureSaveBlockStyle();
+		this.removeSaveBlock(); // idempotent — never stack two overlays
+		const box = $('<div class="mpSaveBlock"></div>');
+		const panel = $('<div class="mpSavePanel"></div>');
+		panel.append($('<div class="mpSaveTitle">' + t('saveDlTitle') + '</div>'));
+		panel.append($('<div class="mpSaveBar"><div class="mpSaveBarFill mpSaveBarIndet"></div></div>'));
+		const info = $('<div class="mpSaveInfo">' + t('saveDlIndeterminate') + '</div>');
+		panel.append(info);
+		box.append(panel);
+		box.appendTo(document.body);
+		this._saveBlockEl = box;
+		this._saveBlockFill = box.find('.mpSaveBarFill');
+		this._saveBlockInfo = info;
+		this._mpSaveBlocked = true;
+		console.log('[multiplayer] holding game start until the cloud save download settles');
+	}
+
+	/** Drive the progress bar from the connector's per-part progress callback. */
+	private updateSaveBlockProgress(p: { received: number, total: number, bytes: number }): void {
+		if (!this._saveBlockEl) return;
+		try {
+			const pct = p && p.total > 0 ? Math.min(100, Math.round(p.received / p.total * 100)) : 0;
+			if (this._saveBlockFill) {
+				this._saveBlockFill.removeClass('mpSaveBarIndet');
+				this._saveBlockFill.css('width', pct + '%');
+			}
+			if (this._saveBlockInfo) {
+				this._saveBlockInfo.text(t('saveDlProgress').replace('{pct}', String(pct)));
+			}
+		} catch (_) { /* an overlay must never break the frame */ }
+	}
+
+	/** Swap the overlay to a failure notice (stays up briefly so the player can
+	 * read it; unblockSaveBlock removes it when the fallback game start fires). */
+	private showSaveBlockError(): void {
+		if (!this._saveBlockEl) return;
+		try {
+			this._saveBlockEl.addClass('mpSaveBlockErr');
+			this._saveBlockEl.find('.mpSaveBar').remove();
+			if (this._saveBlockInfo) this._saveBlockInfo.text(t('saveDlFailed'));
+			console.warn('[multiplayer] cloud save download failed; starting without restore');
+		} catch (_) { /* an overlay must never break the frame */ }
+	}
+
+	/** Remove the block overlay (idempotent; safe when it was never shown). */
+	private removeSaveBlock(): void {
+		this._mpSaveBlocked = false;
+		if (this._saveBlockEl) {
+			try { this._saveBlockEl.remove(); } catch (_) { /* ignore */ }
+			this._saveBlockEl = null;
+		}
+		this._saveBlockFill = null;
+		this._saveBlockInfo = null;
 	}
 
 	/**

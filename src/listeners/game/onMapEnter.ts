@@ -52,6 +52,11 @@ export class OnMapEnterListener {
 				// Round 20: remember the NEW instance's host username for the " (Host)"
 				// name-tag label (optional field — guarded against older servers).
 				if (typeof result.host === 'string') this.main.instanceHost = result.host;
+				// Round 21: host tick-rate latch on host-acquire (this load made us the
+				// new instance's host) — read once at acquire, not live.
+				if (result.isHost) {
+					try { if (this.main.netSync) this.main.netSync.setBlockInterval(this.main.getHostTickInterval()); } catch (_) { /* ignore */ }
+				}
 				// Round 15: capture the NEW instance's roster (changeMapResponse members)
 				// so the load-complete reconcile can drop stale old-map player entries
 				// that clearMap() killed but nothing else removed.

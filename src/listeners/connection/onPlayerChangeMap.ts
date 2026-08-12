@@ -1,7 +1,7 @@
 import { IMultiplayerEntity } from '../../mpEntity';
 import { Multiplayer } from '../../multiplayer';
 import { IPlayer } from '../../player';
-import { wipeAllNameTags } from '../../ui/mpOptions';
+import { dropNameTag, wipeAllNameTags } from '../../ui/mpOptions';
 
 export class OnPlayerChangeMapListener {
 	/** Pending load-complete waiters. A queue (not a single slot) so two players
@@ -54,6 +54,9 @@ export class OnPlayerChangeMapListener {
 			// spawn / tracked record for them.
 			delete this.pendingSpawn[player];
 			this.despawnMirror(player);
+			// Round 22: belt-and-braces tag wipe — a stale cached tag can be re-shown
+			// by addTagAt if a later name collides; mirrors the loadingComplete wipe.
+			try { wipeAllNameTags(); } catch (_) { /* ignore */ }
 		}
 	}
 
@@ -77,6 +80,9 @@ export class OnPlayerChangeMapListener {
 		if (mirror && mirror.entity) {
 			try { mirror.entity.kill(); } catch (_) { /* ignore */ }
 		}
+		// Round 22: drop the cached name tag when a teammate leaves the map so it can't
+		// linger at the last projected position (the per-frame loop only hides, never clears).
+		try { dropNameTag(player); } catch (_) { /* ignore */ }
 		this.main.players[player] = undefined;
 		delete this.main.players[player];
 	}

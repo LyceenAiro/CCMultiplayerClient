@@ -48,6 +48,11 @@ export class OnTeleportListener {
 					const m: any = (window as any).__mpMain;
 					if (m && m.netSync && m.netSync.isLocalDead()) m.netSync.abortDeathForTeleport();
 				} catch (_) { /* ignore */ }
+				// Round 21 (issue 1): 1s no-collision grace for ALL mirrors once the real
+				// teleport actually starts — the new map's mirrors may overlap the local
+				// player mid-load. The per-frame coll decision-maker
+				// (netSync.updateRemoteMirrorFade) forces them to IGNORE until this deadline.
+				try { if (instance.main.netSync) instance.main.netSync._mpMirrorGraceUntil = Date.now() + 1000; } catch (_) { /* ignore */ }
 				if (gen === instance._teleportGen) original.call(this, map, teleportPosition, hint);
 			};
 			instance.onTeleport(map, teleportPosition, gen)
@@ -202,6 +207,11 @@ export class OnTeleportListener {
 			// Round 20: remember the NEW instance's host username for the " (Host)"
 			// name-tag label (optional field — guarded against older servers).
 			if (typeof result.host === 'string') this.main.instanceHost = result.host;
+			// Round 21: host tick-rate latch on host-acquire (the response just told us
+			// this client owns the new instance's enemies) — read once, not live.
+			if (result.isHost) {
+				try { if (this.main.netSync) this.main.netSync.setBlockInterval(this.main.getHostTickInterval()); } catch (e) { /* ignore */ }
+			}
 			console.log('[multiplayer] changeMapResponse: instance=' + result.instanceId + ' isHost=' + result.isHost);
 		}).catch((e) => {
 			console.warn('[multiplayer] changeMapResponse failed; teleport proceeds with previous host flag', e);

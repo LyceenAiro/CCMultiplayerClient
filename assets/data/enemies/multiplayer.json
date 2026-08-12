@@ -44,9 +44,9 @@
         }
     },
     "credit": 0,
-    "exp": 1000,
+    "exp": 0,
     "maxSp": 0,
-    "enduranceScale": 1,
+    "enduranceScale": 0,
     "healDropRate": 0,
     "boss": false,
     "bossOrder": 0,
