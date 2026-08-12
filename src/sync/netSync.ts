@@ -2453,10 +2453,15 @@ export class NetSync {
 	/** ROUND 45 (Gap A) — enemyHurt relay receiver (host → members). A member lands a hit;
 	 * the host applies it to the real enemy (native chain plays it for the host) and relays
 	 * this packet. Each spectator replays the enemy's hurt sound/FX on its own puppet. Thin
-	 * wrapper over playEnemyPuppetHitFx keyed by uid — no attacker/self-drop fields here. */
-	private replayEnemyHurtFx(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }): void {
+	 * wrapper over playEnemyPuppetHitFx keyed by uid. ROUND 58: the host now stamps the
+	 * `attacker` it received on the forwarded enemyDamage, and the server passes it through —
+	 * the ATTACKING member also receives this broadcast (it is not the host, so it isn't
+	 * self-dropped), so we must skip it or they would hear their own local playEnemyPuppetHitFx
+	 * AND this relay at once (the double hurt sound). */
+	private replayEnemyHurtFx(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }): void {
 		try {
 			if (!hit || !hit.uid) return;
+			if (hit.attacker && hit.attacker === this.main.name) return;
 			const puppet = this.puppets && this.puppets[hit.uid];
 			if (!puppet || puppet._killed) { this._sfxLog('reh.nopuppet', 'uid=' + hit.uid); return; }
 			const aType: number = (typeof hit.type === 'number' && hit.type > 0) ? hit.type : 1;
@@ -3108,7 +3113,7 @@ export class NetSync {
 			try {
 				if (typeof (this.main.connection as any).emitEnemyHurt === 'function') {
 					this._sfxLog('aed.relay', 'uid=' + hit.uid + ' t=' + typeNum + ' el=' + atkEl);
-					(this.main.connection as any).emitEnemyHurt({ uid: hit.uid, type: typeNum, attackElement: atkEl, critical: hit.critical === true });
+					(this.main.connection as any).emitEnemyHurt({ uid: hit.uid, type: typeNum, attackElement: atkEl, critical: hit.critical === true, attacker: hit.attacker });
 				}
 			} catch (_) { /* cosmetic relay */ }
 		} catch (_) { /* never let a combat packet crash the frame */ }

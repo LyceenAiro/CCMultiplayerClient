@@ -706,7 +706,7 @@ export class SocketIoConnector implements IConnection {
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
-	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }): void {
+	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }): void {
 		this.socket.emit('enemyHurt', hit);
 	}
 
@@ -878,7 +878,7 @@ export class SocketIoConnector implements IConnection {
 	}
 	/** ROUND 45 (Gap A, host origin): the host relayed a member's hit on a real enemy —
 	 * replay the hurt FX on our same-uid puppet (cosmetic only). */
-	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }) => void): void {
+	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }) => void): void {
 		this.socket.on('enemyHurt', (data: any) => {
 			if (data && typeof data.uid === 'number') callback(data);
 		});
