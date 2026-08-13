@@ -52,7 +52,7 @@ import { t } from './i18n';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.54.0';
+export const MP_VERSION = '1.59.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -530,6 +530,7 @@ export class Multiplayer {
 			// Round 19: a map change voids every cutscene puppet + cached mirror
 			// fade state (mirrors are being recreated for the new map).
 			try { if (this.netSync) this.netSync.clearCsPuppets(); } catch (_) { /* ignore */ }
+			try { if (this.netSync) this.netSync.clearProjectiles(); } catch (_) { /* ignore */ }
 			for (const name in this.players) {
 				const p = this.players[name];
 				if (keep.has(name)) {
@@ -3365,6 +3366,7 @@ export class Multiplayer {
 		// Round 19: kill every cutscene puppet + drop cached mirror fade state and
 		// any stashed regroup (logout / server loss ends the session's world state).
 		try { if (this.netSync) this.netSync.clearCsPuppets(); } catch (e) { /* ignore */ }
+		try { if (this.netSync) this.netSync.clearProjectiles(); } catch (e) { /* ignore */ }
 		this._pendingRegroup = null;
 		// Round 19: a logout/server-loss ends any PVP-duel isolation (the server
 		// clears the override on disconnect too) — the client flag must not leak

@@ -53,6 +53,26 @@ interface IEnemySnap {
 	                  // member tell "engaged on ME" (mirror red) from "engaged on
 	                  // someone else" (still hostile to the group). The plain tg flag
 	                  // couldn't, so a de-aggro off the member read as still-red.
+	sp?: number;      // ROUND 61: currentSp — the guard/break bar. Synced so the
+	                  // member's puppet shows the host's break progress.
+	msp?: number;     // ROUND 61: maxSp (baseParams.sp), the guard bar ceiling.
+	brk?: number;     // ROUND 61: break/vulnerable flag — 1 while the host enemy is
+	                  // guard-broken (its status Gui shows the red "broken" flash the
+	                  // member could never see). 0/absent = not broken.
+	hd?: number;      // ROUND 62: _hidden — 1 while the host enemy is genuinely HIDDEN
+	                  // (phased out via HIDE). The member's puppet mirrors this and becomes
+	                  // untargetable (its coll is untracked via _mpRehide, and
+	                  // onPreDamageModification refunds the hit). The hillkat/meerkat does
+	                  // NOT use HIDE — its burrow is SET_COLL_TYPE PASSIVE (see `psv`).
+	psv?: number;     // ROUND 63: SET_COLL_TYPE PASSIVE — 1 while the host enemy is
+	                  // untargetable-but-VISIBLE (the meerkat's earthIn/earthDig burrow).
+	                  // Balls skip PASSIVE colls natively (COLLISION_MAP[PROJECTILE] has no
+	                  // PASSIVE entry), so mirroring coll.type=PASSIVE on the puppet
+	                  // reproduces the host's "can't hit it underground" without hiding it.
+	vul?: number;     // ROUND 63: VULNERABLE annotation — 1 while the host enemy's
+	                  // annotate.passive === VULNERABLE (the meerkat's 2s "charge light"
+	                  // red-flash window where a charged ball breaks it). The member's
+	                  // puppet mirrors this as the red BLINK_COLOR flash it never showed.
 }
 
 export class NetSync {
@@ -147,6 +167,17 @@ export class NetSync {
 	private csPuppets: { [key: string]: any } = Object.create(null);
 	/** Round 19: ~15Hz accumulator for the member cutscene-entity stream. */
 	private _mpCsSendTimer = 0;
+	/** Round 62: member-side VISUAL-ONLY enemy projectiles (uid -> Ball/Stone copy).
+	 * Deliberately SEPARATE from `puppets` — these are PROJECTILES (Ball/Stone), not
+	 * enemies; they render + rotate but never hit or damage (host-authoritative damage
+	 * flows through combatHit). */
+	private projectiles: { [uid: number]: any } = Object.create(null);
+	/** Round 62: accumulator for the HOST enemy-projectile stream. Re-armed to
+	 * `blockInterval` (the option-driven 怪物同步频率, default 1/30) so the projectile
+	 * stream matches the hostile enemy-block rate instead of a hardcoded 15Hz. */
+	private _mpProjSendTimer = 0;
+	/** Round 62: stale-reap accumulator for visual projectile copies (member side). */
+	private _mpProjReapTimer = 0;
 	/** Round 19: last-seen timestamp per cutscene-entity stream owner (username).
 	 * An owner whose stream stops for >2s has its csPuppets reaped as orphans
 	 * (left the map / disconnected). */
@@ -280,6 +311,11 @@ export class NetSync {
 	 * Stored FULL (em/cl included) so the change-gate works; only the WIRE payload
 	 * drops em/cl when unchanged (opt 3). */
 	private _mpLastPlayerStateSnap: any = null;
+	/** ROUND 65: map name the gw/gm/ga/def guard fields were last sent from. The
+	 * receiver caches them on the mirror entity and mirrors are destroyed on a map
+	 * change, so a new map must re-send the full set even when unchanged (see the
+	 * omission gate in the playerState packer). */
+	private _mpGuardFieldsMap = '';
 	/** Round 22 (opt 2), split ROUND 23: per-uid last FULLY-ENCODED enemy snapshot for
 	 * the host's NON-HOSTILE entityState block delta (enemies with NO current target,
 	 * streamed at a fixed 15Hz). An enemy whose encoded fields are unchanged emits a
@@ -433,6 +469,9 @@ export class NetSync {
 		// Round 19: a client's cutscene-spawned monsters arrived (the server stamps
 		// the stream owner as `from`). Render them as csPuppets on members.
 		conn.onCutsceneEntity((from, data) => this.applyCutsceneEntity(from, data));
+		// Round 62: the host streamed enemy projectiles (Ball/Stone) so members see
+		// ranged attacks (弹幕). Spawn/update visual-only copies; reap absent uids.
+		conn.onProjectileState((map, list) => this.applyProjectileState(map, list));
 
 		// MEMBER-side puppet handling. Round 17: puppets run NO local Enemy AI — the AI's
 		// attack clock/timers are never synced, so a member-side monster's attack timing
@@ -1135,6 +1174,22 @@ export class NetSync {
 								// chargedNeutral AttackInfo (type 1/3, hasHint, attackerParams), so
 								// the flinch + interrupt gates now read the same data the native
 								// host ball path reads.
+								// ROUND 62 (underground invulnerability): a puppet whose host
+								// enemy is _hidden (burrowed/phased, hillkat earthIn) is
+								// untargetable on the host — the native engine never damages a
+								// _hidden enemy. The member's puppet tracked the underground
+								// position (fix A), so a ball connected here and the forwarded
+								// damage bypassed the host's invulnerability. Undo the local damage
+								// the engine just applied and skip the forward/flinch/kill: a hit
+								// on an underground enemy is a no-op, exactly like on the host.
+								if (this._hidden) {
+									try {
+										if (this.params && typeof this.params.currentHp === 'number') {
+											this.params.currentHp += dmg.damage;
+										}
+									} catch (_) { /* best-effort */ }
+									try { ns._sfxLog('fed.hidden', 'uid=' + (this._mpUid || 0) + ' blocked underground hit dmg=' + dmg.damage); } catch (_) { /* ignore */ }
+								} else {
 								const atkInfoA: any = rest[1];
 								// ROUND 43 (enemy-hurt sound, attacker side): this MEMBER's own client
 								// suppressed the puppet's native showHitEffect to avoid a double — so the
@@ -1149,6 +1204,27 @@ export class NetSync {
 									ns.playEnemyPuppetHitFx(this, aType, aEl, !!(atkInfoA && atkInfoA.critical === true));
 								} catch (_) { /* cosmetic */ }
 								ns.forwardEnemyDamage(this, dmg.damage, atkInfoA);
+								// ROUND 60 (diagnostics): the member→enemy （地鼠） report — a member's
+								// ranged hit sometimes shows NO feedback locally and lands for 0~1 on the
+								// host. Tag the member-side packet at its source: the local damage the
+								// member saw (dmg), the forwarded attack type / ball / charged / element /
+								// critical, and the puppet's shield + defense + hitStable at hit time. Paired
+								// with the host's aed.* tags this shows whether the number was already tiny
+								// here (a member-side puppet-shield reduction) or full here and shrank on the
+								// host (a host-side engine-chain reduction / forced-damage miss).
+								try {
+									const pA: any = this.params;
+									const shA: any = this.shield;
+									ns._sfxLog('fed.out', 'uid=' + (this._mpUid || 0), 'dmg=' + dmg.damage,
+										't=' + ((atkInfoA && typeof atkInfoA.type === 'number') ? atkInfoA.type : ((atkInfoA && (atkInfoA.isBall || atkInfoA.ballDamage)) ? 1 : 2)),
+										'ball=' + (!!(atkInfoA && (atkInfoA.isBall || atkInfoA.ballDamage)) ? 1 : 0),
+										'chg=' + ((atkInfoA && typeof atkInfoA.hasHint === 'function' && atkInfoA.hasHint('CHARGED')) ? 1 : 0),
+										'el=' + ((atkInfoA && typeof atkInfoA.element === 'number') ? atkInfoA.element : 0),
+										'crit=' + (!!(atkInfoA && atkInfoA.critical === true) ? 1 : 0),
+										'sh=' + ((shA && typeof shA.name === 'string') ? shA.name : (shA ? 'obj' : 0)),
+										'gd=' + ((pA && typeof pA.getStat === 'function') ? Math.round((pA.getStat('defense') || 0)) : -1),
+										'hs=' + (typeof this.hitStable === 'number' ? this.hitStable : -1));
+								} catch (_) { /* never break the forward path */ }
 								// Group aggro, exactly like the host: the engine's neighbour
 								// notify runs when an enemy ACQUIRES a target, so hitting one
 								// member of a cluster aggros the whole cluster here too (and
@@ -1192,7 +1268,8 @@ export class NetSync {
 									ns.playPuppetDeath(this, true);
 								}
 							}
-						} else if (this._mpMirror) {
+						}
+					} else if (this._mpMirror) {
 							// (B) host: an entity hit a remote player's mirror. rest[0] is the
 							// attacker — its position rides along so the owner can knock their
 							// player away from the hit (round 11).
@@ -1616,6 +1693,11 @@ export class NetSync {
 									}
 									if (best) {
 										try { const m4 = (window as any).__mpMain; if (m4 && m4.netSync) m4.netSync._sfxLog('tg.reachmirror', 'uid=' + enemy.uid + ' from=nonmirror far dMir=' + Math.round(bestD)); } catch (_) { /* ignore */ }
+									// ROUND 59 (diagnostics): narrate the retarget — FROM what (host/mirror/none,
+									// with its distance) TO the reachable mirror. Distinguishes the ROUND 53
+									// "was aimed at a far host, now aims at the close member" fix from the
+									// still-missing "aims at a NEAR host, ignores the member" case (tg.aim).
+									try { const m5 = (window as any).__mpMain; if (m5 && m5.netSync) m5.netSync._sfxLog('tg.aim', 'uid=' + enemy.uid, 'from=' + (enemy.target === (ig.game as any).playerEntity ? 'host' : (enemy.target && enemy.target._mpMirror ? ('mirror:' + enemy.target.name) : 'none')), 'dFrom=' + Math.round((enemy.distanceTo && enemy.target) ? enemy.distanceTo(enemy.target) : -1), 'to=' + (best && best.name), 'dTo=' + Math.round(bestD)); } catch (_) { /* ignore */ }
 										enemy.setTarget(best);
 										try { if (best.name && !enemy._mpEngaged) enemy._mpEngaged = { name: best.name }; } catch (_) { /* ignore */ }
 										try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ }
@@ -2029,10 +2111,14 @@ export class NetSync {
 		// (visualType falling back to type, both numeric sc.ATTACK_TYPE) so the member
 		// replays the genuine melee-hit sound instead of the hardcoded LIGHT ball sound.
 		let ax: number | undefined; let ay: number | undefined; let atk = 0; let attackType = 0;
+		let atkVelX = 0; let atkVelY = 0; // ROUND 65: attacker velocity for the guard direction fallback
 		try {
 			const root: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
 			const c = root && root.coll;
 			if (c && c.pos) { ax = c.pos.x + (c.size ? c.size.x / 2 : 0); ay = c.pos.y + (c.size ? c.size.y / 2 : 0); }
+			// ROUND 65: capture the attacker's velocity too — the native direction gate
+			// (DIRECTIONAL.isActive) falls back to it when the center-to-center check fails.
+			if (c && c.vel) { atkVelX = Number(c.vel.x) || 0; atkVelY = Number(c.vel.y) || 0; }
 			if (attacker && attacker.params && typeof attacker.params.getStat === 'function') {
 				const a = attacker.params.getStat('attack');
 				if (typeof a === 'number' && a > 0) atk = a;
@@ -2079,6 +2165,62 @@ export class NetSync {
 			// window -> not perfect, full stop; a real press gets the small transport grace.
 			const winLeft = gstRemain > 0 ? gstRemain - elapsedSinceSend + GRACE : 0;
 			const gm = typeof mirror._mpGm === 'number' ? mirror._mpGm : 0;
+			// ROUND 65 (guard direction fix): `guarding` alone is not enough — the native
+			// engine gates a successful guard behind TWO checks (game.compiled.js
+			// isShielded ~line 5003 + COMBAT_SHIELDS.DIRECTIONAL.isActive ~line 4892)
+			// that this recompute never ran, so a member holding guard blocked hits from
+			// ANY direction — even with their back to the monster. Reproduce both:
+			//
+			//  1) guardable/strength gate (sc.GUARDABLE: AUTO=0 NEVER=1 FROM_ABOVE=2
+			//     ALWAYS=3): unblockable attacks ignore guard; FROM_ABOVE attacks need
+			//     the top-guard skill (GUARD_AREA >= 2 -> SHIELD_STRENGTH.BLOCK_ABOVE);
+			//     BREAK-type attacks beat the player shield's hitResist (MASSIVE=4).
+			//     GUARDABLE.ALWAYS skips all three, exactly like the engine.
+			//  2) direction gate: the victim must FACE the attacker within a frontal arc
+			//     of (range * 180°); range is 0.5 normally and 1 with the omnidirectional
+			//     guard skill (GUARD_AREA >= 1 — the same GUARD_AREA modifier the guard
+			//     action step reads, already streamed as _mpGa). The engine computes
+			//     f = π - |angle(attacker→victim, victim.face)| and passes on f <= arc,
+			//     with a fallback pass against the attacker's current velocity.
+			const ga = typeof mirror._mpGa === 'number' ? mirror._mpGa : 0;
+			const guardRange = ga >= 1 ? 1 : 0.5;   // GUARD_AREA >= 1: omnidirectional guard skill
+			const guardAbove = ga >= 2;             // GUARD_AREA >= 2: top-guard (BLOCK_ABOVE) skill
+			let guardHolds = guarding;
+			if (guardHolds) {
+				const guardable = hitProps && typeof hitProps.guardable === 'number' ? hitProps.guardable : 0;
+				const hitType = hitProps && typeof hitProps.type === 'number' ? hitProps.type : 0;
+				if (guardable !== 3 /* GUARDABLE.ALWAYS */) {
+					if (guardable === 1 /* GUARDABLE.NEVER */) guardHolds = false;
+					else if (guardable === 2 /* GUARDABLE.FROM_ABOVE */ && !guardAbove) guardHolds = false;
+					else if (hitType > 4 /* player shield hitResist = ATTACK_TYPE.MASSIVE */) guardHolds = false;
+				}
+			}
+			if (guardHolds && guardRange < 1) {
+				const face = mirror.face;
+				const fx = face ? (Number(face.x) || 0) : 0;
+				const fy = face ? (Number(face.y) || 0) : 0;
+				const arc = guardRange * Math.PI;
+				// Vec2.angle semantics: acos(dot/(len*len) clamped) — a ZERO vector yields
+				// NaN, which the engine's `|| 0` folds to a 0 angle (f = π -> never blocks).
+				const angleToFace = (vx: number, vy: number): number => {
+					const vl = Math.sqrt(vx * vx + vy * vy);
+					const fl = Math.sqrt(fx * fx + fy * fy);
+					if (!(vl > 0) || !(fl > 0)) return 0;
+					const c = Math.max(-1, Math.min(1, (vx * fx + vy * fy) / (vl * fl)));
+					return Math.acos(c) || 0;
+				};
+				let pass = false;
+				const mc = mirror.coll && mirror.coll.pos && mirror.coll.size
+					? { x: mirror.coll.pos.x + mirror.coll.size.x / 2, y: mirror.coll.pos.y + mirror.coll.size.y / 2 }
+					: null;
+				if (mc && typeof ax === 'number' && typeof ay === 'number') {
+					pass = (Math.PI - Math.abs(angleToFace(mc.x - ax, mc.y - ay))) <= arc;
+				}
+				if (!pass && (atkVelX || atkVelY)) {
+					pass = (Math.PI - Math.abs(angleToFace(atkVelX, atkVelY))) <= arc;
+				}
+				if (!pass) { D('guarddir', 'back turned -> guard broken'); guardHolds = false; }
+			}
 			// ROUND 30 (item 1): replace the old `engineDamage * sqrt(huskDef/memberDef)`
 			// approximation with the engine's OWN damage law. The engine computes
 			// `PERCENTAGE(atk,def)` (game.compiled.js): atk>def -> atk*(1+pow(1-def/atk,0.5)*0.2),
@@ -2110,7 +2252,7 @@ export class NetSync {
 					? hitProps.attackerParams.criticalDmgFactor : 1.5;
 				baseAgainstMember = Math.max(1, Math.round(baseAgainstMember * critK));
 			}
-			if (guarding && winLeft > 0) {
+			if (guardHolds && winLeft > 0) {
 				// PERFECT guard: no damage, no knockback; member plays the counter window.
 				perfect = true;
 				finalDamage = 0;
@@ -2145,7 +2287,7 @@ export class NetSync {
 						monster: true, perfect: true, regular: false, knockback: false,
 					});
 				} catch (_) { /* mirror FX is cosmetic */ }
-			} else if (guarding) {
+			} else if (guardHolds) {
 				// REGULAR guard: engine's PLAYER-shield damageFactor (atk/def curve minus
 				// GUARD_STRENGTH). Use the member's real defense + attack stat.
 				regular = true;
@@ -2891,6 +3033,24 @@ export class NetSync {
 			}
 			if (!target || !target.params) return;
 			const dmg = Math.max(1, Math.round(hit.damage));
+			// ROUND 60 (diagnostics): the incoming member→enemy packet （地鼠 report — a member's
+			// ranged hit lands for 0~1 on the host). Log the raw forwarded damage + attack meta,
+			// the resolved mirror, and the REAL enemy's shield / defense / hp at receipt. Pair with
+			// the member's fed.out (local damage) to see what the wire carried, and with aed.res
+			// (post-chain) to see what the host's engine chain actually applied.
+			try {
+				const pl0: any = this.main.players[hit.attacker];
+				const mir0: any = pl0 && pl0.entity;
+				const p0: any = target.params;
+				const sh0: any = target.shield;
+				this._sfxLog('aed.in', 'uid=' + hit.uid, 'raw=' + hit.damage, 'dmg=' + dmg, 'atk=' + hit.attacker,
+					'mirror=' + ((mir0 && !mir0._killed) ? 1 : 0),
+					't=' + ((typeof hit.type === 'number') ? hit.type : -1), 'ball=' + (hit.ball === true ? 1 : 0),
+					'chg=' + (hit.charged === true ? 1 : 0), 'crit=' + (hit.critical === true ? 1 : 0),
+					'sh=' + ((sh0 && typeof sh0.name === 'string') ? sh0.name : (sh0 ? 'obj' : 0)),
+					'def=' + ((p0 && typeof p0.getStat === 'function') ? Math.round((p0.getStat('defense') || 0)) : -1),
+					'hp=' + ((p0 && typeof p0.currentHp === 'number') ? Math.round(p0.currentHp) : -1));
+			} catch (_) { /* never break the apply path */ }
 			// ROUND 32 (item 3c): recover the REAL attack's interrupt/knockback strength.
 			// The member forwards sc.ATTACK_TYPE (0..5) + isBall/charged/knockback. Map back
 			// to the engine's type-key string + fly level. Native rule (game.compiled.js
@@ -3059,6 +3219,13 @@ export class NetSync {
 						// number, no flinch/knockback/sparks. Passing the target kills the
 						// guard, and onDamage's `r = c || this` still resolves to the target.
 						applied = target.damage(mirror, info, target) !== false;
+						// ROUND 60 (diagnostics): did the engine chain ACCEPT the forwarded hit, and
+						// did the forced-damage branch (C) actually fire? `forced` is true when the
+						// mirror's _mpForcedDamage was still set at the moment damage() returned — i.e.
+						// branch C did NOT consume it, so the engine computed its OWN (reduced) number
+						// instead of the forwarded one. That is the 0~1-on-host signature. Gated on
+						// _mpSfxDebug so there is no live behavior change.
+						try { (this as any)._mpLastAedForced = ((mirror as any)._mpForcedDamage != null); } catch (_) { (this as any)._mpLastAedForced = true; }
 					} finally {
 						mirrorAny.tackle = prevTackle;
 						if (mirrorAny.coll && mirrorAny.coll.vel) {
@@ -3068,6 +3235,18 @@ export class NetSync {
 					}
 				} catch (_) { applied = false; }
 				if (!applied) (mirror as any)._mpForcedDamage = null;
+				// ROUND 60 (diagnostics): the outcome of the engine chain for a forwarded member hit.
+				// `applied` = did target.damage() run the full chain; `forced` = was the forwarded number
+				// left unconsumed (branch C never fired → the engine's own reduced number showed, which
+				// the host reads as 0~1). `hs` = the real enemy's hitStable (interrupt/poise gate).
+				try {
+					const st: any = this;
+					const stF: any = st._mpLastAedForced;
+					this._sfxLog('aed.res', 'uid=' + hit.uid, 'applied=' + (applied ? 1 : 0),
+						'forced=' + (stF === false ? 0 : 1),
+						'dmg=' + dmg, 'hs=' + (typeof target.hitStable === 'number' ? target.hitStable : -1));
+					st._mpLastAedForced = undefined;
+				} catch (_) { /* cosmetic */ }
 				// ROUND 43 (enemy-hurt sound for teammates): the native onDamage chain above
 				// (target.damage -> Enemy.onDamage -> showHitEffect) ALREADY plays the hurt sound
 				// for the host and fires the onShowHitEffect relay that carries it to the
@@ -3092,6 +3271,11 @@ export class NetSync {
 				// poise-aware, knockback.
 			}
 			if (!applied) {
+				// ROUND 60 (diagnostics): the fallback HP write. If the host shows 0~1 AND we land here
+				// (applied=0), the FULL forwarded number was written — so the small number came from the
+				// MEMBER side (fed.out), not the host. If applied=1 with forced=1, the host's own engine
+				// chain produced the small number. This tag separates those two cases.
+				this._sfxLog('aed.fb', 'uid=' + hit.uid, 'dmg=' + dmg);
 				// Fallback (mirror not up / multi-part enemy colliding / damage refused):
 				// bare HP write + a manual damage number so the hit is still visible.
 				target.params.reduceHp(dmg);
@@ -3520,7 +3704,21 @@ export class NetSync {
 				// Round 27: knockback is host-decided for monster hits (doKnockback). Guarded
 				// monster hits returned early above (no knockback); PvP keeps the old behaviour.
 				if (doKnockback && typeof p.doDamageMovement === 'function') {
-					const stun = p.doDamageMovement(dir, atkType, false, false, 0);
+					// ROUND 64 (client hitstun fix): doDamageMovement's 2nd arg is a
+					// COMBAT_FLY_LEVEL key STRING ('LIGHT'/'MEDIUM'/'HEAVY'/'MASSIVE') —
+					// the engine does `sc.COMBAT_FLY_LEVEL[b]` and returns 0 (no flinch
+					// anim, no knockback, no stun) when the lookup misses. Passing the
+					// numeric sc.ATTACK_TYPE here silently voided the whole reaction,
+					// which is why a damaged member never flinched or got interrupted.
+					// Map ATTACK_TYPE -> fly level exactly like the engine's native
+					// applyDamage (game.compiled.js ~line 5013: BREAK folds into
+					// MASSIVE, NONE/unknown -> LIGHT).
+					const AT: any = (sc as any).ATTACK_TYPE || { LIGHT: 1, MEDIUM: 2, HEAVY: 3, MASSIVE: 4, BREAK: 5 };
+					const flyLevel: string =
+						atkType === AT.MEDIUM ? 'MEDIUM' :
+						atkType === AT.HEAVY ? 'HEAVY' :
+						(atkType === AT.MASSIVE || atkType === AT.BREAK) ? 'MASSIVE' : 'LIGHT';
+					const stun = p.doDamageMovement(dir, flyLevel, false, false, 0);
 					p.damageTimer = Math.max(p.damageTimer || 0, stun || 0.2);
 				}
 				const scAny: any = sc as any;
@@ -3954,6 +4152,9 @@ export class NetSync {
 				// Round 19 (Part 3): a map change voids every cutscene puppet (they
 				// belong to the map we just left) + cached mirror fade state.
 				this.clearCsPuppets();
+				// Round 62: a map change voids every visual projectile copy (they belong
+				// to the map we just left).
+				this.clearProjectiles();
 				this.resetCombatForNewBlock();
 				// Round 14 (fix 5): a map change voids every queued dying puppet — kill them
 				// silently (kill(true): no loot/FX) and drop the queue. They belong to the
@@ -4010,6 +4211,16 @@ export class NetSync {
 				this._mpReapTimer = 0;
 				this.reapStalePuppets();
 			}
+			// Round 62: member-side stale projectile reap (~150ms). Projectiles are
+			// short-lived and the host sends no empty blocks, so absence in the stream
+			// is what tells us a projectile died on the host.
+			if (!this.main.host) {
+				this._mpProjReapTimer += ig.system.tick;
+				if (this._mpProjReapTimer >= 0.15) {
+					this._mpProjReapTimer = 0;
+					this.reapStaleProjectiles();
+				}
+			}
 			// Round 19 (Part 2): the single per-frame fade + collision pass for remote
 			// mirrors (cutscene fade, both directions + shared-town IGNORE).
 			this.updateRemoteMirrorFade();
@@ -4024,6 +4235,9 @@ export class NetSync {
 			this.sendPlayerState();
 			if (this.main.host) {
 				this.sendEnemyBlock();
+				// Round 62: host streams its live enemy projectiles so members see the
+				// enemy's ranged attacks (Ball/Stone flying toward them).
+				this.sendProjectileBlock();
 				// Round 14 (fix 1): combat re-evaluation for the host. sc.model.combatMode is
 				// only re-computed via the LOCAL player's _addTargetedBy/_removeTargetedBy ->
 				// updateCombatMode(), but enemies that de-aggro a REMOTE player's MIRROR never
@@ -4253,7 +4467,18 @@ export class NetSync {
 		// (the receiver caches them on the mirror). `gst` re-arms on every guard PRESS, so
 		// it is always meaningful; `def` rides the same gate (cheap, and the host's damage
 		// math needs it fresh).
-		if (prev && prev.gw === snap.gw && prev.gm === snap.gm && prev.ga === snap.ga && prev.def === snap.def) {
+		// ROUND 65 (skill compatibility): the receiver caches these ON THE MIRROR entity,
+		// and a map change destroys every mirror — the fresh mirror has NO cached ga/gm/
+		// def, while this side's change-gate still sees "unchanged" and keeps omitting
+		// them. The omnidirectional (GUARD_AREA>=1) / top-guard (GUARD_AREA>=2) skills
+		// then silently revert to a plain frontal guard after every map transition until
+		// the player swaps equipment. Force the full field set onto the wire whenever the
+		// map changed since the last send so the new mirrors always learn them.
+		let mapNow = '';
+		try { mapNow = (ig.game && (ig.game as any).mapName) || ''; } catch (_) { /* ignore */ }
+		const mapChanged = mapNow !== this._mpGuardFieldsMap;
+		this._mpGuardFieldsMap = mapNow;
+		if (!mapChanged && prev && prev.gw === snap.gw && prev.gm === snap.gm && prev.ga === snap.ga && prev.def === snap.def) {
 			delete out.gw; delete out.gm; delete out.ga; delete out.def;
 		}
 		this.main.connection.updatePlayerState(out);
@@ -4705,9 +4930,28 @@ export class NetSync {
 				if (t._mpMirror && typeof t.name === 'string' && t.name) return t.name;
 				return '__host__';
 			})(e.target),
+			// ROUND 61 (fix C): guard/break state — the member's puppet never showed the
+			// host enemy's break ("红光") because sp/brk were never in the snapshot. Ship
+			// currentSp / maxSp / the broken flag so applyEntityState can mirror them.
+			sp: e.params ? Math.round(e.params.currentSp || 0) : 0,
+			msp: e.params && e.params.baseParams ? Math.round(e.params.baseParams.sp || 0) : 0,
+			brk: this.readEnemyBroken(e) ? 1 : 0,
+			hd: e._hidden ? 1 : 0,
+			psv: this._mpEnemyPassive(e) ? 1 : 0,
+			vul: this.readEnemyVulnerable(e) ? 1 : 0,
 		};
 		const prev = deltaMap.get(e.uid);
-		if (forceFull || !prev || this.enemySnapChanged(prev, snap)) {
+		// ROUND 61 (fix A): a burrowed/phased/hidden enemy (hillkat earthIn/earthOut) can
+		// sit PERFECTLY still underground for a while — pos/anim/tg all unchanged — so the
+		// strict delta check below emits only a bare liveness marker and the member's puppet
+		// FREEZES at its last position. The host enemy then re-targets the member's MIRROR
+		// and the two positions diverge for good: the member shoots at a frozen puppet (miss)
+		// while the host sees its real enemy take 0~1 mirror-husk hits. Force a FULL snapshot
+		// every block while the enemy is hidden/burrowed so the puppet keeps tracking the
+		// real position through the burrow->emerge cycle (the >250px snap branch in
+		// interpolatePuppets teleports it instantly on emerge).
+		const burrowed = this._mpEnemyUntargetable(e);
+		if (forceFull || burrowed || !prev || this.enemySnapChanged(prev, snap)) {
 			deltaMap.set(e.uid, snap);
 			out.push(snap);
 		} else {
@@ -4755,6 +4999,14 @@ export class NetSync {
 						targetName = null;
 					}
 					this.emitEnemyAttack(e.uid, atkAnim, targetName);
+					// ROUND 59 (diagnostics): log the ATTACK-EDGE snapshot — every engaged swing
+					// at a member emits one line: enemy uid, anim, aimed target (t=member name /
+					// __host__ / '?') and enemy->mirror distance (d). Live signal for the residual
+					// "swings but never hits the member" bug: tgt=member with NO pdm.recompute after
+					// = physical-connect miss; tgt=__host__ = aimed at the host while standing on
+					// the member (targeting problem, fixable WITHOUT touching damage gates). Host
+					// console, `window.__mpSfxDebug = 1`; _sfxLog throttles ~500ms per enemy uid.
+					this._sfxLog('tg.edge.' + e.uid, 'anim=' + atkAnim, 'tgt=' + (targetName || (tgt === (ig.game as any).playerEntity ? '__host__' : '?')), 'd=' + Math.round((tgt && e.distanceTo) ? e.distanceTo(tgt) : -1));
 					// ROUND 49: connect-independent damage trigger. This anim edge fires
 					// for EVERY engaged-enemy swing (the member log relays every swing even
 					// when no hit lands), so it is the reliable trigger the physical connect
@@ -4982,7 +5234,83 @@ export class NetSync {
 		if (a.tn !== b.tn) return true;
 		if (a.mi !== b.mi) return true;
 		if (a.t !== b.t) return true;
+		// ROUND 61 (fix C): break state changes must ship even at a frozen position.
+		if ((a.sp || 0) !== (b.sp || 0)) return true;
+		if ((a.msp || 0) !== (b.msp || 0)) return true;
+		if ((a.brk || 0) !== (b.brk || 0)) return true;
+		// ROUND 62: the burrow/phased flag flips mid-burrow (hillkat earthIn holds a still
+		// frame for a while) — ship it so the member's puppet toggles its invulnerability.
+		if ((a.hd || 0) !== (b.hd || 0)) return true;
+		// ROUND 63: PASSIVE-coll (meerkat burrow) + VULNERABLE (red-flash) both flip while
+		// the enemy holds a still frame — ship them so the member sees the change.
+		if ((a.psv || 0) !== (b.psv || 0)) return true;
+		if ((a.vul || 0) !== (b.vul || 0)) return true;
 		return false;
+	}
+
+	/** ROUND 61: read whether the host enemy is currently guard-BROKEN (the red "broken"
+	 * flash a member's puppet never showed). The engine flips this through the SP bar +
+	 * enemy state; we probe the small set of status/state signals defensively so a
+	 * different build naming still resolves, and default to false (never show a phantom
+	 * break). Best-effort — a missing field just means "not broken". */
+	private readEnemyBroken(e: any): boolean {
+		try {
+			const gui: any = e.statusGui;
+			if (gui && (gui.breakActive === true || gui.broken === true || gui.spBreak === true)) return true;
+			if (gui && gui.spBar && (gui.spBar.broken === true || gui.spBar.breakActive === true)) return true;
+			const st: any = e.state;
+			if (st === 'break' || st === 'broken' || st === 'vulnerable') return true;
+			if (e.breakTimer && e.breakTimer > 0) return true;
+			// ROUND 63: reaction break (the meerkat's CHARGE_WEAK -> STUN). Guard-bar-less
+			// enemies like the meerkat (maxSp 0) never touch statusGui/breakTimer — their
+			// "broken" is the STUN state's annotate.passive === WEAK. Detect it so `brk`
+			// correctly reports the break and the member can replay the break FX/label.
+			if (e.annotate && e.annotate.passive === this._mpAnnoPassive('WEAK', 2)) return true;
+		} catch (_) { /* best-effort */ }
+		return false;
+	}
+
+	/** ROUND 63: resolve an ENEMY_ANNO_PASSIVE enum value by name (e.g. 'VULNERABLE'/'WEAK'),
+	 * falling back to a hard-coded default if the enum key is missing on this build. */
+	private _mpAnnoPassive(key: string, fallback: number): number {
+		try {
+			const E = (sc as any).ENEMY_ANNO_PASSIVE;
+			return (E && E[key] != null) ? E[key] : fallback;
+		} catch (_) { return fallback; }
+	}
+
+	/** ROUND 63: read whether the host enemy is in the VULNERABLE annotation (the meerkat's
+	 * 2s "charge light" red-flash window — a charged ball breaks it here). This is NOT the
+	 * "broken" state readEnemyBroken probes: the meerkat (maxSp 0) has no guard bar, and the
+	 * engine flips `annotate.passive` to VULNERABLE via CHANGE_ENEMY_ANNOTATION during
+	 * SpecialAttack, then to IMMUNE when it burrows. Best-effort; default false. */
+	private readEnemyVulnerable(e: any): boolean {
+		try {
+			if (!e || !e.annotate) return false;
+			const VUL: number = (sc as any).ENEMY_ANNO_PASSIVE && (sc as any).ENEMY_ANNO_PASSIVE.VULNERABLE
+				? (sc as any).ENEMY_ANNO_PASSIVE.VULNERABLE : 1;
+			return e.annotate.passive === VUL;
+		} catch (_) { return false; }
+	}
+
+	/** ROUND 63: read whether the host enemy is untargetable via SET_COLL_TYPE PASSIVE
+	 * (the meerkat's earthIn/earthDig burrow). PASSIVE is a coll type (8), NOT _hidden —
+	 * the meerkat stays visible underground and only its coll becomes untargetable, so the
+	 * old `e._hidden` probe never fired for it. Balls skip PASSIVE colls natively. */
+	private _mpEnemyPassive(e: any): boolean {
+		try {
+			if (!e || !e.coll) return false;
+			const PASSIVE = (ig as any).COLLTYPE && (ig as any).COLLTYPE.PASSIVE != null
+				? (ig as any).COLLTYPE.PASSIVE : 8;
+			return e.coll.type === PASSIVE;
+		} catch (_) { return false; }
+	}
+
+	/** ROUND 63: an enemy is "untargetable" if it is genuinely hidden OR passive-coll. Used
+	 * to force a FULL snapshot every block while buried so the puppet keeps tracking the
+	 * real position through the still-frame burrow->emerge cycle (fix A's burrowed force). */
+	private _mpEnemyUntargetable(e: any): boolean {
+		return !!e._hidden || this._mpEnemyPassive(e);
 	}
 
 	/** Round 17 (issue 1): HOST side — one of our real enemies just started an attack
@@ -5219,6 +5547,25 @@ export class NetSync {
 		// path; _mpSnapNext snaps the fresh spawn into place).
 		for (const ck in this.csPuppets) {
 			const e = this.csPuppets[ck];
+			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
+			const cpp: any = e.coll.pos;
+			const dx = e._mpToX - cpp.xProtected;
+			const dy = e._mpToY - cpp.yProtected;
+			const dz = e._mpToZ - cpp.zProtected;
+			if (dx === 0 && dy === 0 && dz === 0) continue;
+			if (dx * dx + dy * dy > 250 * 250 || Math.abs(dz) > 200) {
+				cpp.xProtected = e._mpToX; cpp.yProtected = e._mpToY; cpp.zProtected = e._mpToZ;
+				continue;
+			}
+			if (dx !== 0) cpp.xProtected = cpp.xProtected + dx * t;
+			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * t;
+			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * t;
+		}
+		// Round 62: visual projectile copies glide through the SAME per-frame lerp
+		// targets (applyProjectileState writes _mpTo* exactly like the block-apply path;
+		// the ~250px snap threshold teleports them past a dropped-block gap).
+		for (const pk in this.projectiles) {
+			const e = this.projectiles[pk];
 			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
 			const cpp: any = e.coll.pos;
 			const dx = e._mpToX - cpp.xProtected;
@@ -5500,6 +5847,175 @@ export class NetSync {
 				}
 			} catch (_) { /* ignore */ }
 		} catch (_) { /* never break a spawn */ }
+	}
+
+	/**
+	 * ROUND 62 (step 1): HOST side — stream every live enemy projectile (Ball/Stone
+	 * with party ENEMY) at `blockInterval` (the option-driven 怪物同步频率, default
+	 * 30Hz) so members can see the enemy's ranged attacks (弹幕). Enemy projectiles only
+	 * exist while an enemy is hostile, so this shares the hostile stream's cadence.
+	 * The host is the only client that runs real enemy AI, so only it spawns enemy
+	 * projectiles (SHOOT_PROXY -> proxy.spawn -> ig.ENTITY.Ball/Stone). Each snap
+	 * carries the projectile's uid, kind (Ball/Stone), the SOURCE enemy uid + proxy
+	 * name (so a member rebuilds the same projectile visual from its own puppet's
+	 * proxy data), position, and 2D velocity (flight angle only). Presence-driven:
+	 * emits only while an enemy projectile is alive.
+	 */
+	private sendProjectileBlock(): void {
+		try {
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen()) return;
+			this._mpProjSendTimer -= ig.system.tick;
+			if (this._mpProjSendTimer > 0) return;
+			this._mpProjSendTimer = this.blockInterval;
+			const list: any[] = [];
+			const entities = ig.game.entities;
+			const Projectile = (ig.ENTITY as any).Projectile;
+			const Stone = (ig.ENTITY as any).Stone;
+			const EnemyParty = (sc as any).COMBATANT_PARTY.ENEMY;
+			for (let i = 0; i < entities.length; i++) {
+				const e: any = entities[i];
+				if (!(e instanceof Projectile) || e._killed || !e.coll) continue;
+				if (e.party !== EnemyParty) continue;          // only ENEMY projectiles (not player throws)
+				if (e._mpMirror || e._mpProj) continue;       // never re-stream a visual copy
+				const combatant = e.combatant;
+				let src = 0;
+				let pn = '';
+				if (combatant && typeof combatant.uid === 'number' && combatant.proxies) {
+					src = combatant.uid;
+					// Reverse-lookup the proxy name by animSheet identity: setBallInfo /
+					// setStoneInfo assign `this.animSheet = config.animation` directly, so a
+					// projectile's animSheet IS its proxy's data.animation object.
+					for (const name in combatant.proxies) {
+						const p = combatant.proxies[name];
+						if (p && p.data && p.data.animation === e.animSheet) { pn = name; break; }
+					}
+				}
+				const vel = e.coll.vel || { x: 0, y: 0 };
+				list.push({
+					i: e.uid,
+					k: (e instanceof Stone) ? 'S' : 'B',
+					src,
+					pn,
+					x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
+					vx: Math.round(vel.x), vy: Math.round(vel.y),
+				});
+				if (list.length >= 64) break;
+			}
+			if (!list.length) return;
+			conn.updateProjectileState(this.mapName, list);
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/**
+	 * ROUND 62 (step 2): MEMBER side — the host's enemy-projectile stream arrived.
+	 * Spawn/update visual-only Ball/Stone copies keyed by uid. Absent uids are NOT
+	 * reaped here (the host sends no empty blocks) — reapStaleProjectiles handles that
+	 * on a ~150ms cadence.
+	 */
+	private applyProjectileState(map: string, list: any[]): void {
+		try {
+			if (this.main.host) return;                        // host renders its own real projectiles
+			if (!map || map !== this.mapName) return;          // stream for a map we left
+			if (!Array.isArray(list)) return;
+			const now = Date.now();
+			for (const s of list) {
+				if (!s || typeof s.i !== 'number') continue;
+				let e: any = this.projectiles[s.i];
+				if (!e || e._killed) {
+					e = this.spawnProjectilePuppet(s);
+					if (!e) continue;                          // source puppet not ready — retry next block
+					this.projectiles[s.i] = e;
+				}
+				e._mpProjSeen = now;
+				// Position target (same _mpTo*/_mpSnapNext contract as puppets, so
+				// interpolatePuppets glides it smoothly between blocks).
+				if (e._mpToX !== s.x || e._mpToY !== s.y || e._mpToZ !== s.z) {
+					e._mpToX = s.x; e._mpToY = s.y; e._mpToZ = s.z;
+					if (e._mpSnapNext) {
+						e._mpSnapNext = false;
+						const cp = e.coll && e.coll.pos;
+						if (cp) { cp.xProtected = s.x; cp.yProtected = s.y; cp.zProtected = s.z; }
+					}
+				}
+				// Flight angle: the projectile rotates from its 2D velocity (Projectile.update
+				// recomputes animState.angle from coll.vel every frame).
+				if (e.coll && e.coll.vel) {
+					if (typeof s.vx === 'number') e.coll.vel.x = s.vx;
+					if (typeof s.vy === 'number') e.coll.vel.y = s.vy;
+				}
+			}
+		} catch (_) { /* never break block apply */ }
+	}
+
+	/**
+	 * ROUND 62 (step 3): spawn a VISUAL-ONLY copy of a host enemy projectile, rebuilt
+	 * from the SOURCE enemy puppet's proxy data so it renders identically to the host's
+	 * (same animation sheet / effects / light / size). The copy is then neutralized —
+	 * party OTHER, coll IGNORE, no attackInfo/hitProxy/behaviors/timer — so it never
+	 * hits, damages, self-destructs, or steers. Position is locked (lockEntity) and the
+	 * stream drives its flight; only the 2D velocity is kept so it ROTATES correctly.
+	 * Returns the neutralized entity, or null when the source puppet isn't ready yet
+	 * (the next block retries).
+	 */
+	private spawnProjectilePuppet(s: any): any {
+		try {
+			const puppet = this.puppets[s.src];
+			if (!puppet || puppet._killed || !puppet.proxies) return null;
+			const proxy = (sc as any).ProxyTools.getProxy(s.pn, puppet);
+			if (!proxy || !proxy.data || typeof proxy.spawn !== 'function') return null;
+			// Spawn through the proxy's own spawn() so the animation sheet, effects and
+			// light all come from the source enemy's data (BallInfo.spawn -> ig.ENTITY.Ball,
+			// StoneInfo.spawn -> ig.ENTITY.Stone). The proxy normalizes velocity to its own
+			// speed, so only the DIRECTION from the stream matters.
+			const e = proxy.spawn(s.x, s.y, s.z, puppet, { x: s.vx || 0, y: s.vy || 0 });
+			if (!e) return null;
+			// Neutralize: no damage, no collision, no self-destruct, no AI behaviors.
+			e.party = (sc as any).COMBATANT_PARTY.OTHER;
+			try { if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE; } catch (_) { /* ignore */ }
+			e.attackInfo = null;
+			e.hitProxy = null;
+			e.combatant = null;
+			e.target = null;
+			e.behaviors = null;
+			e.grab = null;
+			e.destroyProxySrc = null;
+			e.bounceProxySrc = null;
+			e.timer = 0; // Ball.update only ticks the timer while > 0 -> never self-destructs
+			e._mpProj = true;
+			e._mpSnapNext = true;
+			this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z });
+			return e;
+		} catch (_) { return null; }
+	}
+
+	/** Round 62 (step 4): reap visual projectile copies whose host projectile stopped
+	 * being seen (>200ms = ~3 stream blocks). Short-lived by nature; the grace smooths
+	 * over a single dropped block without leaving dead projectiles frozen on screen. */
+	private reapStaleProjectiles(): void {
+		try {
+			const now = Date.now();
+			for (const uid in this.projectiles) {
+				const e = this.projectiles[uid];
+				if (!e) { delete this.projectiles[uid]; continue; }
+				if (e._killed || (typeof e._mpProjSeen === 'number' && now - e._mpProjSeen > 200)) {
+					if (!e._killed) { try { e.kill(true); } catch (_) { /* ignore */ } }
+					delete this.projectiles[uid];
+				}
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** Round 62: kill every visual projectile copy + drop the stream bookkeeping
+	 * (map change / logout / server loss). kill(true) = silent, no FX. */
+	public clearProjectiles(): void {
+		try {
+			for (const uid in this.projectiles) {
+				const e = this.projectiles[uid];
+				if (e && !e._killed) { try { e.kill(true); } catch (_) { /* ignore */ } }
+				delete this.projectiles[uid];
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	/**
@@ -6586,6 +7102,44 @@ export class NetSync {
 					}
 				} catch (_) { /* ignore */ }
 			}
+			// ROUND 62 (underground invulnerability): mirror the host enemy's _hidden flag
+			// onto the puppet. A burrowed/phased hillkat is untargetable on the host (the
+			// native engine never applies damage to a _hidden enemy), but the member's
+			// puppet had no such flag — fix A (burrowed => full snapshot) made the puppet
+			// track the underground position, so a member's ball could connect and the
+			// forwarded damage bypassed the host's native invulnerability. Write the flag
+			// here; the onPreDamageModification branch-A gate reads it to drop the hit
+			// (no local damage, no forward, no flinch, no kill) while the puppet is hidden.
+			// Only set/unset on an actual flip so the burrow/emerge transition is one-shot.
+			if (isFull) {
+				const hdNow = (s.hd || 0) === 1;
+				if (!!e._hidden !== hdNow) e._hidden = hdNow;
+			}
+			this._mpRehidePuppet(e, isFull);
+			// ROUND 63 (meerkat burrow untargetability): the hillkat/meerkat goes
+			// untargetable via SET_COLL_TYPE PASSIVE, not HIDE — so the ROUND 62 _hidden
+			// mirror never fired for it. Mirror the PASSIVE coll type onto the puppet:
+			// balls skip PASSIVE colls natively (COLLISION_MAP[PROJECTILE] has no PASSIVE
+			// entry), so a member's ball passes straight through the buried puppet exactly
+			// like it does on the host — no local hit, no forward, no 0~1 mirror-husk hit.
+			// The puppet stays VISIBLE (coll.type doesn't hide it), so the earthIn/earthDig
+			// anim (synced via `a`) still shows it sinking underground. Only set/unset on
+			// an actual flip, and cache the real type once to restore on emerge.
+			if (isFull) {
+				const psvNow = (s.psv || 0) === 1;
+				if (e._mpPassiveSynced !== psvNow) {
+					e._mpPassiveSynced = psvNow;
+					try {
+						if (psvNow) {
+							if (e._mpEnemyCollType === undefined) e._mpEnemyCollType = e.coll.type;
+							e.coll.type = (ig as any).COLLTYPE.PASSIVE;
+						} else {
+							e.coll.type = (e._mpEnemyCollType !== undefined) ? e._mpEnemyCollType : e.coll.type;
+						}
+						this._sfxLog('psv.sync', 'uid=' + s.i + ' passive=' + (psvNow ? 1 : 0));
+					} catch (_) { /* best-effort */ }
+				}
+			}
 			// Round 14 (fix 5): a _mpDying puppet is mid-death-FX — never re-issue a live
 			// anim onto it from the host block (it's already pinned to the damage anim).
 			if (isFull && s.a && !e._mpDying && this.lastAnim[s.i] !== s.a) {
@@ -6618,12 +7172,167 @@ export class NetSync {
 					try { (sc as any).Model.notifyObserver(e.params, (sc as any).COMBAT_PARAM_MSG.HP_CHANGED); } catch (_) { /* best-effort */ }
 				}
 			}
+			// ROUND 61 (fix C): mirror the host's guard/break bar onto the puppet so the
+			// member sees the break progress + the red "broken" flash. sp/maxSp drive the
+			// bar fill; brk forces the status Gui into its broken state. Everything guarded
+			// — an absent statusGui/field just skips the cosmetic, never breaks the block.
+			if (isFull && e.params) {
+				try {
+					if (typeof s.sp === 'number' && typeof e.params.currentSp === 'number' && e.params.currentSp !== s.sp) {
+						e.params.currentSp = s.sp;
+						try { (sc as any).Model.notifyObserver(e.params, (sc as any).COMBAT_PARAM_MSG.SP_CHANGED); } catch (_) { /* best-effort */ }
+					}
+					if (typeof s.msp === 'number' && s.msp > 0 && e.params.baseParams && typeof e.params.baseParams.sp === 'number' && e.params.baseParams.sp !== s.msp) {
+						e.params.baseParams.sp = s.msp;
+					}
+				} catch (_) { /* best-effort */ }
+				try {
+					const brokenNow = (s.brk || 0) === 1;
+					if (e._mpBrokenSynced !== brokenNow) {
+						e._mpBrokenSynced = brokenNow;
+						const gui: any = e.statusGui;
+						if (gui) {
+							if ('breakActive' in gui) gui.breakActive = brokenNow;
+							else if ('broken' in gui) gui.broken = brokenNow;
+							else if (gui.spBar && 'broken' in gui.spBar) gui.spBar.broken = brokenNow;
+						}
+						// ROUND 63 (break FX): replay the "BREAK!" dramatic effect (label +
+						// speedlines + blur) on the member's puppet the moment the host enemy
+						// breaks. The meerkat's reaction break (CHARGE_WEAK -> STUN) never
+						// touched the statusGui bar, so this was the missing annotation the
+						// member never saw. doDramaticEffect on a non-player target skips the
+						// camera/slow-mo, so only the visible break FX + "BREAK!" label play.
+						if (brokenNow) { try { this._mpPlayBreakFx(e); } catch (_) { /* best-effort */ } }
+						this._sfxLog('brk.sync', 'uid=' + s.i + ' broken=' + (brokenNow ? 1 : 0));
+					}
+				} catch (_) { /* best-effort */ }
+			}
+			// ROUND 63 (meerkat red-flash): mirror the host enemy's VULNERABLE annotation
+			// (the 2s "charge light" red blink a charged ball can break through). The old
+			// readEnemyBroken probed the guard/break bar, but the meerkat has maxSp 0 and
+			// no bar — its "red flash" is the annotate.passive VULNERABLE window, driven by
+			// CHANGE_ENEMY_ANNOTATION during SpecialAttack. Replay the red blink on the
+			// puppet when it flips; stop it when the host leaves the window (or it breaks).
+			if (isFull) {
+				const vulNow = (s.vul || 0) === 1;
+				if (e._mpVulSynced !== vulNow) {
+					e._mpVulSynced = vulNow;
+					this._mpApplyVulnerable(e, vulNow);
+				}
+			}
 		}
 		// Round 23: the per-block reap pass is GONE — replaced by the time-based
 		// reapStalePuppets() (run from tick() on a ~500ms accumulator), which uses the
 		// persistent _mpUidSeen/_mpMapSeen stamps written above. A single dropped block
 		// can no longer kill a live puppet; member-side deaths now clear within ~600ms
 		// instead of on the next block.
+	}
+
+	/**
+	 * ROUND 62 (underground untargetability): keep a burrowed/phased puppet's coll OUT of
+	 * the game's collision lists so a member's ball can't connect while the host enemy is
+	 * underground. The mod locks the puppet (lockEntity + a short-circuiting Enemy.update),
+	 * so the engine's own updateSprites / getOverlappedEntities path that would hide it
+	 * natively never runs — the coll stays tracked and hittable underground. Mirror it by
+	 * hand: while e._hidden, untrack the coll exactly like ig.Entity.hide (with the
+	 * per-entity entityAttached removed too), which drops it out of the ball's
+	 * getOverlappedEntities / hit check entirely. Re-track it when the host reports the
+	 * enemy has emerged, so it becomes hittable again. All engine calls are feature-
+	 * detected and best-effort; the hp-refund in onPreDamageModification is the backstop
+	 * for any hit that still slips through.
+	 */
+	private _mpRehidePuppet(e: any, isFull: boolean): void {
+		try {
+			if (!(e && e.coll)) return;
+			const coll: any = e.coll;
+			const game: any = ig.game;
+			const hidden = !!e._hidden;
+			if (hidden && !e._mpHiddenRe) {
+				e._mpHiddenRe = true;
+				if (game && game.collision && typeof game.collision.untrackEntity === 'function') {
+					try { game.collision.untrackEntity(coll); } catch (_) { /* ignore */ }
+				}
+				const att: any = e.entityAttached;
+				if (att && att.length && game && game.freeEntityAttached) {
+					try {
+						for (let k = 0; k < att.length; k++) {
+							const a: any = att[k];
+							if (a && a.coll && game.collision && typeof game.collision.untrackEntity === 'function') {
+								try { game.collision.untrackEntity(a.coll); } catch (_) { /* ignore */ }
+							}
+						}
+					} catch (_) { /* ignore */ }
+				}
+			} else if (!hidden && e._mpHiddenRe) {
+				e._mpHiddenRe = false;
+				if (game && game.collision && typeof game.collision.trackEntity === 'function') {
+					try { game.collision.trackEntity(coll); } catch (_) { /* ignore */ }
+				}
+				const att: any = e.entityAttached;
+				if (att && att.length && game && game.collision && typeof game.collision.trackEntity === 'function') {
+					try {
+						for (let k = 0; k < att.length; k++) {
+							const a: any = att[k];
+							if (a && a.coll) { try { game.collision.trackEntity(a.coll); } catch (_) { /* ignore */ } }
+						}
+					} catch (_) { /* ignore */ }
+				}
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/**
+	 * ROUND 63 (meerkat red flash): replay the host's "charge light" BLINK_COLOR on the
+	 * puppet when its VULNERABLE annotation flips. Uses the same cached EffectSheet path
+	 * as applySkillFx — the sheet may not be resident on the member (the puppet never
+	 * runs its own SpecialAttack, so nothing pre-loaded "charge"), so it loads async and
+	 * the spawn lands a frame late. The real effect auto-stops after its 2s duration; we
+	 * also stop() it early if the host leaves the window before then. Best-effort visual.
+	 */
+	private _mpApplyVulnerable(e: any, on: boolean): void {
+		try {
+			if (on) {
+				try {
+					const ES: any = (ig as any).EffectSheet;
+					if (ES) {
+						let sheet = this._fxSheets['charge'];
+						if (!sheet) sheet = this._fxSheets['charge'] = new ES('charge');
+						const target = e;
+						sheet.load(() => {
+							try {
+								if (!sheet.loaded || !target || target._killed) return;
+								if (target._mpVulSynced !== true) return; // flipped off before the load landed
+								target._mpVulFx = sheet.spawnOnTarget('light', target, { duration: 2 });
+							} catch (_) { /* visual only */ }
+						});
+					}
+				} catch (_) { /* visual only */ }
+				this._sfxLog('vul.on', 'uid=' + (e._mpUid || 0));
+			} else {
+				try { if (e._mpVulFx) e._mpVulFx.stop(); } catch (_) { /* ignore */ }
+				e._mpVulFx = null;
+				this._sfxLog('vul.off', 'uid=' + (e._mpUid || 0));
+			}
+		} catch (_) { /* best-effort visual */ }
+	}
+
+	/**
+	 * ROUND 63 (break FX): replay the host's "BREAK!" dramatic effect on the member's
+	 * puppet. The host plays it natively when a guard-bar or reaction break triggers
+	 * (sc.combat.doDramaticEffect(BREAK) in the hit-reaction path); the member's locked
+	 * puppet never runs reactions, so we replay the label + speedlines + blur here. Passing
+	 * the puppet as both source and target skips camera/slow-mo (no alwaysFocus), so only
+	 * the visible break FX + "BREAK!" annotation play. Best-effort visual.
+	 */
+	private _mpPlayBreakFx(e: any): void {
+		try {
+			const combat: any = (sc as any).combat;
+			const BREAK = (sc as any).DRAMATIC_EFFECT && (sc as any).DRAMATIC_EFFECT.BREAK;
+			if (combat && BREAK && typeof combat.doDramaticEffect === 'function') {
+				combat.doDramaticEffect(e, e, BREAK);
+			}
+			this._sfxLog('brk.fx', 'uid=' + (e._mpUid || 0));
+		} catch (_) { /* best-effort visual */ }
 	}
 
 	/** Round 23: MEMBER-side stale-puppet reap (replaces the old per-block reap pass

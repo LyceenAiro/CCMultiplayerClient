@@ -64,6 +64,11 @@ export interface IConnection {
      * relays this to the instance as `cutsceneEntity` with the sender stamped as
      * `from`; receivers render them as csPuppets and reap them when the stream stops. */
     updateCutsceneEntityBlock(state: { map: string, list: any[] }): void;
+    /** Round 62: host-only stream of live enemy projectiles (Ball/Stone, party ENEMY)
+     * so members can see enemy ranged attacks (弹幕). The server relays it as
+     * `projectileState` (host-only like entityState); receivers spawn visual-only
+     * copies and reap absent uids. */
+    updateProjectileState(map: string, list: any[]): void;
 
     spawnEntity(type: string, x: number, y: number, z: number, settings?: object, showAppearEffects?: boolean): void;
     registerEntity(id: number, type: string, pos: Vec3, settings: object): void;
@@ -324,6 +329,10 @@ export interface IConnection {
      * owner's username (server-stamped); receivers ignore their own echo and reap
      * the owner's csPuppets when its stream stops. */
     onCutsceneEntity(callback: (from: string, data: { map: string, list: any[] }) => void): void;
+    /** Round 62: the host's enemy-projectile stream arrived (host-only). `list` = the
+     * projectile snaps (uid/kind/source/proxy-name/pos/vel); receivers spawn/update
+     * visual-only copies and reap absent uids. */
+    onProjectileState(callback: (map: string, list: any[]) => void): void;
 
     // ---- social callbacks ----
     onPresence(callback: (player: string, online: boolean) => void): void;

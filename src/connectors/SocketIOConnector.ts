@@ -779,6 +779,12 @@ export class SocketIoConnector implements IConnection {
 	public updateCutsceneEntityBlock(state: { map: string, list: any[] }): void {
 		this.socket.emit('cutsceneEntity', state);
 	}
+	// Round 62: host-only stream of enemy projectiles (Ball/Stone). The server relays it
+	// as `projectileState` via broadcastHostState (no-op unless the sender is the instance
+	// host); the payload is whitelisted server-side.
+	public updateProjectileState(map: string, list: any[]): void {
+		this.socket.emit('projectileState', { map, e: list });
+	}
 	public onPlayerState(callback: (player: string, state: any) => void): void {
 		this.socket.on('playerState', (data: any) => callback(data.player, data));
 	}
@@ -793,6 +799,14 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('cutsceneEntity', (data: any) => {
 			if (!data || typeof data.map !== 'string' || !Array.isArray(data.list)) return;
 			callback(data.from, data);
+		});
+	}
+	// Round 62: enemy-projectile stream (see applyProjectileState). Host-only relay like
+	// entityState; entries are the host's own projectile snaps (validated server-side).
+	public onProjectileState(callback: (map: string, list: any[]) => void): void {
+		this.socket.on('projectileState', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.e)) return;
+			callback(data.map, data.e);
 		});
 	}
 	public updateEntityState(id: number, state: string): void {
