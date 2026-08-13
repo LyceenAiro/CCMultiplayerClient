@@ -8,8 +8,10 @@ export class OnPlayerChangeMapListener {
 	 * entering during the same map load both get their mirror spawned — a single
 	 * shared `cb` would be overwritten by the second, silently dropping the first. */
 	private cbs: Array<() => void> = [];
-	/** Players who entered while we were mid-teleport; spawned on loadingComplete. */
-	private pendingSpawn: { [name: string]: { position: Vec3 } } = {};
+	/** Players who entered while we were mid-map-change; spawned on loadingComplete.
+	 * Each entry carries the relayed sub-map so the flush/reconcile can skip members
+	 * whose sub-map doesn't match ours (a town instance spans a whole area). */
+	private pendingSpawn: { [name: string]: { position: Vec3, map?: string } } = {};
 
 	constructor(
         private main: Multiplayer,
@@ -31,6 +33,23 @@ export class OnPlayerChangeMapListener {
 			// them as "on this map" (and mirror them) when it matches OUR map.
 			const myMap = ig.game ? (ig.game as any).mapName : '';
 			if (this.main.playerMapByName) this.main.playerMapByName[player] = map || '';
+			// Deferral window (changeMap sent, awaiting the response): ig.game.mapName
+			// is still the OLD map and we are about to load a new one. Spawn NOW on the
+			// old map (the upcoming load clears it) — spawning later at this stale
+			// position on the NEW map is what left the host invisible when a member
+			// follows immediately. No sameMap decision here (the map is stale).
+			if (this.main.loadingMap && !ig.game.isTeleporting()) {
+				if (this.main.playersOnThisMap) this.main.playersOnThisMap[player] = true;
+				this.spawnMirror(player, position);
+				return;
+			}
+			// Actual level load: queue for loadingComplete (spawning mid-load hangs/errs).
+			if (ig.game.isTeleporting() || ig.game.entities.length === 0) {
+				this.pendingSpawn[player] = { position, map: map || '' };
+				this.ensurePlayerRecord(player, position);
+				return;
+			}
+			// Idle: a sameMap decision is reliable (a town instance spans a whole area).
 			const sameMap = !map || map === myMap;
 			if (this.main.playersOnThisMap) {
 				if (sameMap) this.main.playersOnThisMap[player] = true;
@@ -40,15 +59,6 @@ export class OnPlayerChangeMapListener {
 				// Off-map member: never mirror them; clear any stale mirror/tag first.
 				delete this.pendingSpawn[player];
 				this.despawnMirror(player);
-				return;
-			}
-			// If the game is mid-teleport (map loading), DON'T spawn yet — queue it and
-			// let loadingComplete spawn every queued player. Spawning during a load is
-			// what made map transitions hang / error. We still track the player record
-			// (with no entity yet) so network updates for them are tolerated.
-			if (ig.game.isTeleporting() || ig.game.entities.length === 0) {
-				this.pendingSpawn[player] = { position };
-				this.ensurePlayerRecord(player, position);
 				return;
 			}
 			this.spawnMirror(player, position);
@@ -114,11 +124,16 @@ export class OnPlayerChangeMapListener {
 		ig.Game.inject({
 			loadingComplete(this: any): void {
 				this.parent();
-				// Flush any deferred spawns (players who entered during the load).
+				// Flush any deferred spawns (players who entered during the load), but
+				// only for members whose relayed sub-map matches ours (town spans an area).
 				const pending = instance.pendingSpawn;
 				instance.pendingSpawn = {};
+				const flushMap = ig.game ? (ig.game as any).mapName : '';
 				for (const name in pending) {
-					instance.spawnMirror(name, pending[name].position);
+					const rec = pending[name];
+					if (rec && (!rec.map || rec.map === flushMap)) {
+						instance.spawnMirror(name, rec.position);
+					}
 				}
 				// Round 15: reconcile this instance's roster after the load. clearMap()
 				// killed every old-map mirror, so drop stale player entries that are not
@@ -144,7 +159,10 @@ export class OnPlayerChangeMapListener {
 							pmap[m.name] = map;
 							if (map === myMap) keep.add(m.name);
 						}
-						for (const n in pending) keep.add(n);
+						for (const n in pending) {
+							const rec = pending[n];
+							if (rec && (!rec.map || rec.map === myMap)) keep.add(n);
+						}
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
 						instance.main.newInstanceMembers = undefined;
 					} else {

@@ -204,7 +204,7 @@ export class NetSync {
 	 * gets its fade written on the next pass — a name-keyed cache would inherit a
 	 * stale "already applied" entry and leave a mid-cutscene respawn at full alpha).
 	 * Reset on map change / disconnect / cutscene end. */
-	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any }> = new Map();
+	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number }> = new Map();
 	// ---- round 26: member-side local monster-hit detection (REMOVED in round 27) ----
 	// The round-26 purely-local collision-gated monster-hit model (_mpPendingAtk /
 	// _mpLastLocalHit / _mpLocalHitActive) is GONE: the host is now the single
@@ -5992,20 +5992,22 @@ export class NetSync {
 				const nowMs = Date.now();
 				const grace = nowMs < ((e as any)._mpNoCollUntil || this._mpMirrorGraceUntil || 0);
 				const targetColl = (inTown || fade || grace) ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
+				// Main-city refactor: hide the under-feet HP bar entirely while in a shared
+				// town (a room full of auto-matched players would stack dozens of HP bars).
+				if (e.statusGui && e.statusGui.hook && e._mpBaseHpAlpha === undefined) {
+					e._mpBaseHpAlpha = (typeof e.statusGui.hook.localAlpha === 'number') ? e.statusGui.hook.localAlpha : 1;
+				}
+				const hpAlpha = inTown ? 0 : (fade ? 0.25 : (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1));
 				const cached = this._mpMirrorFadeCache.get(e);
-				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl) {
-					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl });
+				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl || cached.hp !== hpAlpha) {
+					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, hp: hpAlpha });
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
 					try { if (e.animState) e.animState.alpha = targetAlpha; } catch (_) { /* ignore */ }
-					// HP bar fade via the StatusBar hook's localAlpha (base ~0.7);
-					// capture once and restore exactly when the fade lifts.
+					// HP bar via the StatusBar hook's localAlpha (base ~0.7): 0 in town,
+					// 0.25 while faded, base otherwise. Capture once and restore exactly.
 					try {
 						if (e.statusGui && e.statusGui.hook) {
-							const h = e.statusGui.hook;
-							if (e._mpBaseHpAlpha === undefined) {
-								e._mpBaseHpAlpha = (typeof h.localAlpha === 'number') ? h.localAlpha : 1;
-							}
-							h.localAlpha = fade ? 0.25 : e._mpBaseHpAlpha;
+							e.statusGui.hook.localAlpha = hpAlpha;
 						}
 					} catch (_) { /* ignore */ }
 					try { if (e.coll) e.coll.type = targetColl; } catch (_) { /* ignore */ }

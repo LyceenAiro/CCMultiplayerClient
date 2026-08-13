@@ -18,9 +18,8 @@ synchronized to everyone else over a central relay server
 > been battle-tested on a live 1.4.2 install** — see
 > [Known limitations](#known-limitations--to-verify-in-game).
 >
-> A **CCLoader3** build is available separately in the
-> `CCMultiplayerClient-ccloader3/` folder for when that loader is ready — it is
-> still under construction and not usable today.
+> **Development note:** This project is developed with **vibe coding**
+> (AI-assisted development).
 
 ---
 
