@@ -60,7 +60,10 @@ export class OnMapEnterListener {
 				// Round 15: capture the NEW instance's roster (changeMapResponse members)
 				// so the load-complete reconcile can drop stale old-map player entries
 				// that clearMap() killed but nothing else removed.
-				this.main.newInstanceMembers = (result.members || []).map((mm: any) => mm.name);
+				// Main-city refactor: keep each member's SUB-MAP so the load-complete
+				// reconcile only mirrors the members actually on our map (a town instance
+				// spans a whole area).
+				this.main.newInstanceMembers = (result.members || []).map((mm: any) => ({ name: mm.name, map: mm.map }));
 			}).catch(() => { /* keep current flag */ });
 		}
 	}

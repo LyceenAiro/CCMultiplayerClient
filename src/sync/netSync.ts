@@ -73,6 +73,23 @@ interface IEnemySnap {
 	                  // annotate.passive === VULNERABLE (the meerkat's 2s "charge light"
 	                  // red-flash window where a charged ball breaks it). The member's
 	                  // puppet mirrors this as the red BLINK_COLOR flash it never showed.
+	sh?: IShieldSnap[]; // ROUND 66: the host enemy's ACTIVE shields (ADD_SHIELD state
+	                  // guards like the hedgehog's roll-up "full" shield). The member's
+	                  // puppet runs no AI, so these state-driven shields never attach
+	                  // locally — without them a poised/guarding enemy takes FULL damage
+	                  // from the member instead of the shield-reduced (silver-number)
+	                  // chip. Synced verbatim so the puppet's native isShielded applies
+	                  // the same factor / hitResist / direction gates as the host.
+}
+
+/** ROUND 66: one active shield connection, serialized from the host enemy's
+ * shieldsConnections. k = COMBAT_SHIELDS registry key ('DIRECTIONAL'/'PARTS'/'BASE'),
+ * n = shield name, bf = baseFactor, ef = elementFactors, hr/so/st = hitResist /
+ * stableOverride / strength (numeric enum values), nt = neutralize, rg/bk =
+ * DIRECTIONAL range/back, pt/iv = PARTS parts/inverse. */
+interface IShieldSnap {
+	k: string; n: string; bf: number; ef: number[]; hr: number; so: number; st: number;
+	nt: number; rg?: number; bk?: number; pt?: string[] | null; iv?: number;
 }
 
 export class NetSync {
@@ -311,6 +328,10 @@ export class NetSync {
 	 * Stored FULL (em/cl included) so the change-gate works; only the WIRE payload
 	 * drops em/cl when unchanged (opt 3). */
 	private _mpLastPlayerStateSnap: any = null;
+	/** Main-city refactor: last time we emitted the heavy player STATE (hp/sp/etc.)
+	 * while in a shared town. Position still streams at 10Hz there; state is folded
+	 * into the packet only once per second (1Hz). */
+	private _mpTownStateAt = 0;
 	/** ROUND 65: map name the gw/gm/ga/def guard fields were last sent from. The
 	 * receiver caches them on the mirror entity and mirrors are destroyed on a map
 	 * change, so a new map must re-send the full set even when unchanged (see the
@@ -812,20 +833,92 @@ export class NetSync {
 					if (HitNum && typeof HitNum.spawnHitNumber === 'function' && !HitNum._mpSpawnHitWrapped) {
 						HitNum._mpSpawnHitWrapped = true;
 						const origSpawn = HitNum.spawnHitNumber;
+						// ROUND 69 (user-driven repro): the member's native window has no
+						// devtools console, so mirror every hitnum line to a per-process
+						// log FILE via NW.js' node integration (window.require). The user
+						// just plays; we read D:\Dev_cc\hitnum-log-<pid>.txt afterwards.
+						// Browser mode has no require -> file logging silently disables.
+						let hitnumFs: any = null, hitnumFile: string | null = null;
+						try {
+							const w: any = window as any;
+							const req: any = w && w.require;
+							if (req) {
+								hitnumFs = req('fs');
+								const pid: any = (w.process && w.process.pid) || Math.floor(Math.random() * 1e9);
+								hitnumFile = 'D:\\Dev_cc\\hitnum-log-' + pid + '.txt';
+								hitnumFs.writeFileSync(hitnumFile, '[mpsfx] hitnum wrap installed\n');
+							}
+						} catch (_) { hitnumFs = null; hitnumFile = null; }
 						HitNum.spawnHitNumber = function (a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any) {
+							// ROUND 70 (member-hit number position): on the host, a member's
+							// forwarded hit runs target.damage(mirror, ...) with the member's
+							// MIRROR husk as the attacker. The native chain derives the number
+							// position from the attacker via getHitCenter -> coll
+							// .getOverlapCenterCoords, CLAMPED to the attacker's own coll box
+							// (game.compiled.js: d.x.limit(this.pos.x, this.pos.x+size.x)) —
+							// so for a ranged member attack (mirror far from the enemy) the
+							// number popped at the member's head on the host's screen instead
+							// of at the monster. applyEnemyDamage pins _mpHitNumPosOverride to
+							// the target for the duration of that call; honor it here. Only
+							// the number's position changes — knockback direction, shields,
+							// spike bookkeeping all keep reading the mirror's true position.
+							let nsHook: any = null;
+							try { nsHook = cur(); } catch (_) { /* ignore */ }
+							let ovrApplied = false;
 							try {
-								const ns = cur();
+								const ovr: any = nsHook && nsHook._mpHitNumPosOverride;
+								if (ovr && typeof ovr.x === 'number') { a = ovr; ovrApplied = true; }
+							} catch (_) { /* ignore */ }
+							try {
+								const ns = nsHook;
 								if (ns) {
 									const igAny: any = ig as any;
 									const scAny: any = sc as any;
 									const me: any = igAny.game && igAny.game.playerEntity;
 									const isPlayer = b && b.party === scAny.COMBATANT_PARTY.PLAYER;
-									ns._sfxLog('hitnum', 'dmg=' + c, 'shield=' + f, 'crit=' + (g === true), 'onPlayer=' + (isPlayer ? 1 : 0),
-										'onLocalMe=' + (b === me ? 1 : 0), 'name=' + (b && b.name),
-										'host=' + (ns.main && ns.main.host ? 1 : 0));
+									// ROUND 68 (member number-position hunt): log WHERE the
+									// number spawns (pos + delta from the local player) and WHO
+									// called it (2-frame stack hint: the native onDamage chain
+									// vs our spawnHitNumberOn), so a live repro tells whether
+									// the member's own-hit number ever spawns at the puppet and
+									// exactly which call site puts one on the player's head.
+									// Direct console.log (gated on __mpSfxDebug) — _sfxLog's
+									// 500ms per-tag throttle would drop most numbers.
+									if ((window as any).__mpSfxDebug || hitnumFile) {
+										const px: any = a && typeof a.x === 'number' ? Math.round(a.x) : '?';
+										const py: any = a && typeof a.y === 'number' ? Math.round(a.y) : '?';
+										let ddx: any = '?', ddy: any = '?';
+										try {
+											if (me && me.coll && a && typeof a.x === 'number') {
+												const mc: any = me.coll;
+												const ms: any = mc.size || { x: 0, y: 0 };
+												ddx = Math.round(a.x - (mc.pos.x + ms.x / 2));
+												ddy = Math.round(a.y - (mc.pos.y + ms.y / 2));
+											}
+										} catch (_) { /* ignore */ }
+										let via = '';
+										try {
+											const st: string = (new Error().stack as any) || '';
+											const frames = st.split('\n').slice(1, 6)
+												.map((fr: string) => (fr.match(/at\s+([^\s(]+)/) || [])[1] || '')
+												.filter((nm: string) => !!nm && nm.indexOf('spawnHitNumber') === -1);
+											via = frames.slice(0, 3).join('<');
+										} catch (_) { /* ignore */ }
+										const line = '[mpsfx] hitnum ' + 'dmg=' + c + ' shield=' + f + ' crit=' + (g === true) +
+											' onPlayer=' + (isPlayer ? 1 : 0) + ' onLocalMe=' + (b === me ? 1 : 0) +
+											' name=' + (b && b.name) + ' pos=' + px + ',' + py + ' dme=' + ddx + ',' + ddy +
+											' via=' + via + ' host=' + (ns.main && ns.main.host ? 1 : 0) +
+											' who=' + (ns.main && ns.main.name) + ' ovr=' + (ovrApplied ? 1 : 0);
+										if ((window as any).__mpSfxDebug) {
+											try { console.log(line); } catch (_) { /* ignore */ }
+										}
+										if (hitnumFile && hitnumFs) {
+											try { hitnumFs.appendFileSync(hitnumFile, line + '\n'); } catch (_) { /* ignore */ }
+										}
+									}
 								}
 							} catch (_) { /* never break the hit-number path */ }
-							return origSpawn.apply(this, arguments as any);
+							return origSpawn.call(this, a, b, c, d, e, f, g, h);
 						};
 					}
 				} catch (e) { console.warn('[netsync] spawnHitNumber wrap failed', e); }
@@ -1158,6 +1251,25 @@ export class NetSync {
 						const ns = cur();
 						if (!ns) return r;
 						if (ns.isPuppet(this)) {
+							// ROUND 67 (phantom mirror-ball hit): a TEAMMATE's (or the host's)
+							// mirrored ball is a live ig.ENTITY.Ball on this client and can
+							// physically connect with our puppet. Its native chain uses the
+							// owner's MIRROR-husk params (multiplayer.json), so it shows a
+							// bogus ~0 damage number AND branch (A) below would forward a
+							// second enemyDamage — double-dipping the real enemy with the
+							// husk chip. The authoritative damage already lands on the host
+							// and streams back via entityState HP, so cancel the chain
+							// outright (ignoreHit -> onDamage returns false: no number, no
+							// HP write, no forward, no flinch). Only the LOCAL player's own
+							// hits (root = ig.game.playerEntity, no _mpMirror) may proceed.
+							try {
+								const atkPh: any = rest[0];
+								const rootPh: any = atkPh && atkPh.getCombatantRoot ? (atkPh.getCombatantRoot() || atkPh) : atkPh;
+								if (rootPh && rootPh._mpMirror) {
+									try { a.ignoreHit = true; } catch (_) { /* ignore */ }
+									return r;
+								}
+							} catch (_) { /* detection failure: fall through to the normal path */ }
 							// (A) member hit a puppet: let the damage stand locally, forward it to
 							// the host, and handle the killing blow without loot/kill-vars.
 							const dmg = rest[3]; // damageResult (u)
@@ -1203,7 +1315,21 @@ export class NetSync {
 									const aEl: number = (atkInfoA && typeof atkInfoA.element === 'number' && atkInfoA.element >= 0 && atkInfoA.element <= 4) ? atkInfoA.element : 0;
 									ns.playEnemyPuppetHitFx(this, aType, aEl, !!(atkInfoA && atkInfoA.critical === true));
 								} catch (_) { /* cosmetic */ }
-								ns.forwardEnemyDamage(this, dmg.damage, atkInfoA);
+								// ROUND 72 (style sync): forward the number's FINAL style the
+								// local engine just produced, not only the damage. u (rest[3])
+								// carries the rolled critical + the offensive/defensive factors
+								// (number size + STRONG/WEAK appendix), rest[4] is the shield
+								// result (silver GUARD style) and the hook's first arg `a`
+								// carries the element-weakness flag — the same five values the
+								// native spawnHitNumber tail reads. Without them spectators
+								// (and the host's forced chain) could only render plain white.
+								ns.forwardEnemyDamage(this, dmg.damage, atkInfoA, {
+									critical: dmg.critical === true,
+									shield: (typeof rest[4] === 'number') ? rest[4] : 0,
+									weak: !!(a && a.weakness),
+									off: (typeof dmg.baseOffensiveFactor === 'number') ? dmg.baseOffensiveFactor : 1,
+									def: (typeof dmg.defensiveFactor === 'number') ? dmg.defensiveFactor : 1,
+								});
 								// ROUND 60 (diagnostics): the member→enemy （地鼠） report — a member's
 								// ranged hit sometimes shows NO feedback locally and lands for 0~1 on the
 								// host. Tag the member-side packet at its source: the local damage the
@@ -1375,15 +1501,82 @@ export class NetSync {
 							// target.damage(mirror, ...) call — the engine recomputed its own
 							// number from the mirror's stats; force the exact forwarded value
 							// (the member already saw THIS number land locally).
+							// ROUND 67 (stray physical ball connect, HOST only): a member's
+							// MIRRORED ball is a live ig.ENTITY.Ball on this host and can hit
+							// the REAL enemy natively — showing a husk-stat number (silver ~0
+							// against the real shield) and chipping HP before the attacker's
+							// forwarded enemyDamage arrives. That forwarded hit is the
+							// authority: it re-enters this hook through applyEnemyDamage with
+							// _mpForcedDamage set on the SAME mirror, so the forced chain is
+							// untouched by this guard. Cancel the stray connect outright
+							// (ignoreHit -> no number, no HP chip, no FX).
+							try {
+								if (ns.main.host) {
+									const atkC: any = rest[0];
+									const rootC: any = atkC && atkC.getCombatantRoot ? (atkC.getCombatantRoot() || atkC) : atkC;
+									if (rootC && rootC._mpMirror && rootC._mpForcedDamage == null) {
+										try { a.ignoreHit = true; } catch (_) { /* ignore */ }
+										return r;
+									}
+								}
+							} catch (_) { /* detection failure: fall through */ }
 							try {
 								const atk: any = rest[0];
 								const root: any = atk && atk.getCombatantRoot ? (atk.getCombatantRoot() || atk) : atk;
 								if (root && root._mpMirror && root._mpForcedDamage != null) {
 									const du = rest[3];
-									if (du) du.damage = root._mpForcedDamage;
+									if (du) {
+										du.damage = root._mpForcedDamage;
+										// ROUND 72 (crit style sync): the host's chain rolled crit
+										// off the mirror HUSK's params (near-zero focus), so a
+										// member's golden crit showed as a plain white number on
+										// the host. Force the attacker's rolled crit flag the
+										// same way the damage value is forced.
+										if (root._mpForcedCrit) du.critical = true;
+									}
 									root._mpForcedDamage = null;
+									root._mpForcedCrit = null;
 								}
 							} catch (_) { /* ignore */ }
+							// ROUND 72 (host-hit number sync): the host's OWN hit on a real
+							// enemy spawned its damage number locally only — members saw
+							// nothing (their mirrored-ball phantom numbers are cancelled per
+							// ROUND 67, and the sound relay carries no number). Relay the
+							// FINAL styled result (damage + rolled crit + shield result +
+							// weakness + size factors — the exact five values the native
+							// spawnHitNumber tail reads) over enemyHurt so every member pops
+							// the identical number on its same-uid puppet. Member-forwarded
+							// hits re-entering through applyEnemyDamage have a MIRROR root and
+							// are excluded — spectators already get those via enemyDamage.
+							try {
+								if (ns.main.host) {
+									const atkH: any = rest[0];
+									const rootH: any = atkH && atkH.getCombatantRoot ? (atkH.getCombatantRoot() || atkH) : atkH;
+									const duH: any = rest[3];
+									const infoH: any = rest[1];
+									if (rootH && !rootH._mpMirror
+										&& rootH.party === (sc as any).COMBATANT_PARTY.PLAYER
+										&& duH && typeof duH.damage === 'number' && duH.damage > 0
+										&& typeof this.uid === 'number' && this.uid > 0
+										&& typeof (ns.main.connection as any).emitEnemyHurt === 'function') {
+										let tH = 2;
+										if (infoH && typeof infoH.type === 'number' && infoH.type > 0) tH = infoH.type;
+										else if (infoH && (infoH.isBall || infoH.ballDamage)) tH = 1;
+										const elH: number = (infoH && typeof infoH.element === 'number' && infoH.element >= 0 && infoH.element <= 4) ? infoH.element : 0;
+										(ns.main.connection as any).emitEnemyHurt({
+											uid: this.uid,
+											damage: Math.round(duH.damage),
+											type: tH,
+											attackElement: elH,
+											critical: duH.critical === true,
+											shield: (typeof rest[4] === 'number') ? rest[4] : 0,
+											weak: !!(a && a.weakness),
+											off: (typeof duH.baseOffensiveFactor === 'number') ? duH.baseOffensiveFactor : 1,
+											def: (typeof duH.defensiveFactor === 'number') ? duH.defensiveFactor : 1,
+										});
+									}
+								}
+							} catch (_) { /* number sync is cosmetic — never break the hit */ }
 						}
 						return r;
 					},
@@ -2575,7 +2768,7 @@ export class NetSync {
 	 * exactly one replay per genuine spectator, no doubles. During 霸体 the sound still
 	 * plays (showHitEffect's sound is NOT poise-gated).
 	 */
-	private replayEnemyHurtFxForSpectator(hit: { uid: number, damage: number, attacker: string, type?: number, attackElement?: number, critical?: boolean }): void {
+	private replayEnemyHurtFxForSpectator(hit: { uid: number, damage: number, attacker: string, type?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		try {
 			if (!hit) return;
 			// We didn't land this hit (the server excludes the sender), but guard anyway so
@@ -2589,6 +2782,17 @@ export class NetSync {
 			const aEl: number = (typeof hit.attackElement === 'number' && hit.attackElement >= 0) ? hit.attackElement : 0;
 			this._sfxLog('rhfx.replay', 'uid=' + uid + ' t=' + aType + ' el=' + aEl + ' crit=' + (hit.critical === true));
 			this.playEnemyPuppetHitFx(puppet, aType, aEl, hit.critical === true);
+			// ROUND 72 (teammate number visibility): the FX replay alone left every
+			// teammate hit NUMBERLESS for members — only the host (native chain) and the
+			// attacker (local chain) ever saw a number. Pop the attacker's exact result
+			// on our puppet: damage + crit + shield/weakness/size factors all ride the
+			// packet (the ROUND 72 style block). The mirrored-ball phantom number is
+			// cancelled by ROUND 67's ignoreHit, so this is the ONLY number — no double.
+			if (typeof hit.damage === 'number' && hit.damage > 0) {
+				this.spawnHitNumberOn(puppet, Math.round(hit.damage), hit.critical === true,
+					(typeof hit.shield === 'number' && hit.shield > 0) ? hit.shield : undefined,
+					{ off: hit.off, def: hit.def, weak: hit.weak === true });
+			}
 		} catch (_) { /* cosmetic — never break the frame */ }
 	}
 
@@ -2600,7 +2804,7 @@ export class NetSync {
 	 * the ATTACKING member also receives this broadcast (it is not the host, so it isn't
 	 * self-dropped), so we must skip it or they would hear their own local playEnemyPuppetHitFx
 	 * AND this relay at once (the double hurt sound). */
-	private replayEnemyHurtFx(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }): void {
+	private replayEnemyHurtFx(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		try {
 			if (!hit || !hit.uid) return;
 			if (hit.attacker && hit.attacker === this.main.name) return;
@@ -2610,6 +2814,16 @@ export class NetSync {
 			const aEl: number = (typeof hit.attackElement === 'number' && hit.attackElement >= 0) ? hit.attackElement : 0;
 			this._sfxLog('reh.replay', 'uid=' + hit.uid + ' t=' + aType + ' el=' + aEl + ' crit=' + (hit.critical === true));
 			this.playEnemyPuppetHitFx(puppet, aType, aEl, hit.critical === true);
+			// ROUND 72 (host-hit number sync): host-originated hits now carry the FINAL
+			// styled result (damage + style block, NO attacker stamp). Pop it on our
+			// puppet. Member-originated relays keep their attacker stamp and carry no
+			// damage — spectators already popped that number via the enemyDamage packet
+			// (replayEnemyHurtFxForSpectator), so this stays FX-only for them.
+			if (!hit.attacker && typeof hit.damage === 'number' && hit.damage > 0) {
+				this.spawnHitNumberOn(puppet, Math.round(hit.damage), hit.critical === true,
+					(typeof hit.shield === 'number' && hit.shield > 0) ? hit.shield : undefined,
+					{ off: hit.off, def: hit.def, weak: hit.weak === true });
+			}
 		} catch (_) { /* cosmetic — never break the frame */ }
 	}
 
@@ -2741,7 +2955,8 @@ export class NetSync {
 	 * hit (no rate limit; tiny packets on a LAN) so locally-shown damage always
 	 * matches what the host applies.
 	 */
-	public forwardEnemyDamage(entity: any, damage: number, attackInfo?: any): void {
+	public forwardEnemyDamage(entity: any, damage: number, attackInfo?: any,
+		style?: { critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		if (this.main.host) return;                  // only members forward
 		const uid = entity && entity._mpUid;
 		if (!uid || typeof damage !== 'number' || damage <= 0) return;
@@ -2783,15 +2998,29 @@ export class NetSync {
 		// ROUND 44 (Fix A): also forward whether the hit was CRITICAL so every spectator
 		// replays the matching (louder/sharper) hurt FX on its own puppet, not a watered-down
 		// neutral one. attackInfo.critical is the engine flag; fall back to false.
+		// ROUND 72: prefer the style block — it carries the damageResult's ROLLED crit
+		// (attackInfo.critical is only the rare forced-crit flag and misses natural rolls),
+		// plus the shield result / weakness / size factors for the spectator number.
 		let critical = false;
+		let shield = 0; let weak = false; let off = 1; let def = 1;
 		try {
 			const c2: any = attackInfo;
 			if (c2 && typeof c2.element === 'number' && isFinite(c2.element) && c2.element >= 0 && c2.element <= 4) attackElement = Math.round(c2.element);
 			if (c2 && c2.critical === true) critical = true;
 		} catch (_) { /* neutral default */ }
+		try {
+			if (style) {
+				if (style.critical === true) critical = true;
+				if (typeof style.shield === 'number' && style.shield >= 0 && style.shield <= 3) shield = Math.round(style.shield);
+				if (style.weak === true) weak = true;
+				if (typeof style.off === 'number' && isFinite(style.off) && style.off > 0 && style.off <= 10) off = style.off;
+				if (typeof style.def === 'number' && isFinite(style.def) && style.def > 0 && style.def <= 10) def = style.def;
+			}
+		} catch (_) { /* defaults */ }
 		this.main.connection.enemyDamage({
 			uid, damage, attacker: this.main.name,
 			type, ball: isBall, charged, knockback, attackElement, critical,
+			shield, weak, off, def,
 		});
 		// Instant local aggro: don't wait the ~66ms for the host's tg=1 block — the hit
 		// itself guarantees the host will aggro this enemy (applyEnemyDamage sets the
@@ -3158,6 +3387,11 @@ export class NetSync {
 				try {
 					const mirrorAny: any = mirror;
 					mirrorAny._mpForcedDamage = dmg;
+					// ROUND 72 (crit style sync): the host chain rolls crit off the mirror
+					// husk's params, so member crits showed plain on the host. Carry the
+					// attacker's rolled crit; branch C forces it onto the damageResult the
+					// same way _mpForcedDamage forces the value. Cleared alongside it.
+					mirrorAny._mpForcedCrit = hit.critical === true;
 					// getElement() reads tackle.attackInfo.element — neutral passes
 					// element shields/filters that would otherwise swallow the hit.
 					// The fake tackle MUST be restored synchronously: left in place,
@@ -3218,7 +3452,31 @@ export class NetSync {
 						// bare-HP fallback below — member-forwarded hits showed only the
 						// number, no flinch/knockback/sparks. Passing the target kills the
 						// guard, and onDamage's `r = c || this` still resolves to the target.
-						applied = target.damage(mirror, info, target) !== false;
+						// ROUND 70 (member-hit number position): the native chain inside
+						// target.damage computes the damage-number position from the ATTACKER
+						// (the member's mirror husk) — for a ranged member hit the mirror is
+						// nowhere near the enemy, and getOverlapCenterCoords clamps the point
+						// into the MIRROR's coll box, so the number popped at the member's
+						// head on the host's screen. Pin the spawnHitNumber override to the
+						// target's body for exactly this call so the number lands on the
+						// monster; everything else (knockback dir, shields) is untouched.
+						let ovrSet = false;
+						try {
+							const tc: any = target.coll;
+							if (tc && tc.pos && tc.size) {
+								(this as any)._mpHitNumPosOverride = {
+									x: tc.pos.x + tc.size.x / 2,
+									y: tc.pos.y + tc.size.y / 2,
+									z: tc.pos.z + tc.size.z / 2,
+								};
+								ovrSet = true;
+							}
+						} catch (_) { /* cosmetic */ }
+						try {
+							applied = target.damage(mirror, info, target) !== false;
+						} finally {
+							if (ovrSet) { try { (this as any)._mpHitNumPosOverride = null; } catch (_) { /* ignore */ } }
+						}
 						// ROUND 60 (diagnostics): did the engine chain ACCEPT the forwarded hit, and
 						// did the forced-damage branch (C) actually fire? `forced` is true when the
 						// mirror's _mpForcedDamage was still set at the moment damage() returned — i.e.
@@ -3234,7 +3492,7 @@ export class NetSync {
 						}
 					}
 				} catch (_) { applied = false; }
-				if (!applied) (mirror as any)._mpForcedDamage = null;
+				if (!applied) { (mirror as any)._mpForcedDamage = null; (mirror as any)._mpForcedCrit = null; }
 				// ROUND 60 (diagnostics): the outcome of the engine chain for a forwarded member hit.
 				// `applied` = did target.damage() run the full chain; `forced` = was the forwarded number
 				// left unconsumed (branch C never fired → the engine's own reduced number showed, which
@@ -3278,8 +3536,24 @@ export class NetSync {
 				this._sfxLog('aed.fb', 'uid=' + hit.uid, 'dmg=' + dmg);
 				// Fallback (mirror not up / multi-part enemy colliding / damage refused):
 				// bare HP write + a manual damage number so the hit is still visible.
+				// ROUND 67: the manual number must keep the GUARDED style when the enemy's
+				// active shields would have blocked this hit (the hedgehog's roll-up
+				// shield) — the old plain call rendered a normal-format number for a hit
+				// the native chain would have shown as silver/guarded. Ask the engine's
+				// own isShielded for the verdict (same call the native chain makes).
+				let shieldFb = 0;
+				try {
+					const scratch: any = { hitStable: 0, damageFactor: 1 };
+					if (mirror && mirror.params && typeof target.isShielded === 'function' && (sc as any).AttackInfo) {
+						const infoFb: any = new (sc as any).AttackInfo(mirror.params, { type: flyStr, element: atkEl });
+						try { infoFb.isBall = isBall; } catch (_) { /* cosmetic */ }
+						shieldFb = target.isShielded(mirror, infoFb, target, scratch) || 0;
+					}
+				} catch (_) { shieldFb = 0; }
 				target.params.reduceHp(dmg);
-				this.spawnHitNumberOn(target, dmg, false);
+				// ROUND 72: pass the attacker's rolled crit through to the fallback number
+				// too (was hardcoded false — a fallback crit rendered plain white).
+				this.spawnHitNumberOn(target, dmg, hit.critical === true, shieldFb > 0 ? shieldFb : undefined);
 				// Round 20 (fix 3): the fallback skips the engine's whole damage chain, so
 				// there was no knockback at all — apply the away-from-mirror knockback here.
 				// ROUND 34 (item 1/2): pass the poise gate + real fly level so a weak hit
@@ -3504,7 +3778,8 @@ export class NetSync {
 
 	/** Spawn a damage number on a combatant at its REAL hit position (the old
 	 * `spawnHitNumber(null, ...)` calls silently threw — the engine reads pos.x). */
-	private spawnHitNumberOn(ent: any, dmg: number, critical: boolean, shieldResult?: number): void {
+	private spawnHitNumberOn(ent: any, dmg: number, critical: boolean, shieldResult?: number,
+		style?: { off?: number, def?: number, weak?: boolean }): void {
 		try {
 			if (!ig.ENTITY.HitNumber || !(ig.ENTITY.HitNumber as any).spawnHitNumber || !ent) return;
 			let pos: any = null;
@@ -3522,7 +3797,14 @@ export class NetSync {
 			// (PERFECT -> P icon, REGULAR -> shield icon). sc.SHIELD_RESULT = {NONE:0,
 			// REGULAR:1, PERFECT:2, NEUTRALIZE:3}.
 			const g = (typeof shieldResult === 'number') ? shieldResult : 0;
-			(ig.ENTITY.HitNumber as any).spawnHitNumber(pos, ent, dmg, 1, 1, g, !!critical, false);
+			// ROUND 72: carry the full native style triple — offFactor drives the number
+			// SIZE (XXS..L), defFactor the STRONG/WEAK appendix (element effectiveness,
+			// >=1.25 / <=0.75), weak the element-weakness appendix. Defaults reproduce the
+			// old plain rendering for callers that don't know the style.
+			const offF = (style && typeof style.off === 'number' && isFinite(style.off)) ? style.off : 1;
+			const defF = (style && typeof style.def === 'number' && isFinite(style.def)) ? style.def : 1;
+			const weakF = !!(style && style.weak === true);
+			(ig.ENTITY.HitNumber as any).spawnHitNumber(pos, ent, dmg, offF, defF, g, !!critical, weakF);
 		} catch (_) { /* ignore */ }
 	}
 
@@ -4234,10 +4516,14 @@ export class NetSync {
 
 			this.sendPlayerState();
 			if (this.main.host) {
-				this.sendEnemyBlock();
-				// Round 62: host streams its live enemy projectiles so members see the
-				// enemy's ranged attacks (Ball/Stone flying toward them).
-				this.sendProjectileBlock();
+				// Main-city refactor: towns have no enemies — skip the enemy/projectile
+				// blocks entirely (the host streams only playerState there).
+				if (!isSharedTownNow()) {
+					this.sendEnemyBlock();
+					// Round 62: host streams its live enemy projectiles so members see the
+					// enemy's ranged attacks (Ball/Stone flying toward them).
+					this.sendProjectileBlock();
+				}
 				// Round 14 (fix 1): combat re-evaluation for the host. sc.model.combatMode is
 				// only re-computed via the LOCAL player's _addTargetedBy/_removeTargetedBy ->
 				// updateCombatMode(), but enemies that de-aggro a REMOTE player's MIRROR never
@@ -4261,7 +4547,7 @@ export class NetSync {
 			// Round 19 (Part 3, step 3): members stream their own cutscene-spawned
 			// monsters so other members render them as csPuppets (~15Hz, presence-
 			// driven). Hosts no-op (their story enemies sync via the normal block).
-			if (!this.main.host) this.sendCutsceneEntityBlock();
+			if (!this.main.host && !isSharedTownNow()) this.sendCutsceneEntityBlock();
 			// Round 10: keep the party charge time-stop in lockstep with reality —
 			// engages when ANY party member starts charging, releases when the LAST
 			// one lets go (see updateChargeFreeze).
@@ -4451,6 +4737,28 @@ export class NetSync {
 		// plus IMMEDIATE packets between floors whenever an important field changed vs
 		// what we last sent.
 		const now = Date.now();
+		// Main-city refactor: in a shared town, position streams at 10Hz while the heavy
+		// player state (hp/sp/etc.) streams at 1Hz, so a 32-player room stays cheap. This
+		// bypasses the normal change-gated floor below.
+		if (isSharedTownNow()) {
+			if (now - this._mpLastPlayerStateAt < 100) return; // 10Hz position floor
+			const includeState = (now - (this._mpTownStateAt || 0)) >= 1000;
+			const out: any = {
+				pos: snap.pos, face: snap.face, anim: snap.anim, dead: snap.dead,
+				cs: snap.cs, cg: snap.cg,
+			};
+			if (includeState) {
+				out.hp = snap.hp; out.maxHp = snap.maxHp; out.sp = snap.sp; out.maxSp = snap.maxSp;
+				out.em = snap.em; out.cl = snap.cl;
+				out.gd = snap.gd; out.gst = snap.gst; out.gws = snap.gws;
+				out.gw = snap.gw; out.gm = snap.gm; out.ga = snap.ga; out.def = snap.def; out.ggt = snap.ggt;
+				this._mpTownStateAt = now;
+			}
+			this._mpLastPlayerStateAt = now;
+			this._mpLastPlayerStateSnap = snap;
+			this.main.connection.updatePlayerState(out);
+			return;
+		}
 		const prev = this._mpLastPlayerStateSnap;
 		if (!this.shouldSendPlayerState(now, snap)) return;
 		this._mpLastPlayerStateAt = now;
@@ -4939,6 +5247,9 @@ export class NetSync {
 			hd: e._hidden ? 1 : 0,
 			psv: this._mpEnemyPassive(e) ? 1 : 0,
 			vul: this.readEnemyVulnerable(e) ? 1 : 0,
+			// ROUND 66: active shields (poise/state guards) — the puppet's native
+			// isShielded needs them to reduce the member's damage exactly like the host.
+			sh: this.encodeEnemyShields(e),
 		};
 		const prev = deltaMap.get(e.uid);
 		// ROUND 61 (fix A): a burrowed/phased/hidden enemy (hillkat earthIn/earthOut) can
@@ -5245,7 +5556,70 @@ export class NetSync {
 		// the enemy holds a still frame — ship them so the member sees the change.
 		if ((a.psv || 0) !== (b.psv || 0)) return true;
 		if ((a.vul || 0) !== (b.vul || 0)) return true;
+		// ROUND 66: a shield attach/detach mid-windup (hedgehog roll-up) changes the
+		// damage the member's hit should deal — ship it immediately.
+		const ash = a.sh, bsh = b.sh;
+		if ((ash ? ash.length : 0) !== (bsh ? bsh.length : 0)) return true;
+		if (ash && bsh) {
+			for (let i = 0; i < ash.length; i++) {
+				const x = ash[i], y = bsh[i];
+				if (!x || !y || x.k !== y.k || x.n !== y.n || x.bf !== y.bf || x.hr !== y.hr
+					|| x.st !== y.st || x.so !== y.so || x.nt !== y.nt
+					|| (x.rg || 0) !== (y.rg || 0) || (x.bk || 0) !== (y.bk || 0)
+					|| (x.iv || 0) !== (y.iv || 0)
+					|| JSON.stringify(x.pt || null) !== JSON.stringify(y.pt || null)
+					|| JSON.stringify(x.ef || null) !== JSON.stringify(y.ef || null)) return true;
+			}
+		}
 		return false;
+	}
+
+	/** ROUND 66: serialize the host enemy's ACTIVE shield connections for the member's
+	 * puppet. Enemy state guards (ADD_SHIELD action step — the hedgehog's roll-up
+	 * "full" shield, baseFactor 0.25) only exist on the host: the puppet runs no AI,
+	 * so without this sync a poised enemy takes FULL damage from the member. The class
+	 * key is resolved against the COMBAT_SHIELDS registry (DIRECTIONAL/PARTS cover every
+	 * enemy shield in the game data; anything else ships as BASE). Numeric enum fields
+	 * (hitResist/stableOverride/strength) are sent as-is — the member assigns them
+	 * directly onto the reconstructed instance. Returns undefined when no shield is
+	 * active (keeps the wire payload lean). */
+	private encodeEnemyShields(e: any): IShieldSnap[] | undefined {
+		try {
+			const conns: any[] = e && e.shieldsConnections;
+			if (!conns || !conns.length) return undefined;
+			const out: IShieldSnap[] = [];
+			const reg: any = (sc as any).COMBAT_SHIELDS || {};
+			for (let i = 0; i < conns.length; i++) {
+				const c: any = conns[i];
+				const sh: any = c && c.shield;
+				if (!sh || typeof sh !== 'object') continue;
+				let k = 'BASE';
+				try {
+					if (reg.PARTS && sh instanceof reg.PARTS) k = 'PARTS';
+					else if (reg.DIRECTIONAL && sh instanceof reg.DIRECTIONAL) k = 'DIRECTIONAL';
+				} catch (_) { /* keep BASE */ }
+				const snap: IShieldSnap = {
+					k,
+					n: typeof sh.name === 'string' ? sh.name : '',
+					bf: typeof sh.baseFactor === 'number' ? sh.baseFactor : 1,
+					ef: Array.isArray(sh.elementFactors) ? sh.elementFactors.slice(0, 4) : [1, 1, 1, 1],
+					hr: typeof sh.hitResist === 'number' ? sh.hitResist : 4,
+					so: typeof sh.stableOverride === 'number' ? sh.stableOverride : 3,
+					st: typeof sh.strength === 'number' ? sh.strength : 3,
+					nt: sh.neutralize === true ? 1 : 0,
+				};
+				if (k === 'DIRECTIONAL') {
+					snap.rg = typeof sh.range === 'number' ? sh.range : 0.5;
+					snap.bk = sh.back === true ? 1 : 0;
+				}
+				if (k === 'PARTS') {
+					snap.pt = Array.isArray(sh.parts) ? sh.parts.slice() : null;
+					snap.iv = sh.inverse === true ? 1 : 0;
+				}
+				out.push(snap);
+			}
+			return out.length ? out : undefined;
+		} catch (_) { return undefined; }
 	}
 
 	/** ROUND 61: read whether the host enemy is currently guard-BROKEN (the red "broken"
@@ -6768,6 +7142,18 @@ export class NetSync {
 			const onMap: any = (this.main as any).playersOnThisMap;
 			if (onMap && !onMap[player] && Object.keys(onMap).length > 0) return;
 		} catch (_) { /* ignore */ }
+		// Main-city refactor: a town instance spans a whole AREA, so a member on a
+		// DIFFERENT sub-map also streams playerState to us (broadcastToInstance reaches
+		// every channel member). Drop those by the member's known sub-map BEFORE the
+		// playersOnThisMap fail-open above can let one slip through while we're alone
+		// on our sub-map. Unknown maps (pre-reconcile window) still fail open.
+		try {
+			const pmap: any = (this.main as any).playerMapByName;
+			if (pmap && pmap[player] !== undefined) {
+				const myMap = (ig.game && (ig.game as any).mapName) || '';
+				if (pmap[player] !== myMap) return;
+			}
+		} catch (_) { /* ignore */ }
 		let pl = this.main.players[player];
 		// Death flag: while the remote player is dead their mirror must be GONE for us
 		// (a corpse frozen in place reads as a bug — the teammate should visibly
@@ -7220,6 +7606,13 @@ export class NetSync {
 					this._mpApplyVulnerable(e, vulNow);
 				}
 			}
+			// ROUND 66 (poise/shield damage sync): mirror the host enemy's ACTIVE shields
+			// onto the puppet. Without them the puppet's native isShielded finds nothing,
+			// so a poised/guarding enemy (hedgehog roll-up, baseFactor 0.25) takes FULL
+			// damage from the member — no silver guard number, no reduction — while the
+			// host's real enemy reduces it. With the shields attached the puppet's own
+			// damage chain produces the SAME factor/number/poise as the host natively.
+			if (isFull) this.syncPuppetShields(e, s.sh);
 		}
 		// Round 23: the per-block reap pass is GONE — replaced by the time-based
 		// reapStalePuppets() (run from tick() on a ~500ms accumulator), which uses the
@@ -7241,6 +7634,83 @@ export class NetSync {
 	 * detected and best-effort; the hp-refund in onPreDamageModification is the backstop
 	 * for any hit that still slips through.
 	 */
+	/** ROUND 66 (poise/shield damage sync): reconcile the puppet's synced shield
+	 * connections with the host enemy's streamed list (IEnemySnap.sh). The puppet runs
+	 * no AI, so ADD_SHIELD state guards (the hedgehog's roll-up "full" shield,
+	 * baseFactor 0.25, hitResist HEAVY) never attach locally — without this the member
+	 * deals FULL damage to a poised enemy instead of the shield-reduced chip with the
+	 * silver guard number. Each streamed shield is reconstructed as the SAME
+	 * COMBAT_SHIELDS class with the SAME numeric fields, so the puppet's native
+	 * isShielded reproduces the host's factor / hitResist / stableOverride / direction
+	 * gates exactly. Synced connections are tagged (_mpShieldSync) so shields from any
+	 * other source are left untouched; an absent/empty list clears only synced ones.
+	 * duration is pinned to -1 (no timer expiry) — attach/detach is host-driven via the
+	 * stream. Shield visual FX (domes) are NOT reproduced; damage correctness is the
+	 * goal. */
+	private syncPuppetShields(e: any, sh: IShieldSnap[] | undefined): void {
+		try {
+			if (!e || !Array.isArray(e.shieldsConnections)) return;
+			const want: { [key: string]: IShieldSnap } = {};
+			if (sh) {
+				for (let i = 0; i < sh.length; i++) {
+					const s = sh[i];
+					if (s && typeof s.n === 'string') want[s.n + '|' + s.k] = s;
+				}
+			}
+			// Detach synced shields the host no longer reports.
+			for (let i = e.shieldsConnections.length; i--;) {
+				const c: any = e.shieldsConnections[i];
+				if (!c || !c._mpShieldSync) continue;
+				const key = ((c.shield && c.shield.name) || '') + '|' + c._mpShieldKind;
+				if (want[key]) continue;
+				try {
+					if (typeof e.removeShield === 'function') e.removeShield(c);
+					else e.shieldsConnections.splice(i, 1);
+				} catch (_) { try { e.shieldsConnections.splice(i, 1); } catch (_) { /* ignore */ } }
+			}
+			// Attach shields the host reports that aren't synced yet.
+			const reg: any = (sc as any).COMBAT_SHIELDS || {};
+			for (const key in want) {
+				let exists = false;
+				for (let i = 0; i < e.shieldsConnections.length; i++) {
+					const c: any = e.shieldsConnections[i];
+					if (c && c._mpShieldSync
+						&& (((c.shield && c.shield.name) || '') + '|' + c._mpShieldKind) === key) { exists = true; break; }
+				}
+				if (exists) continue;
+				const s = want[key];
+				try {
+					const cls: any = (s.k === 'PARTS' && reg.PARTS) ? reg.PARTS
+						: (s.k === 'DIRECTIONAL' && reg.DIRECTIONAL) ? reg.DIRECTIONAL
+						: (sc as any).CombatShield;
+					if (!cls) continue;
+					const inst: any = new cls({}, s.n);
+					// Assign the numeric fields DIRECTLY — the constructors map string enum
+					// keys, but the host already resolved them to numbers.
+					inst.baseFactor = typeof s.bf === 'number' ? s.bf : 1;
+					inst.elementFactors = Array.isArray(s.ef) && s.ef.length >= 4 ? s.ef.slice(0, 4) : [1, 1, 1, 1];
+					inst.hitResist = typeof s.hr === 'number' ? s.hr : 4;   // ATTACK_TYPE.MASSIVE
+					inst.stableOverride = typeof s.so === 'number' ? s.so : 3; // ATTACK_TYPE.HEAVY
+					inst.strength = typeof s.st === 'number' ? s.st : 3;    // SHIELD_STRENGTH.BLOCK_ALL
+					inst.neutralize = s.nt === 1;
+					inst.duration = -1; // never expires on a timer — the stream drives detach
+					if (s.k === 'DIRECTIONAL') {
+						inst.range = typeof s.rg === 'number' ? s.rg : 0.5;
+						inst.back = s.bk === 1;
+					}
+					if (s.k === 'PARTS') {
+						inst.parts = Array.isArray(s.pt) ? s.pt.slice() : null;
+						inst.inverse = s.iv === 1;
+					}
+					if (typeof e.addShield === 'function') {
+						const conn: any = e.addShield(inst, 0);
+						if (conn) { conn._mpShieldSync = true; conn._mpShieldKind = s.k; }
+					}
+				} catch (_) { /* one bad shield must not break the block */ }
+			}
+		} catch (_) { /* best-effort — never break the state block */ }
+	}
+
 	private _mpRehidePuppet(e: any, isFull: boolean): void {
 		try {
 			if (!(e && e.coll)) return;

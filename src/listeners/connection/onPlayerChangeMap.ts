@@ -26,8 +26,22 @@ export class OnPlayerChangeMapListener {
 		map: string,
 		marker: string | null): void {
 		if (enters) {
-			// Round 15: maintain the on-this-map roster (consumed by the netSync gate).
-			if (this.main.playersOnThisMap) this.main.playersOnThisMap[player] = true;
+			// Main-city refactor: a town instance spans a whole AREA, so an entering
+			// player may be on a DIFFERENT sub-map. Track their sub-map and only treat
+			// them as "on this map" (and mirror them) when it matches OUR map.
+			const myMap = ig.game ? (ig.game as any).mapName : '';
+			if (this.main.playerMapByName) this.main.playerMapByName[player] = map || '';
+			const sameMap = !map || map === myMap;
+			if (this.main.playersOnThisMap) {
+				if (sameMap) this.main.playersOnThisMap[player] = true;
+				else delete this.main.playersOnThisMap[player];
+			}
+			if (!sameMap) {
+				// Off-map member: never mirror them; clear any stale mirror/tag first.
+				delete this.pendingSpawn[player];
+				this.despawnMirror(player);
+				return;
+			}
 			// If the game is mid-teleport (map loading), DON'T spawn yet — queue it and
 			// let loadingComplete spawn every queued player. Spawning during a load is
 			// what made map transitions hang / error. We still track the player record
@@ -41,6 +55,7 @@ export class OnPlayerChangeMapListener {
 		} else {
 			// Round 15: drop them from the on-this-map roster (see enters branch).
 			if (this.main.playersOnThisMap) delete this.main.playersOnThisMap[player];
+			if (this.main.playerMapByName) delete this.main.playerMapByName[player];
 			// Round 16: the party LEADER left our instance — they teleported to a NEW
 			// instance on the other map, so we stop receiving botState blocks (we're on
 			// the same map, so the map-mismatch cull never fires) and their puppets
@@ -116,20 +131,33 @@ export class OnPlayerChangeMapListener {
 				try {
 					const roster = instance.main.newInstanceMembers;
 					const keep = new Set<string>();
+					const myMap = ig.game ? (ig.game as any).mapName : '';
+					const pmap: { [k: string]: string } = {};
 					if (roster !== undefined) {
-						for (const n of roster) keep.add(n);
+						// Main-city refactor: a town instance spans a whole area. Keep only
+						// the members on OUR sub-map as mirrors, but remember EVERY member's
+						// sub-map in playerMapByName so a stray playerState from an off-map
+						// member is dropped by netSync's gate instead of spawning a wrong mirror.
+						for (const m of roster) {
+							if (!m || !m.name) continue;
+							const map = m.map || myMap;
+							pmap[m.name] = map;
+							if (map === myMap) keep.add(m.name);
+						}
 						for (const n in pending) keep.add(n);
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
 						instance.main.newInstanceMembers = undefined;
 					} else {
+						// No roster (same-map checkpoint reload): keep live mirrors.
 						for (const n in instance.main.players) {
 							const p = instance.main.players[n];
-							if (p && p.entity && !(p.entity as any)._killed) keep.add(n);
+							if (p && p.entity && !(p.entity as any)._killed) { keep.add(n); pmap[n] = myMap; }
 						}
 					}
 					const onMap: { [k: string]: boolean } = {};
 					keep.forEach((n: string) => { onMap[n] = true; });
 					instance.main.playersOnThisMap = onMap;
+					instance.main.playerMapByName = pmap;
 				} catch (_) { /* never break a map load */ }
 				// Round 16: old-map name tags must never survive into the new map.
 				// The reconcile block above killed stale mirrors + dropped their tags,

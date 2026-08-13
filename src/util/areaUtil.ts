@@ -17,15 +17,37 @@ export function currentAreaPath(): string {
 	}
 }
 
-/** The sc.AREA_TYPE of the current area, defaulting to PATH when unknown. */
-export function currentAreaType(): number {
+/**
+ * The numeric sc.AREA_TYPE (0=TOWN, 1=PATH, 2=DUNGEON) of an AREA by its path.
+ * The game's `areas` table stores `areaType` as a STRING key ("TOWN" / "PATH" /
+ * "DUNGEON") — the old `typeof area.areaType === 'number'` check therefore never
+ * matched, so every area (towns included) fell back to PATH and shared-town
+ * matchmaking never fired. Prefer the engine's own converter, then fall back to
+ * reading the record directly (handling both the string key and the number).
+ */
+function areaTypeOfPath(areaPath: string): number {
 	try {
-		const area = (sc.map as any).areas[currentAreaPath()];
-		if (area && typeof area.areaType === 'number') {
-			return area.areaType;
+		const sm = (sc.map as any);
+		// Preferred: the engine's own converter (returns the numeric sc.AREA_TYPE).
+		if (sm && typeof sm.getAreaType === 'function') {
+			const t = sm.getAreaType(areaPath);
+			if (typeof t === 'number' && t >= 0 && t <= 2) return t;
+		}
+		const area = sm && sm.areas && sm.areas[areaPath];
+		if (area) {
+			if (typeof area.areaType === 'number') return area.areaType;
+			if (typeof area.areaType === 'string') {
+				const en = (sc as any).AREA_TYPE;
+				if (en && typeof en[area.areaType] === 'number') return en[area.areaType];
+			}
 		}
 	} catch (_) { /* fall through */ }
 	return AREA_TYPE.PATH;
+}
+
+/** The sc.AREA_TYPE of the current area, defaulting to PATH when unknown. */
+export function currentAreaType(): number {
+	return areaTypeOfPath(currentAreaPath());
 }
 
 /** True when the current area is a town (shared matchmaking space). */
@@ -45,13 +67,7 @@ export function areaPathOfMap(mapName: string): string {
 
 /** The sc.AREA_TYPE of the area a target map belongs to (defaults to PATH). */
 export function areaTypeOfMap(mapName: string): number {
-	try {
-		const area = (sc.map as any).areas[areaPathOfMap(mapName)];
-		if (area && typeof area.areaType === 'number') {
-			return area.areaType;
-		}
-	} catch (_) { /* fall through */ }
-	return AREA_TYPE.PATH;
+	return areaTypeOfPath(areaPathOfMap(mapName));
 }
 
 /**

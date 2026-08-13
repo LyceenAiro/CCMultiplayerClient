@@ -27,6 +27,8 @@ synchronized to everyone else over a central relay server
 ## Table of contents
 
 - [How it works](#how-it-works)
+- [Features](#features)
+- [Main-city (shared town) mechanics](#main-city-shared-town-mechanics)
 - [Requirements](#requirements)
 - [Building](#building)
 - [Installing](#installing)
@@ -65,6 +67,92 @@ CrossCode is a single-player game, so "multiplayer" here is really
 
 Communication is a socket.io relay: clients never talk to each other directly,
 everything goes through `CCMultiplayerServer`.
+
+## Features
+
+**Connectivity & matchmaking**
+- **Server list screen** (Minecraft-style): add / delete servers, **direct
+  connect** by `host:port`, a live **reachability indicator** (online/offline +
+  ping), all persisted without editing the config file.
+- **Version gate** — the server rejects a client whose mod version differs.
+- **Account login** — username is the identity (LAN trust); duplicate logins are
+  rejected and recent usernames are remembered.
+- **Main-city auto-match** — see
+  [Main-city (shared town) mechanics](#main-city-shared-town-mechanics).
+
+**World & combat sync**
+- **Whole-state block sync** — players, host enemies and enemy projectiles are
+  broadcast as whole-state blocks (self-healing, no packet-loss desync).
+- **Host election & migration** — the first client in an instance is its host;
+  the server migrates the host when it leaves.
+- **Player state** — position / facing / animation / HP / SP / charge /
+  cutscene / element / combat-class / guard timing.
+- **Enemy sync** — host-authoritative, two cadences (15 Hz base + an
+  option-driven hostile stream), plus enemy sounds / attacks / loot.
+- **Combat feedback** — enemy hits, guards & perfect guards, counter /
+  guard-break FX, skill sound/FX replay, and party-wide charge time-stop.
+- **Death & respawn** — downed players become spectators; a full-party wipe
+  reloads the checkpoint in lockstep.
+
+**Social & party**
+- **Parties** — invite / accept / decline / leave / kick, leader transfer, and
+  "teleport to teammate" regroup.
+- **Friends** — request / accept / decline / remove, request management, and a
+  name search; the official companions can be re-added as friends (auto-accept).
+- **Party bots** — the leader's follower bots are mirrored to members; offline
+  friends can follow as "mod bots".
+- **Room players** — see who is in your current map instance, plus a live online
+  counter.
+- **Party chat** — press Enter for a chat input with history and speech-bubble
+  rendering (party-only).
+
+**HUD & helpers**
+- **Name tags** — show names / own name / bot names, gold leader name, ping
+  display, adjustable opacity and size.
+- **Network badges** — a green/yellow/orange/red diamond (ping/loss) on party
+  portraits and the element indicator, with hover tooltips.
+- **Network debug HUD** — live upload/download rates, packet loss, cumulative
+  totals.
+- **Mod options tab** — a dedicated "Multiplayer" options tab in the game menu.
+- **Quick-menu (SHIFT) inspection** — online players and party bots are
+  inspectable, with an add/remove-friend button.
+- **Direct save+upload** — the bag-menu / ESC-menu save buttons upload straight
+  to the server while connected.
+- **Command box (F8)** — run `mp.*` console commands without DevTools.
+
+**Saves & persistence**
+- **Cloud saves** — your save is streamed from the server on login and restored;
+  it uploads (chunked + rate-limited) on save and on exit-to-title.
+- **Anti-spam** — area-save throttling and a login-time upload suppression window.
+- **Local persistence** — server list, options, login history and chat history
+  survive restarts (localStorage).
+
+## Main-city (shared town) mechanics
+
+Two areas act as **main cities** (open matchmaking hubs) where players meet
+without needing to form a party:
+
+- **Rookie Harbor** (`rookie-harbor`, 新手港)
+- **Rhombus Square** (`rhombus-sqr`, 罗姆斯广场, incl. 迎新桥)
+
+Behaviour:
+
+- **Whole-area instances.** The entire area counts as one main-city instance —
+  every player anywhere in the area auto-matches into the same instance
+  (`town:<area>[#N]`), regardless of which sub-map they stand on. A town
+  instance is **not** keyed per sub-map.
+- **Host = first in.** Like the wilderness, the first player to enter a channel
+  becomes its host; host migration stays the same.
+- **No party required.** Players auto-match to whoever is already in the city.
+- **32 players per channel.** Each main-city channel holds up to 32 players;
+  when full, the next player spills into a new `town:<area>#N` channel.
+- **Traffic optimised for crowds.** To keep a 32-player room cheap:
+  - player state (HP / EXP / SP …) syncs at **1 Hz**;
+  - position syncs at **10 Hz**;
+  - enemy / projectile sync packets are **not** sent (towns have no enemies);
+  - party **bots** are **not** synced — they stay visible only to their own
+    party leader;
+  - ghost chests remain **party-only**.
 
 ## Requirements
 
@@ -152,7 +240,7 @@ src/
 ├─ connection.ts               # IConnection interface (the wire protocol surface)
 ├─ connectors/SocketIOConnector.ts  # socket.io implementation of IConnection
 ├─ simplify.d.ts               # typings for the Simplify library bundled with CCLoader v2
-├─ loadScreenHook.ts           # reuses the Load-game menu as the server picker
+├─ loadScreenHook.ts           # LEGACY: reused the Load-game menu (now ui/serverList.ts)
 ├─ types.d.ts                  # shared Vec2/Vec3 shapes
 ├─ mpEntity.ts / player.ts / server.ts / ballInfo.ts / entityDefinition.ts
 ├─ listeners/
@@ -244,9 +332,9 @@ install (they cannot be validated by compiling):
   button by a *fixed index* (`buttons[1]` or `[2]` depending on platform). It
   now warns instead of crashing if the layout changed, but the index should be
   confirmed against the real 1.4.2 title screen.
-- **Server picker** reuses the *Load game* menu (`sc.ButtonListBox` /
-  `sc.SaveSlotButton`) via a one-shot prototype hook. Structure should be
-  unchanged, but worth a smoke test.
+- **Server list screen** is a dedicated DOM overlay (add / delete / direct
+  connect / connectivity ping) opened from the relabelled title-screen button;
+  worth a smoke test on the real 1.4.2 title screen.
 - **Combat correctness.** The mirror-entity property-locking trick
   (`coll.pos`, `face`, `currentAnim`, `currentState`) is inherently
   version-sensitive; expect to tune it for 1.4.2 combat.

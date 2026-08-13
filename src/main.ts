@@ -23,6 +23,29 @@ import { installChatBox } from './ui/chatBox';
  */
 async function startMultiplayer(): Promise<void> {
 	try {
+		// ROUND 71 (native diagnostics boot marker): the 1.64 file-logging build
+		// produced NO log files from a live native session, so instrument the very
+		// first mod frame: one boot file per process proving WHICH version actually
+		// loaded in the native client AND whether NW.js node fs is reachable from
+		// mod scope at all (the hitnum file logger depends on it). Browser mode has
+		// no window.require -> the marker simply doesn't appear, which is also data.
+		try {
+			const w: any = window as any;
+			if (w && w.require) {
+				const fsAny: any = w.require('fs');
+				const pid: any = (w.process && w.process.pid) || Math.floor(Math.random() * 1e9);
+				fsAny.writeFileSync('D:\\Dev_cc\\mp-boot-' + pid + '.txt',
+					'version=' + MP_VERSION + ' time=' + new Date().toISOString() + '\n');
+			}
+		} catch (bootErr) {
+			try {
+				const w: any = window as any;
+				if (w && w.require) {
+					w.require('fs').writeFileSync('D:\\Dev_cc\\mp-boot-err.txt', String(bootErr));
+				}
+			} catch (_) { /* ignore */ }
+		}
+
 		if (typeof simplify === 'undefined') {
 			throw new Error('[multiplayer] Simplify is not available. Is the Simplify mod installed and enabled?');
 		}

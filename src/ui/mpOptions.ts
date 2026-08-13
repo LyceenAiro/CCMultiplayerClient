@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
+import { isSharedTownNow } from '../util/areaUtil';
 
 /**
  * Round 12 — mod-dedicated OPTIONS tab + persistent player name tags.
@@ -628,6 +629,9 @@ function pingSuffix(ms: number): string {
  * (connector pingMs), never the server-relayed value. */
 function ownTagLabel(m: Multiplayer | undefined, base: string): string {
     try {
+        // Main-city refactor: in a shared town, name tags show the plain name only —
+        // no ping / " (Host)" suffix (those are wilderness-only).
+        if (isSharedTownNow()) return base;
         if (!getMpOption('showPing')) return base;
         const conn: any = m && (m as any).connection;
         if (!conn) return base;
@@ -645,6 +649,8 @@ function ownTagLabel(m: Multiplayer | undefined, base: string): string {
  * recent value (>= 0); otherwise the plain name. Never uses the local pingMs. */
 function remoteTagLabel(m: Multiplayer | undefined, name: string): string {
     try {
+        // Main-city refactor: no ping / " (Host)" suffix on tags inside a shared town.
+        if (isSharedTownNow()) return name;
         if (!getMpOption('showPing')) return name;
         const pings: any = m && (m as any).remotePings;
         if (!pings) return name;

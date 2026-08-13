@@ -1,0 +1,9 @@
+{
+	"servers": [
+		{
+			"hostname": "localhost",
+			"port": 15152,
+			"type": "http"
+		}
+	]
+}

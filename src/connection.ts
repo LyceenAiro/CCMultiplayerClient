@@ -90,12 +90,12 @@ export interface IConnection {
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
      * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
      * fixed MEDIUM. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean }): void;
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void;
     /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
      * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
      * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
      * every other member replays the enemy's hurt sound/FX on its own puppet. */
-    emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }): void;
+    emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void;
     /** Round 21: member -> host — a monster hit our real player LOCALLY (native damage
      * pipeline: guard/i-frames/knockback). Bookkeeping only: the member's HP already
      * streams via playerState, so the host must NOT re-apply any damage from this. */
@@ -268,10 +268,10 @@ export interface IConnection {
     onCombatHit(callback:
         (hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }) => void): void;
     onEnemyDamage(callback:
-        (hit: { uid: number, damage: number, attacker: string, attackElement?: number, critical?: boolean }) => void): void;
+        (hit: { uid: number, damage: number, attacker: string, attackElement?: number, critical?: boolean, type?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void;
     /** ROUND 45 (Gap A, host origin): the host relayed that a member's hit landed on a
      * real enemy — replay the hurt FX on our same-uid puppet (cosmetic only, no damage). */
-    onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean }) => void): void;
+    onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void;
     /** Round 17: the host's real enemy started an attack — replay it on our puppet
      * (uid) toward the local player with the given attack anim. Round 22 (RC1): `t`
      * is the targeted member's username (null when the host/bot/unknown was targeted). */
@@ -399,7 +399,7 @@ export interface INetQuality {
 export interface IChangeMapResult {
     instanceId: string;
     isHost: boolean;
-    members: Array<{ name: string, pos?: Vec3 }>;
+    members: Array<{ name: string, pos?: Vec3, map?: string }>;
     /** Round 20: the username of the NEW instance's block host (changeMapResponse.host). */
     host?: string;
 }

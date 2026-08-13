@@ -29,11 +29,10 @@ import { OnPlayerHealthChangeListener } from './listeners/game/onPlayerHealthCha
 import { OnPlayerMoveListener } from './listeners/game/onPlayerMove';
 import { OnTeleportListener } from './listeners/game/onTeleport';
 import { PlayerListener } from './listeners/game/playerListener';
-import { LoadScreenHook } from './loadScreenHook';
 import { IMultiplayerEntity } from './mpEntity';
 import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
-import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea } from './util/areaUtil';
+import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, isSharedTownNow } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows } from './ui/socialMenuInject';
@@ -44,6 +43,7 @@ import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { displayChat, clearChat } from './ui/chatBox';
 import { t } from './i18n';
+import { showServerList } from './ui/serverList';
 
 // CrossCode ships jQuery globally (declared in types.d.ts); overlays use it directly.
 
@@ -52,7 +52,7 @@ import { t } from './i18n';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.59.0';
+export const MP_VERSION = '1.68.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -68,6 +68,11 @@ export class Multiplayer {
 	 *  onPlayerChangeMap's loadingComplete, updated on enters/leaves). A later
 	 *  netSync gate consumes it. */
 	public playersOnThisMap: { [name: string]: boolean } = {};
+	/** Main-city refactor: the SUB-MAP each instance member is currently on
+	 *  (username -> mapName). A town instance spans a whole area, so members on a
+	 *  DIFFERENT sub-map must not be mirrored; onPlayerChangeMap seeds this from the
+	 *  relayed `map` field and netSync's mirror gate reads it (via playersOnThisMap). */
+	public playerMapByName: { [name: string]: string } = {};
 	/** Round 27 (item 2): the map each remote party MEMBER is currently on
 	 *  (username -> mapName). Seeded/updated by the per-second checkBotMaps publish
 	 *  (this client's OWN map via the cached memberMap, and every relayed packet for
@@ -153,10 +158,8 @@ export class Multiplayer {
 
 	public entities: IMultiplayerEntity[] = [];
 
-	private loadScreen!: () => void;
 	private nextEID = 1;
 	private entitySpawnListener!: OnEntitySpawnListener;
-	private loadScreenHook = new LoadScreenHook();
 	/** Round 23: the server STREAMS the save as paced saveDownload parts instead of
 	 * embedding it in handshakeResponse. The connector reassembles parts and fires
 	 * onSaveDownload once (or null for no save); this promise is created in connect()
@@ -272,24 +275,16 @@ export class Multiplayer {
 		await this.config.load();
 	}
 
-	public async waitForServerSelection(index: number): Promise<void> {
-		this.connection = this.config.getConnection(this, index);
-	}
-
 	public initialize(): void {
 		this.initializeGUI();
 		this.disableFocus();
 	}
 
 	public async connect(): Promise<void> {
-		const serverNumber = await this.loadScreenHook.displayServers(
-			this.config.servers.map((server) => server.display ?? server.hostname),
-			this.loadScreen);
-
-		// Go back to previous sub state (out of the menu).
-		sc.model.enterPrevSubState();
-
-		await this.waitForServerSelection(serverNumber);
+		// Minecraft-style server list (add / delete / direct connect / connectivity
+		// indicator) instead of reusing the game's save-slot "load" screen.
+		const server = await showServerList(this.config);
+		this.connection = this.config.getConnectionFor(this, server);
 
 		const username = await this.showLogin();
 
@@ -297,9 +292,7 @@ export class Multiplayer {
 
 		if (!this.connection.isOpen()) {
 			console.log('[multiplayer] Connecting..');
-			await this.connection.open(this.config.servers[serverNumber].hostname,
-				this.config.servers[serverNumber].port,
-				this.config.servers[serverNumber].type);
+			await this.connection.open(server.hostname, server.port, server.type);
 		}
 
 		this.initializeListeners();
@@ -514,8 +507,10 @@ export class Multiplayer {
 	}
 
 	/** Roster of the instance we most recently joined (from changeMapResponse
-	 *  `members`), round 15. undefined = no changeMap completed for this load. */
-	public newInstanceMembers?: string[];
+	 *  `members`), round 15. Each entry now carries the member's SUB-MAP (a town
+	 *  instance spans a whole area) so the load-complete reconcile can keep only
+	 *  the members actually on our map. undefined = no changeMap for this load. */
+	public newInstanceMembers?: Array<{ name: string; map?: string }>;
 
 	/** Round 15: the LOCAL player changed maps. clearMap() killed every old-map
 	 *  mirror but this.players still references them, and the server never tells
@@ -618,7 +613,6 @@ export class Multiplayer {
 		}
 
 		buttons[buttonNumber].setText(t('titleConnect'), true);
-		this.loadScreen = buttons[buttonNumber].onButtonPress;
 		buttons[buttonNumber].onButtonPress = this.startConnect.bind(this);
 	}
 
@@ -1684,6 +1678,10 @@ export class Multiplayer {
 	private checkBotRoster(): void {
 		try {
 			if (!this.host || !this.connection || !this.connection.isOpen()) return;
+			// Main-city refactor: never publish bots while in a shared town — several
+			// parties sharing one room would fight over the instance bot roster. Bots
+			// stay leader-local (only the leader's own client shows them).
+			if (isSharedTownNow()) return;
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
@@ -1968,6 +1966,9 @@ export class Multiplayer {
 	private streamBotState(): void {
 		try {
 			if (!this.connection || !this.connection.isOpen()) return;
+			// Main-city refactor: no botState stream in a shared town (bots are
+			// leader-local there — see checkBotRoster).
+			if (isSharedTownNow()) return;
 			if (!this.isPartyLeader) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
 			const party: any = (sc as any).party;
@@ -2920,6 +2921,11 @@ export class Multiplayer {
 				this.launchGame();
 			})
 			.catch((err: any) => {
+				// A user-initiated cancel (server list / login panel) rejects with the
+				// string 'cancelled' — it is NOT a failure. Skip console.error entirely:
+				// CCLoader overrides console.error to also draw an on-screen red toast, so
+				// logging it here was what showed the little "cancelled" box top-right.
+				if (err === 'cancelled') return;
 				console.error(err);
 				this.reportConnectError(err);
 			});
@@ -3400,6 +3406,8 @@ export class Multiplayer {
 		// them so a stale map never greys/hides a teammate in the next session.
 		this.memberMapByName = {};
 		this.botMapByName = {};
+		this.playerMapByName = {};
+		this.playersOnThisMap = {};
 		// Round 22: drop every cached name tag so the module-level tag cache can't
 		// leak into the next session (they project the old session's mirrors).
 		try { wipeAllNameTags(); } catch (_) { /* ignore */ }

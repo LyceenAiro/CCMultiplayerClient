@@ -2,6 +2,7 @@ import { IBallInfo } from '../ballInfo';
 import { IConnection, IChangeMapResult, IPlayerProfile, IBotStateEntry, ILootDrop, INetQuality, NetTier } from '../connection';
 import { Multiplayer, MP_VERSION } from '../multiplayer';
 import { IServer } from '../server';
+import { areaTypeOfMap } from '../util/areaUtil';
 
 import type { Socket } from 'socket.io-client';
 
@@ -226,8 +227,9 @@ export class SocketIoConnector implements IConnection {
 						// not be reliable during reconnect).
 						const idx = this.map.indexOf('.');
 						const areaPath = idx === -1 ? this.map : this.map.substring(0, idx);
-						const area = (sc.map as any).areas[areaPath];
-						const areaType = area && typeof area.areaType === 'number' ? area.areaType : 1;
+						// Use the same area-type resolver as the teleport path (handles the
+						// game's string-keyed areaType + sc.map.getAreaType).
+						const areaType = areaTypeOfMap(this.map);
 						// Round 19: the server cleared a PVP-duel isolation override on
 						// disconnect. If we were isolated (or a duel is still running),
 						// re-assert isolated:true so the duel stays in its own solo
@@ -687,7 +689,7 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
-	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean }): void {
+	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		this.socket.emit('enemyDamage', hit);
 	}
 
@@ -706,7 +708,7 @@ export class SocketIoConnector implements IConnection {
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
-	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }): void {
+	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		this.socket.emit('enemyHurt', hit);
 	}
 
@@ -862,7 +864,7 @@ export class SocketIoConnector implements IConnection {
 			callback(data);
 		});
 	}
-	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean }) => void): void {
+	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void {
 		this.socket.on('enemyDamage', (data: any) => {
 			callback(data);
 		});
@@ -892,7 +894,7 @@ export class SocketIoConnector implements IConnection {
 	}
 	/** ROUND 45 (Gap A, host origin): the host relayed a member's hit on a real enemy —
 	 * replay the hurt FX on our same-uid puppet (cosmetic only). */
-	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string }) => void): void {
+	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void {
 		this.socket.on('enemyHurt', (data: any) => {
 			if (data && typeof data.uid === 'number') callback(data);
 		});
