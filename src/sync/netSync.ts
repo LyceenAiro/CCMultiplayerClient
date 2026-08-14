@@ -509,6 +509,10 @@ export class NetSync {
 		// ROUND 39 (item 1): a remote player RELEASED a sustained sound (the skill charge-up)
 		// — cut the looped handle we started for it so the charge doesn't ring out past release.
 		conn.onSoundStop((player) => this.applySoundStop(player));
+		// ROUND 74 (plant destruct sync): a same-instance player destroyed a plant — destroy
+		// our own copy at the same mapId (vanilla chain, idempotent). Guarded like
+		// onSkillSound so a mixed client/server pair never crashes.
+		if (typeof conn.onPlantBreak === 'function') conn.onPlantBreak((d) => this.applyPlantBreak(d));
 		// Round 11: a remote player cast a special skill — replay its effect sheet
 		// on their mirror.
 		conn.onSkillFx((player, fx) => this.applySkillFx(player, fx));
@@ -1802,6 +1806,30 @@ export class NetSync {
 					},
 				});
 			} catch (e) { console.warn('[netsync] EnemySpawner inject failed', e); }
+
+			// ROUND 74 (plant destruct sync): every client owns its own local destructible
+			// (plant/bush/stone) copies of the SAME map data. When the local player breaks
+			// one, broadcast its stable mapId so every other same-instance client destroys
+			// its own copy too (drops + propsDestroyed count + respawn var). The receiver
+			// sets _mpSyncedDestroy before calling destroy() — that flag suppresses the
+			// re-broadcast here, so the sync can never loop.
+			try {
+				const IDProto: any = (ig.ENTITY as any).ItemDestruct && (ig.ENTITY as any).ItemDestruct.prototype;
+				if (IDProto && typeof IDProto.destroy === 'function' && !IDProto._mpDestructWrapped) {
+					IDProto._mpDestructWrapped = true;
+					const origDestroy = IDProto.destroy;
+					IDProto.destroy = function (this: any) {
+						const synced = !!this._mpSyncedDestroy;
+						this._mpSyncedDestroy = false;
+						const r = origDestroy.call(this);
+						try {
+							const m = (window as any).__mpMain;
+							if (!synced && m && m.netSync) m.netSync.broadcastPlantBreak(this);
+						} catch (_) { /* never break the destroy chain */ }
+						return r;
+					};
+				}
+			} catch (e) { console.warn('[netsync] ItemDestruct destroy wrap failed', e); }
 
 			// ROUND 19 (Part 3, step 1): flag cutscene-spawned monsters. Story sequences
 			// spawn enemies via ig.Game.spawnEntity with mapId 0 and settings WITHOUT
@@ -4424,6 +4452,52 @@ export class NetSync {
 			}
 		} catch (_) { /* ignore */ }
 		this._mpSustained = Object.create(null);
+	}
+
+	// ---- ROUND 74 (plant destruct sync) ----
+	/** The local player just destroyed a map destructible (the ItemDestruct.destroy inject
+	 * above calls this). Broadcast its stable mapId so every other same-instance client
+	 * destroys its own intact copy. The connector's syncEmit skips the packet while we are
+	 * the only member of our instance (pure upload waste). */
+	public broadcastPlantBreak(plant: any): void {
+		try {
+			const mapId = plant && plant.mapId;
+			if (!mapId) return;
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen()) return;
+			if (typeof conn.plantBreak !== 'function') return;
+			conn.plantBreak({ map: this.mapName, mapId });
+		} catch (_) { /* never break the destroy chain */ }
+	}
+
+	/** A same-instance player destroyed a plant — destroy OUR copy at the same mapId if it
+	 * is still intact, through the VANILLA chain so every side effect matches a local
+	 * break: dropped anim + boom/debris FX, OUR own drop rolls (dropItem uses the local
+	 * player's stats), the propsDestroyed count, the per-mapId respawn var and the trigger
+	 * var. Idempotent: an already-dropped / absent plant is a no-op. The enemy-spawn roll
+	 * (rare cold-dungeon destructibles) is suppressed on the receiver — the enemy already
+	 * spawned on the sender, and a second local spawn would be an unsynced ghost. */
+	public applyPlantBreak(data: { map: string, mapId: number }): void {
+		try {
+			if (!data || typeof data.mapId !== 'number' || !isFinite(data.mapId)) return;
+			if (data.map && data.map !== this.mapName) return; // a plant on a map we already left
+			const ID: any = (ig.ENTITY as any).ItemDestruct;
+			const plant = ig.game && typeof (ig.game as any).getEntityByMapId === 'function'
+				? (ig.game as any).getEntityByMapId(Math.round(data.mapId)) : null;
+			if (!plant || !(plant instanceof ID)) return;
+			if (plant.dropped || plant._killed) return; // already destroyed — nothing to do
+			// The vanilla ballHit path counts the destruction before destroy(); destroy()
+			// itself doesn't touch the stat, so mirror that count here.
+			try { (sc as any).stats.addMap('player', 'propsDestroyed', 1); } catch (_) { /* ignore */ }
+			const savedEnemyInfo = plant.enemyInfo;
+			const savedEnemyChance = plant.enemyChance;
+			plant.enemyInfo = null;
+			plant.enemyChance = -1;
+			plant._mpSyncedDestroy = true;   // the destroy inject sees this and skips re-broadcast
+			try { plant.destroy(); } catch (_) { plant._mpSyncedDestroy = false; }
+			plant.enemyInfo = savedEnemyInfo;
+			plant.enemyChance = savedEnemyChance;
+		} catch (_) { /* never break the frame */ }
 	}
 
 	/** MEMBER side — the host reported an enemy sound. Rebuild + play it on our same-uid

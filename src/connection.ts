@@ -23,6 +23,13 @@ export interface IConnection {
      * connectors that don't measure it need no implementation; the HUD
      * overlay guards the call with `conn.getNetStats?.()`. */
     getNetStats?(): { upBitsSec: number; downBitsSec: number; lossPct: number; upBitsTotal: number; downBitsTotal: number; tickRate: number; tickRateHostile?: number; tickRateBase?: number };
+    /** ROUND 75 (net diagnostics): per-event upload breakdown since the LAST call
+     * (bytes / count / cumulative total / bytes-per-sec per event name, rate-sorted).
+     * OPTIONAL like getNetStats; the __mpNet() console command guards the call. */
+    getUploadEventStats?(): { event: string; bytes: number; count: number; total: number; bytesPerSec: number }[];
+    /** ROUND 76 (advanced network tool): per-event DOWNLOAD breakdown, same
+     * window/reset semantics as getUploadEventStats. OPTIONAL. */
+    getDownloadEventStats?(): { event: string; bytes: number; count: number; total: number; bytesPerSec: number }[];
 
     /** Round 25: send one network-quality probe `{t, seq}`. The server echoes it
      * back verbatim as `netPong` (auth-gated, ~4/s); the connector folds the echo
@@ -147,6 +154,12 @@ export interface IConnection {
      * sustained (loop:true) sound (the skill charge-up). Every other same-instance client
      * cuts the looped handle it started for that player (applySoundStop). */
     emitSoundStop(): void;
+    /** ROUND 74 (plant destruct sync): any client -> its instance — the local player just
+     * destroyed a map destructible (plant/bush/stone, ig.ENTITY.ItemDestruct). `map` = the
+     * map it belonged to, `mapId` = the entity's stable mapId — identical map data on every
+     * client, so it unambiguously identifies the same plant for everyone. The server relays
+     * it to the other same-instance members (sender excluded). */
+    plantBreak(data: { map: string, mapId: number }): void;
 
     updateEntityPosition(id: number, pos: Vec3): void;
     updateEntityAnimation(id: number, face: Vec2, anim: string): void;
@@ -304,6 +317,11 @@ export interface IConnection {
     /** ROUND 39 (item 1): a same-instance player released a sustained sound (see
      * emitSoundStop) — cut the looped handle we started for them. */
     onSoundStop(callback: (player: string) => void): void;
+    /** ROUND 74 (plant destruct sync): a same-instance player destroyed a plant (see
+     * plantBreak) — destroy OUR copy at the same mapId if it is still intact (vanilla
+     * chain: dropped anim + FX + our own drop rolls + propsDestroyed count + respawn
+     * var). Idempotent: an already-dropped/absent plant is a no-op. */
+    onPlantBreak(callback: (data: { map: string, mapId: number }) => void): void;
 
     onRegisterEntity(callback:
         (id: number, type: string, pos: Vec3, settings: object) => void): void;

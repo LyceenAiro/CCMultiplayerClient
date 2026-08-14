@@ -55,6 +55,10 @@ interface IMpOptions {
     showNetDebug: boolean;
     /** Round 21: extend the network debug overlay with cumulative up/down totals. */
     showNetDebugCumulative: boolean;
+    /** ROUND 76 (advanced network tool): show the full per-event network-usage panel
+     * (upload/download rate + count + cumulative bytes for every sync type). Read
+     * live by the same 1s HUD pump; hidden while any menu is open. */
+    showNetTool: boolean;
     /** Name-tag backing opacity: one of 0 / 0.25 / 0.5 / 0.75 / 1. */
     tagAlpha: number;
     /** Name-tag font key: 'tiny' | 'small' | 'font' (ascending sizes). */
@@ -74,6 +78,7 @@ const DEFAULTS: IMpOptions = {
     playerStateRate: 10,
     showNetDebug: false,
     showNetDebugCumulative: false,
+    showNetTool: false,
     tagAlpha: 0.5,
     tagSize: 'tiny',
     showSaveToast: true,
@@ -93,6 +98,7 @@ function loadOptions(): IMpOptions {
         playerStateRate: DEFAULTS.playerStateRate,
         showNetDebug: DEFAULTS.showNetDebug,
         showNetDebugCumulative: DEFAULTS.showNetDebugCumulative,
+        showNetTool: DEFAULTS.showNetTool,
         tagAlpha: DEFAULTS.tagAlpha,
         tagSize: DEFAULTS.tagSize,
         showSaveToast: DEFAULTS.showSaveToast,
@@ -115,6 +121,8 @@ function loadOptions(): IMpOptions {
                 if ([10, 20, 30, 60].indexOf(parsed.playerStateRate) !== -1) out.playerStateRate = parsed.playerStateRate;
                 if (typeof parsed.showNetDebug === 'boolean') out.showNetDebug = parsed.showNetDebug;
                 if (typeof parsed.showNetDebugCumulative === 'boolean') out.showNetDebugCumulative = parsed.showNetDebugCumulative;
+                // Round 76: absent on older saves -> default (off).
+                if (typeof parsed.showNetTool === 'boolean') out.showNetTool = parsed.showNetTool;
                 if (typeof parsed.tagAlpha === 'number' && [0, 0.25, 0.5, 0.75, 1].indexOf(parsed.tagAlpha) !== -1) out.tagAlpha = parsed.tagAlpha;
                 if (typeof parsed.tagSize === 'string' && ['tiny', 'small', 'font'].indexOf(parsed.tagSize) !== -1) out.tagSize = parsed.tagSize;
                 // Round-24 key: absent on older saves -> default (on).
@@ -441,6 +449,11 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optNetDebug'), t('optNetDebugDesc'), 'showNetDebug', () => { /* HUD pump reads live */ });
                     this.list.addButton(rows[r], true); r++;
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optNetDebugCum'), t('optNetDebugCumDesc'), 'showNetDebugCumulative', () => { /* HUD pump reads live */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // ROUND 76 (advanced network tool): per-event network-usage panel
+                    // (upload/download per sync type, 1s refresh). The same HUD pump
+                    // reads the option live, so the onApplied is a no-op.
+                    rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optNetTool'), t('optNetToolDesc'), 'showNetTool', () => { /* HUD pump reads live */ });
                     this.list.addButton(rows[r], true); r++;
                     // Round 24: save-success toast toggle. No immediate action — the
                     // gate in multiplayer.ts's onSaveSaved reads it live at save time.
@@ -797,8 +810,8 @@ export function startNameTagLoop(getMain: () => Multiplayer | undefined): void {
 /** Round 21: bit counter -> compact human string. Units step by 1024:
  * ['bit','kb','Mb','Gb']; values below 1024 show as a plain integer + 'bit',
  * anything else as one decimal + the unit. Rates (bits/sec) are formatted here and
- * the caller appends `/s`. Unit text stays ASCII; the ↑/↓ direction glyphs are
- * added by applyNetHudNow, not here. */
+ * the caller appends `/s` — the mod's network displays have used kbps since
+ * Round 21, so the header and the simple debug overlay keep this unit. */
 function formatBits(bits: number): string {
     if (!isFinite(bits) || bits < 0) bits = 0;
     const units = ['bit', 'kb', 'Mb', 'Gb'];
@@ -806,6 +819,21 @@ function formatBits(bits: number): string {
     let u = 0;
     while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
     if (u === 0) return Math.round(v) + 'bit';
+    return v.toFixed(1) + units[u];
+}
+
+/** ROUND 76 (advanced network tool): byte counter -> compact human string.
+ * 1024-stepping units: ['B','kB','MB','GB']; values below 1024 show as a plain
+ * integer + 'B', anything else as one decimal + the unit. Used for the per-event
+ * rates/totals of the network tool (explicit kB/MB units, never confused with
+ * the kbps header). */
+function formatBytes(bytes: number): string {
+    if (!isFinite(bytes) || bytes < 0) bytes = 0;
+    const units = ['B', 'kB', 'MB', 'GB'];
+    let v = bytes;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    if (u === 0) return Math.round(v) + 'B';
     return v.toFixed(1) + units[u];
 }
 
@@ -839,29 +867,46 @@ function ensureNetHud(): any {
 function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
     try {
         const m = getMain();
-        const show = !!getMpOption('showNetDebug') && !!m && inGameOk() && !anyMenuOpen();
+        // ROUND 76: the advanced network tool renders inside THIS bottom-right debug
+        // window (a top-left panel collided with other UI), so it takes priority over
+        // the simple text while it is on; the simple debug stays when only
+        // showNetDebug is enabled.
+        const showTool = !!getMpOption('showNetTool');
+        const showSimple = !showTool && !!getMpOption('showNetDebug');
+        const show = (showTool || showSimple) && !!m && inGameOk() && !anyMenuOpen();
         const conn: any = m && m.connection;
-        if (!show || !conn || typeof conn.isOpen !== 'function' || !conn.isOpen() || typeof conn.getNetStats !== 'function') {
+        if (!show || !conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) {
             if (netHudBox) { try { netHudBox.hook._visible = false; } catch (_) { /* ignore */ } }
             return;
         }
-        const s = conn.getNetStats();
-        // Round 22: arrow glyphs for up/down (user-requested; ↑ ↓ render in the game
-        // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us.
-        let str = '↑ ' + formatBits(s.upBitsSec) + '/s  ↓ ' + formatBits(s.downBitsSec) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
-        if (getMpOption('showNetDebugCumulative')) {
-            str += '\n↑ ' + formatBits(s.upBitsTotal) + '  ↓ ' + formatBits(s.downBitsTotal);
-            // Item 3: display the two per-stream entityState rates separately. The old
-            // "TICK n/s" summed the fixed 15Hz BASE stream + the option's HOSTILE stream,
-            // reading ~75 in combat at a 60Hz setting (a display artifact, not an
-            // over-send). Prefer the split fields the connector now reports; fall back
-            // to the combined count only when they're absent (older connector).
-            const sa: any = s as any;
-            if (typeof sa.tickRateHostile === 'number') {
-                str += '  TICK ' + Math.round(sa.tickRateHostile) + '(H)/s ' + Math.round(sa.tickRateBase || 0) + '(B)/s';
-            } else {
-                str += '  TICK ' + Math.round(sa.tickRate || 0) + '/s';
+        let str = '';
+        if (showTool && typeof conn.getUploadEventStats === 'function') {
+            str = buildNetToolText(conn);
+        }
+        if (!str && typeof conn.getNetStats === 'function') {
+            const s = conn.getNetStats();
+            // Round 22: arrow glyphs for up/down (user-requested; ↑ ↓ render in the game
+            // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us. Rates keep the
+            // kbps convention the mod has always used (formatBits).
+            str = '↑ ' + formatBits(s.upBitsSec) + '/s  ↓ ' + formatBits(s.downBitsSec) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
+            if (getMpOption('showNetDebugCumulative')) {
+                str += '\n↑ ' + formatBits(s.upBitsTotal) + '  ↓ ' + formatBits(s.downBitsTotal);
+                // Item 3: display the two per-stream entityState rates separately. The old
+                // "TICK n/s" summed the fixed 15Hz BASE stream + the option's HOSTILE stream,
+                // reading ~75 in combat at a 60Hz setting (a display artifact, not an
+                // over-send). Prefer the split fields the connector now reports; fall back
+                // to the combined count only when they're absent (older connector).
+                const sa: any = s as any;
+                if (typeof sa.tickRateHostile === 'number') {
+                    str += '  TICK ' + Math.round(sa.tickRateHostile) + '(H)/s ' + Math.round(sa.tickRateBase || 0) + '(B)/s';
+                } else {
+                    str += '  TICK ' + Math.round(sa.tickRate || 0) + '/s';
+                }
             }
+        }
+        if (!str) {
+            if (netHudBox) { try { netHudBox.hook._visible = false; } catch (_) { /* ignore */ } }
+            return;
         }
         if (str !== netHudLast) {
             netHudLast = str;
@@ -878,6 +923,61 @@ function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
     } catch (_) { /* never break the update loop */ }
 }
 
+// ---- ROUND 76 (advanced network tool): full per-event network-usage table ----
+
+/** ROUND 76: build the per-event network-usage table text (header + top rows, by
+ * combined rate). The callers (applyNetHudNow) render it; the per-event windows
+ * reset on every read, so the rates always describe the last second. Returns ''
+ * when the connector lacks the per-event counters (older build). */
+function buildNetToolText(conn: any): string {
+    try {
+        const up = conn.getUploadEventStats();
+        const down = (typeof conn.getDownloadEventStats === 'function') ? conn.getDownloadEventStats() : [];
+        // Merge both directions per event name, keep the top rows by combined rate.
+        const merged: { [name: string]: any } = Object.create(null);
+        for (const r of up) { const e = merged[r.event] || (merged[r.event] = {}); e.up = r; }
+        for (const r of down) { const e = merged[r.event] || (merged[r.event] = {}); e.down = r; }
+        const rows: any[] = [];
+        for (const name in merged) {
+            const e = merged[name];
+            const upBps = e.up ? e.up.bytesPerSec : 0;
+            const downBps = e.down ? e.down.bytesPerSec : 0;
+            rows.push({ name, upBps, downBps, upCount: e.up ? e.up.count : 0, downCount: e.down ? e.down.count : 0, upTotal: e.up ? e.up.total : 0, downTotal: e.down ? e.down.total : 0 });
+        }
+        rows.sort((a, b) => (b.upBps + b.downBps) - (a.upBps + a.downBps));
+        const top = rows.slice(0, 14);
+        // Sum ALL rows (not only the displayed top) so the 合计 line is directly
+        // comparable with the engine-level header — any leftover difference is
+        // protocol framing / untagged packets, not missing sync traffic.
+        let sumUp = 0;
+        let sumDown = 0;
+        for (const r of rows) { sumUp += r.upBps; sumDown += r.downBps; }
+        let str = '';
+        try {
+            const s: any = typeof conn.getNetStats === 'function' ? conn.getNetStats() : null;
+            if (s) {
+                // The header keeps the mod's long-standing kbps convention (the
+                // engine counter is bits/s); the per-event rows use kB/s with
+                // explicit units — 合计(kB/s) × 8 ≈ 标题(kbps).
+                str = '↑ ' + formatBits(s.upBitsSec) + '/s   ↓ ' + formatBits(s.downBitsSec) + '/s   ' + t('netToolLoss') + ' ' + Math.round(s.lossPct || 0) + '%\n';
+            }
+        } catch (_) { /* header is cosmetic */ }
+        if (!top.length) {
+            str += t('netToolNoEvents');
+        } else {
+            for (const r of top) {
+                str += r.name
+                    + '  ↑' + formatBytes(r.upBps) + '/s·' + r.upCount + '·' + formatBytes(r.upTotal)
+                    + '  ↓' + formatBytes(r.downBps) + '/s·' + r.downCount + '·' + formatBytes(r.downTotal) + '\n';
+            }
+            str += t('netToolSum') + '  ↑' + formatBytes(sumUp) + '/s  ↓' + formatBytes(sumDown) + '/s';
+        }
+        return str;
+    } catch (_) {
+        return '';
+    }
+}
+
 /** Round 21: start the 1s-cadence network-debug HUD pump (idempotent). */
 export function startNetHudLoop(getMain: () => Multiplayer | undefined): void {
     const s: any = (typeof simplify !== 'undefined') ? (simplify as any) : null;
@@ -889,6 +989,8 @@ export function startNetHudLoop(getMain: () => Multiplayer | undefined): void {
             netHudTimer += ig.system.tick;
             if (netHudTimer < 1) return;
             netHudTimer = 0;
+            // ROUND 76: the advanced network tool renders inside applyNetHudNow's
+            // bottom-right window, so it shares this one pump.
             applyNetHudNow(getMain);
         } catch (_) { /* never break the update loop */ }
     });

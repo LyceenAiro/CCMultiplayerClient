@@ -79,6 +79,17 @@ export class SocketIoConnector implements IConnection {
 	private upBlockAccum = 0;
 	private downBlockAccum = 0;
 	private tickRate = 0;
+	/** ROUND 75 (net diagnostics): per-event upload breakdown — bytes/count per event
+	 * name, tallied by the raw-emit wrapper installed in open(). Read by the
+	 * __mpNet() console command (getUploadEventStats) so a traffic question can be
+	 * answered per stream (entityState vs playerState vs plantBreak ...).
+	 * ROUND 76 (advanced network tool): `total` is the never-reset cumulative size;
+	 * `bytes`/`count` are the window since the last read (getUploadEventStats resets
+	 * them). A matching downEventStats pair is tallied by the onevent wrapper. */
+	private upEventStats: { [event: string]: { bytes: number, count: number, total: number } } = Object.create(null);
+	private upEventStatsAt = 0;
+	private downEventStats: { [event: string]: { bytes: number, count: number, total: number } } = Object.create(null);
+	private downEventStatsAt = 0;
 	// ITEM 3: the host streams TWO entityState cadences (a fixed 15Hz BASE stream for
 	// idle enemies + the option-driven HOSTILE stream). The connector can't tell which
 	// stream a block belongs to, so instead of summing them (which double-counts) we
@@ -139,6 +150,52 @@ export class SocketIoConnector implements IConnection {
 		this.socket = io(type + '://' + hostname + ':' + port + '/', {
 			transports: ['websocket'],
 		});
+
+		// ROUND 75 (net diagnostics): wrap the raw emit ONCE per socket so every upload
+		// event is tallied by name (payload JSON size — a close-enough wire estimate,
+		// framing overhead is constant per event). Skips non-JSON payloads (multi-arg
+		// emit calls fall back to a fixed estimate) and never throws into the emit.
+		try {
+			const sock: any = this.socket;
+			if (sock && !sock._mpEmitCounted) {
+				sock._mpEmitCounted = true;
+				const origEmit = sock.emit.bind(sock);
+				sock.emit = (event: string, ...args: any[]) => {
+					try {
+						if (typeof event === 'string') {
+							let size = event.length + 4;
+							try { size += args && args.length ? JSON.stringify(args[0]).length : 0; } catch (_) { size += 16; }
+							const e = this.upEventStats[event] || (this.upEventStats[event] = { bytes: 0, count: 0, total: 0 });
+							e.bytes += size;
+							e.count++;
+							e.total += size;
+						}
+					} catch (_) { /* diagnostics must never break an emit */ }
+					return origEmit(event, ...args);
+				};
+			}
+			// ROUND 76 (advanced network tool): mirror the emit wrapper for DOWNLOAD —
+			// socket.io v1/v2 decodes each incoming message into onevent(packet) with
+			// packet.data = [event, ...args]; tally its JSON size per event name.
+			if (sock && !sock._mpOneventCounted) {
+				sock._mpOneventCounted = true;
+				const origOnevent = sock.onevent.bind(sock);
+				sock.onevent = (packet: any) => {
+					try {
+						if (packet && Array.isArray(packet.data) && packet.data.length && typeof packet.data[0] === 'string') {
+							const event = packet.data[0];
+							let size = event.length + 4;
+							try { size += JSON.stringify(packet.data).length; } catch (_) { size += 16; }
+							const e = this.downEventStats[event] || (this.downEventStats[event] = { bytes: 0, count: 0, total: 0 });
+							e.bytes += size;
+							e.count++;
+							e.total += size;
+						}
+					} catch (_) { /* diagnostics must never break a receive */ }
+					return origOnevent(packet);
+				};
+			}
+		} catch (_) { /* ignore */ }
 
 		// Round 21: hook the socket.io engine's packet events for the network debug
 		// stats. The engine is only reachable after connect and is swapped on every
@@ -512,6 +569,42 @@ export class SocketIoConnector implements IConnection {
 		};
 	}
 
+	/** ROUND 75/76: fold one direction's per-event counters into a rate-sorted table
+	 * for the window since the last read, resetting the window accumulators. `total`
+	 * is cumulative and never resets. */
+	private foldEventStats(stats: { [event: string]: { bytes: number, count: number, total: number } }, lastAt: number): { lastAt: number, rows: { event: string, bytes: number, count: number, total: number, bytesPerSec: number }[] } {
+		const now = Date.now();
+		const dt = Math.max(1, (now - lastAt) / 1000);
+		const rows: { event: string, bytes: number, count: number, total: number, bytesPerSec: number }[] = [];
+		for (const ev in stats) {
+			const e = stats[ev];
+			rows.push({ event: ev, bytes: e.bytes, count: e.count, total: e.total, bytesPerSec: e.bytes / dt });
+			e.bytes = 0;
+			e.count = 0;
+		}
+		rows.sort((a, b) => b.bytesPerSec - a.bytesPerSec);
+		return { lastAt: now, rows };
+	}
+
+	/** ROUND 75 (net diagnostics): per-event upload breakdown since the LAST call —
+	 * bytes, event count, cumulative total and bytes/sec per event name, sorted by
+	 * rate descending. Call twice (e.g. __mpNet(), wait 10s, __mpNet()) to read live
+	 * rates; the window resets on every call so the numbers describe "since last call".
+	 * ROUND 76: the advanced network tool panel reads this on its own 1s pump. */
+	public getUploadEventStats(): { event: string, bytes: number, count: number, total: number, bytesPerSec: number }[] {
+		const r = this.foldEventStats(this.upEventStats, this.upEventStatsAt);
+		this.upEventStatsAt = r.lastAt;
+		return r.rows;
+	}
+
+	/** ROUND 76 (advanced network tool): per-event DOWNLOAD breakdown, same
+	 * window/reset semantics as getUploadEventStats (tallied by the onevent wrapper). */
+	public getDownloadEventStats(): { event: string, bytes: number, count: number, total: number, bytesPerSec: number }[] {
+		const r = this.foldEventStats(this.downEventStats, this.downEventStatsAt);
+		this.downEventStatsAt = r.lastAt;
+		return r.rows;
+	}
+
 	// ---- Round 25: netPing/netPong quality ----
 
 	/** Send one netPing probe {t, seq} (exposed for completeness; the connector's
@@ -761,6 +854,13 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('soundStop', {});
 	}
 
+	// ROUND 74 (plant destruct sync): any client -> its instance — the local player just
+	// destroyed a map destructible; every other same-instance client destroys its own copy
+	// at the same mapId (see NetSync.applyPlantBreak). syncEmit: solo-instance skip.
+	public plantBreak(data: { map: string, mapId: number }): void {
+		this.syncEmit('plantBreak', data);
+	}
+
 	public updateEntityPosition(id: number, pos: Vec3): void {
 		this.socket.emit('updateEntityPosition', {id, pos});
 	}
@@ -961,6 +1061,16 @@ export class SocketIoConnector implements IConnection {
 	public onSoundStop(callback: (player: string) => void): void {
 		this.socket.on('soundStop', (data: any) => {
 			if (data && typeof data.player === 'string') callback(data.player);
+		});
+	}
+	/** ROUND 74 (plant destruct sync): a same-instance player destroyed a plant — destroy
+	 * our own copy at the same mapId (see NetSync.applyPlantBreak). Server relays the
+	 * event to the other instance members (sender excluded) and validates the payload. */
+	public onPlantBreak(callback: (data: { map: string, mapId: number }) => void): void {
+		this.socket.on('plantBreak', (data: any) => {
+			if (data && typeof data.map === 'string' && typeof data.mapId === 'number') {
+				callback({ map: data.map, mapId: data.mapId });
+			}
 		});
 	}
 	public onRegisterEntity(callback: (id: number, type: string, pos: Vec3, settings: object) => void): void {

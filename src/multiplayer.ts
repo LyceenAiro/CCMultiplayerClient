@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.68.14';
+export const MP_VERSION = '1.69';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -790,6 +790,32 @@ export class Multiplayer {
 				}
 				if (!near.length) console.log('[mpai] no enemies within 700px of the mirror — stand test2 near the frozen enemy and re-run');
 			} catch (err) { console.error('[mpai] failed', err); }
+		};
+		// ROUND 75 (net diagnostics, READ-ONLY): __mpNet() prints the engine-level upload
+		// rate plus the per-event upload breakdown since the last call. Run it TWICE with a
+		// gap (e.g. 10s) to read live rates — the per-event table resets on every call, so
+		// the numbers always describe "since last call". Never mutates anything.
+		(window as any).__mpNet = () => {
+			try {
+				const m = (window as any).__mpMain;
+				const conn = m && m.connection;
+				if (!conn) { console.log('[mpnet] no connection'); return; }
+				let s: any = null;
+				try { if (typeof (conn as any).getNetStats === 'function') s = (conn as any).getNetStats(); } catch (_) { /* ignore */ }
+				if (s) {
+					console.log('[mpnet] up=' + ((s.upBitsSec || 0) / 8 / 1024).toFixed(2) + ' KB/s  down=' + ((s.downBitsSec || 0) / 8 / 1024).toFixed(2) + ' KB/s  totalUp=' + ((s.upBitsTotal || 0) / 8 / 1024).toFixed(1) + ' KB  loss=' + (s.lossPct || 0) + '%');
+				}
+				try {
+					if (typeof (conn as any).getUploadEventStats === 'function') {
+						console.log('[mpnet] upload per event (since last call):');
+						console.table((conn as any).getUploadEventStats());
+					}
+					if (typeof (conn as any).getDownloadEventStats === 'function') {
+						console.log('[mpnet] download per event (since last call):');
+						console.table((conn as any).getDownloadEventStats());
+					}
+				} catch (_) { /* ignore */ }
+			} catch (e) { console.warn('[mpnet] failed', e); }
 		};
 		this.initializeConnectionHooks();
 		// New whole-state sync (players + host enemy block). Re-wired each connect so it
