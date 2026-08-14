@@ -91,6 +91,16 @@ export class SocketIoConnector implements IConnection {
 	public setHostileTickHz(hz: number): void {
 		this.hostileTickRate = (isFinite(hz) && hz > 0) ? hz : 0;
 	}
+	/** Solo-instance optimization (see Multiplayer.isSoloInstance): every INSTANCE-
+	 * scoped sync broadcast is pure upload waste while we are the only member of our
+	 * instance (the server relays to every OTHER member, and there are none). Emit
+	 * through this helper to skip those packets so solo play only sends the necessary
+	 * server communication (mpPing/netPing/pingReport keepalive, changeMap, save,
+	 * social, and the cross-instance memberMap — all still plain socket.emit). */
+	private syncEmit(event: string, payload: any): void {
+		if (this.main.isSoloInstance()) return;
+		this.socket.emit(event, payload);
+	}
 
 	// ---- Round 23: streamed save DOWNLOAD (saveDownload parts) ----
 	// The server no longer embeds the save in handshakeResponse; it streams it in
@@ -599,11 +609,11 @@ export class SocketIoConnector implements IConnection {
 	}
 
 	public throwBall(ballInfo: IBallInfo): void {
-		this.socket.emit('throwBall', ballInfo);
+		this.syncEmit('throwBall', ballInfo);
 	}
 
 	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }): void {
-		this.socket.emit('combatHit', hit);
+		this.syncEmit('combatHit', hit);
 	}
 
 	public partyRegroup(target?: string): void {
@@ -627,7 +637,7 @@ export class SocketIoConnector implements IConnection {
 	// clients can spawn their own follower copies. Round 27 (item 2): `maps` tags
 	// each bot with the HOST's current map for the off-map HUD hide/grey.
 	public partyBots(bots: string[], maps?: { [botName: string]: string }): void {
-		this.socket.emit('partyBots', { bots, maps: maps || {} });
+		this.syncEmit('partyBots', { bots, maps: maps || {} });
 	}
 	public onPartyBots(callback: (bots: string[], maps?: { [botName: string]: string }) => void): void {
 		this.socket.on('partyBots', (data: any) => callback((data && data.bots) || [], (data && data.maps) || undefined));
@@ -636,7 +646,7 @@ export class SocketIoConnector implements IConnection {
 	// Round 13: the party leader streams live bot state (pos/anim/hp/level); members
 	// apply it to their local puppet copies.
 	public botState(state: { map: string, bots: IBotStateEntry[] }): void {
-		this.socket.emit('botState', state);
+		this.syncEmit('botState', state);
 	}
 	public onBotState(callback: (data: { map?: string, from?: string, bots: IBotStateEntry[] }) => void): void {
 		this.socket.on('botState', (data: any) => callback(data));
@@ -681,7 +691,7 @@ export class SocketIoConnector implements IConnection {
 
 	// Round 11: special-skill effect replay (sheet path + effect key).
 	public skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
-		this.socket.emit('skillFx', fx);
+		this.syncEmit('skillFx', fx);
 	}
 	public onSkillFx(callback: (player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void {
 		this.socket.on('skillFx', (data: any) => {
@@ -690,65 +700,65 @@ export class SocketIoConnector implements IConnection {
 	}
 
 	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
-		this.socket.emit('enemyDamage', hit);
+		this.syncEmit('enemyDamage', hit);
 	}
 
 	/** Round 21: a monster hit our real player LOCALLY (native damage pipeline) — report
 	 * the outcome to the host for bookkeeping (same wire style as enemyDamage). */
 	public emitCombatResult(hit: { uid: number, damage: number, guarded: boolean }): void {
-		this.socket.emit('combatResult', hit);
+		this.syncEmit('combatResult', hit);
 	}
 
 	/** Round 26: a counter/guard-break dramatic effect played on a SHARED enemy (uid) —
 	 * relay to the instance so everyone else replays it on the same-uid entity. The
 	 * server excludes the sender and rate-limits ~20/s. kind = 'counter' | 'break'. */
 	public emitCombatFx(uid: number, kind: string): void {
-		this.socket.emit('combatFx', { uid, kind });
+		this.syncEmit('combatFx', { uid, kind });
 	}
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
 	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void {
-		this.socket.emit('enemyHurt', hit);
+		this.syncEmit('enemyHurt', hit);
 	}
 
 	// Round 17: HOST -> all — the host's real enemy started an attack; members replay
 	// it on their puppet toward the local player (member puppets no longer run local AI).
 	// Round 22 (RC1): `t` = the targeted member's username (null = host/bot/unknown).
 	public enemyAttack(atk: { uid: number, anim: string, t: string | null }): void {
-		this.socket.emit('enemyAttack', atk);
+		this.syncEmit('enemyAttack', atk);
 	}
 
 	// Round 23: HOST -> all — a host real enemy died and granted credits to the host's
 	// player. Round 24 (loot fairness): the raw drop table + boosterState ride along so
 	// members roll their OWN drops with their OWN stats (not the host's).
 	public emitLoot(loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }): void {
-		this.socket.emit('loot', loot);
+		this.syncEmit('loot', loot);
 	}
 
 	// Round 33 (item 2b): HOST -> all — one of the host's real enemies played a sound;
 	// members replay it positioned on their same-uid puppet (member puppets run no AI, so
 	// they are silent without this relay).
 	public emitEnemySound(s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }): void {
-		this.socket.emit('enemySound', s);
+		this.syncEmit('enemySound', s);
 	}
 
 	// ROUND 34 (item 3): any client -> its instance — the local player's own attack sound
 	// (melee swing / ball throw); every other same-instance client replays it on the mirror.
 	public emitPlayerSound(s: { path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }): void {
-		this.socket.emit('playerSound', s);
+		this.syncEmit('playerSound', s);
 	}
 
 	// ROUND 43 (skill-release sound): any client -> its instance — the local player fired a
 	// skill whose launch sound we silenced locally; every other client replays it on the mirror.
 	public emitSkillSound(s: { player: string, path: string, volume?: number, variance?: number, radius?: number, speed?: number }): void {
-		this.socket.emit('skillSound', s);
+		this.syncEmit('skillSound', s);
 	}
 
 	// ROUND 39 (item 1): any client -> its instance — the local player released a sustained
 	// (looped) sound (the skill charge-up); every other client cuts its handle.
 	public emitSoundStop(): void {
-		this.socket.emit('soundStop', {});
+		this.syncEmit('soundStop', {});
 	}
 
 	public updateEntityPosition(id: number, pos: Vec3): void {
@@ -765,9 +775,19 @@ export class SocketIoConnector implements IConnection {
 	}
 	// ---- NEW sync system ----
 	public updatePlayerState(state: any): void {
-		this.socket.emit('playerState', state);
+		this.syncEmit('playerState', state);
+	}
+	/** Solo-instance optimization: ~1Hz minimal position beacon (see NetSync). Emits
+	 * a bare {pos} playerState that keeps the server's memberPos cache fresh while we
+	 * are the only member of our instance. Deliberately NOT gated by syncEmit — it IS
+	 * the solo-mode keepalive for spawn placement / party regroup. */
+	public updatePlayerPosition(pos: Vec3): void {
+		this.socket.emit('playerState', { pos });
 	}
 	public updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean): void {
+		// Solo-instance optimization: no one else is in our instance, so the block is pure
+		// upload waste — skip it (and its stats count).
+		if (this.main.isSoloInstance()) return;
 		// Round 22 (EXTRA 2): count host->member enemy blocks for the observed tick rate.
 		this.upBlockAccum++;
 		// Round 24: a force-full block ships f:1 (the ~1s heartbeat). Normal blocks omit
@@ -779,13 +799,13 @@ export class SocketIoConnector implements IConnection {
 	// Round 19: cutscene-spawned monster stream (see applyCutsceneEntity). The server
 	// relays it to the instance stamped with the sender as `from` (protocol.js).
 	public updateCutsceneEntityBlock(state: { map: string, list: any[] }): void {
-		this.socket.emit('cutsceneEntity', state);
+		this.syncEmit('cutsceneEntity', state);
 	}
 	// Round 62: host-only stream of enemy projectiles (Ball/Stone). The server relays it
 	// as `projectileState` via broadcastHostState (no-op unless the sender is the instance
 	// host); the payload is whitelisted server-side.
 	public updateProjectileState(map: string, list: any[]): void {
-		this.socket.emit('projectileState', { map, e: list });
+		this.syncEmit('projectileState', { map, e: list });
 	}
 	public onPlayerState(callback: (player: string, state: any) => void): void {
 		this.socket.on('playerState', (data: any) => callback(data.player, data));

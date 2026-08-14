@@ -332,6 +332,10 @@ export class NetSync {
 	 * while in a shared town. Position still streams at 10Hz there; state is folded
 	 * into the packet only once per second (1Hz). */
 	private _mpTownStateAt = 0;
+	/** Solo-instance optimization: last time the ~1Hz minimal position beacon was
+	 * emitted (see sendPlayerState). Keeps the server's memberPos fresh while we are
+	 * the only member of our instance, without the full 10-60Hz stream. */
+	private _mpSoloBeaconAt = 0;
 	/** ROUND 65: map name the gw/gm/ga/def guard fields were last sent from. The
 	 * receiver caches them on the mirror entity and mirrors are destroyed on a map
 	 * change, so a new map must re-send the full set even when unchanged (see the
@@ -4630,6 +4634,20 @@ export class NetSync {
 		// to the death spot each frame, and teammates' mirrors must not wander.
 		const pos = (this._mpDead && this._mpDeathPos) ? this._mpDeathPos
 			: { x: p.coll.pos.x, y: p.coll.pos.y, z: p.coll.pos.z };
+		// Solo-instance optimization: while we are the ONLY member of our instance the
+		// full playerState stream is suppressed (see SocketIoConnector.syncEmit). Keep a
+		// ~1Hz minimal {pos} beacon instead so the server's memberPos cache stays fresh
+		// for late-joiner spawn placement + party regroup, without re-enabling the whole
+		// stream. The bare {pos} playerState is harmless even if it ever reaches a member
+		// (it only nudges position).
+		if (this.main.isSoloInstance()) {
+			const beaconNow = Date.now();
+			if (beaconNow - this._mpSoloBeaconAt >= 1000) {
+				this._mpSoloBeaconAt = beaconNow;
+				this.main.connection.updatePlayerPosition(pos);
+			}
+			return;
+		}
 		// No anim updates while dead: the mirror keeps its last pose instead of
 		// mirroring the corpse's local input-driven walk cycle.
 		const anim = this._mpDead ? '' : (typeof p.currentAnim === 'string' ? p.currentAnim : '');

@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.68.0';
+export const MP_VERSION = '1.68.1';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -125,6 +125,24 @@ export class Multiplayer {
 	 *  any reader) can compare without re-reading ig.game mid-frame. */
 	private _mpOurMapCached = '';
 	private _mpLastMemberMapAt = 0;
+	/** Solo-instance optimization: true when this client is the ONLY member of its
+	 *  current map instance (a lone host with no one else in the room). While true, the
+	 *  whole-state sync streams (playerState / entityState / projectileState /
+	 *  cutsceneEntity + the combat/sound/bot/ball relays) are suppressed at the connector
+	 *  so solo play sends only the necessary server communication (keepalive probes,
+	 *  changeMap, save, social, and the cross-instance memberMap). `playerMapByName`
+	 *  tracks every OTHER member of the current instance (seeded from changeMapResponse
+	 *  and kept fresh by enter/leave broadcasts), so it flips false the instant anyone
+	 *  else joins. Returns false whenever the roster is missing, so a transient empty
+	 *  roster errs toward streaming rather than ever hiding a real teammate. */
+	public isSoloInstance(): boolean {
+		try {
+			const pm = this.playerMapByName;
+			if (!pm) return false; // unknown -> not solo (keep streaming)
+			for (const k in pm) return false;
+			return true;
+		} catch (_) { return false; }
+	}
 	public config: MultiplayerConfig;
 	public connection!: IConnection;
 	public name?: string;

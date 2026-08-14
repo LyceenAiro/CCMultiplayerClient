@@ -54,6 +54,11 @@ export interface IConnection {
     /** Stream our own full player state (pos/face/anim/hp/sp) each frame.
      * `dead`=1 while our player is dead: teammates despawn our mirror until respawn. */
     updatePlayerState(state: { pos: Vec3, face: Vec2, anim: string, dead?: number, hp?: number, maxHp?: number, sp?: number, maxSp?: number, cg?: number, em?: number, cl?: string, cs?: number }): void;
+    /** Solo-instance optimization: a ~1Hz minimal position beacon (a playerState
+     * carrying only {pos}) that keeps the server's memberPos cache fresh while we
+     * are the only member of our instance — for late-joiner spawn placement and
+     * party regroup — without re-enabling the full sync stream. */
+    updatePlayerPosition(pos: Vec3): void;
     /** Host-only: broadcast the whole enemy state block for the current map.
      * `combat` = host's combat mode, so members enter/see the shared fight.
      * `full` = this block was force-full (f:1 on the wire) — the ~1s heartbeat that
