@@ -657,6 +657,7 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] setPaused wrap failed', e); }
+
 			try {
 				// Round 11 skill-FX sync: wrap the EffectSheet spawn choke points. Skill
 				// visuals are SHOW_EFFECT action steps -> EffectHandle -> sheet.spawnOnTarget/
@@ -6742,6 +6743,14 @@ export class NetSync {
 		this._mpCheckpointReloading = false;
 		this._mpCheckpointReloadAt = 0;
 		this._mpCheckpointForced = false;
+		// Release the charge + party charge time-stop the instant we die. A player who
+		// dies MID-CHARGE never runs Player.onKill -> clearCharge (manualKill gates that
+		// kill), so charging.time stays >= 0, localCharging() stays true and
+		// updateChargeFreeze holds the 'mpCharge' slow-motion (0.1x) forever — after a
+		// full-party wipe + revive the host's enemy block then crawls at ~1/s instead of
+		// the wilderness 15-60Hz. Clear BOTH the vanilla 'playerCharge' handle and ours.
+		try { if (p && typeof p.clearCharge === 'function') p.clearCharge(); } catch (_) { /* ignore */ }
+		this.clearChargeFreeze();
 		this._mpDeathPos = p.coll ? { x: p.coll.pos.x, y: p.coll.pos.y, z: p.coll.pos.z } : null;
 		this._mpDeathMap = (ig.game as any).mapName || '';
 		// The engine's death flow (_onDeathHit) sets coll.type to IGNORE; remember
@@ -6989,6 +6998,11 @@ export class NetSync {
 		this._mpCheckpointReloadAt = 0;
 		this._mpCheckpointForced = false;
 		this._mpCorpseHidden = false;
+		// Belt-and-braces: a revive must never resume into a held charge time-stop.
+		// (enterDeath already cleared it; this also covers a revive reached via a path
+		// that skipped enterDeath, e.g. abortDeathForTeleport re-entry.)
+		try { if (p && typeof p.clearCharge === 'function') p.clearCharge(); } catch (_) { /* ignore */ }
+		this.clearChargeFreeze();
 		// Round 21 (issue 1): 1s no-collision grace after the local player is re-placed
 		// next to a teammate mirror (this respawn repositions us). updateRemoteMirrorFade
 		// forces every mirror to IGNORE until this deadline so we can't overlap one.

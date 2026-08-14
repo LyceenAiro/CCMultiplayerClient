@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.68.1';
+export const MP_VERSION = '1.68.9';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -138,8 +138,34 @@ export class Multiplayer {
 	public isSoloInstance(): boolean {
 		try {
 			const pm = this.playerMapByName;
-			if (!pm) return false; // unknown -> not solo (keep streaming)
-			for (const k in pm) return false;
+			if (pm) { for (const k in pm) return false; }
+			// playersOnThisMap is the live mirror roster. If ANY mirror exists (even
+			// when playerMapByName was transiently emptied by a load-complete reconcile),
+			// we are NOT solo and must keep the full sync stream running.
+			const om = this.playersOnThisMap;
+			if (om) { for (const k in om) return false; }
+			// The cached instance host is authoritative for "there is at least one other
+			// player": a MEMBER always sees the HOST's name here (never its own), so this
+			// keeps the member streaming even when its changeMapResponse roster came back
+			// empty because the host's own changeMap landed a moment earlier (the exact
+			// wipe+revive race). The own host guard means a lone host still reads as solo.
+			if (this.instanceHost && this.instanceHost !== this.name) return false;
+			// HOST-side fallback for the same race: the host's own changeMapResponse roster
+			// is empty and the member's enter broadcast can be missed, but the memberMap
+			// relay (~1/s, cross-instance) still reports the member's map. In the wilderness
+			// the instance is keyed by map, so a party member reporting OUR map is in OUR
+			// instance. ~1s stale, fail-open-safe (never hides a real teammate).
+			const roster = this.partyMembers;
+			if (roster && roster.length > 1) {
+				const myMap = this.currentMapName;
+				if (myMap) {
+					for (const name of roster) {
+						if (name === this.name) continue;
+						const mm = this.memberMapByName && this.memberMapByName[name];
+						if (mm === myMap) return false;
+					}
+				}
+			}
 			return true;
 		} catch (_) { return false; }
 	}
@@ -988,9 +1014,27 @@ export class Multiplayer {
 			// departure manner (lastLeft) rides the same payload from the server.
 			this.notifyPartyRosterChange(this.partyMembers.slice(), party ? party.members.slice() : [], party && party.lastLeft);
 
+			// Capture the pre-update party state so we can detect the solo->partied
+			// transition (the no-pause swallow only guards NEW pauses, not an already
+			// open pause GUI).
+			const prevPartied = !!(this.partyMembers && this.partyMembers.length > 1);
 			this.partyMembers = party ? party.members.slice() : [];
 			this.partyLeader = party ? party.leader : undefined;
 			this.applyPartyRoster(this.partyMembers);
+			// FIX: a player can open a pause GUI (backpack/inventory/ESC) while SOLO.
+			// If a teammate then joins while that GUI is still open, setPaused(true) was
+			// already consumed and the round-10 swallow never re-fires — the host would
+			// stay paused and a visiting teammate sees every monster frozen. Un-pause on
+			// the solo->partied transition so the shared world keeps simulating.
+			if (!prevPartied && !!(this.partyMembers && this.partyMembers.length > 1)) {
+				try {
+					const g: any = ig.game;
+					if (g && g.paused) {
+						console.log('[multiplayer] party formed while paused — resuming the world');
+						g.setPaused(false);
+					}
+				} catch (_) { /* a pause fix must never break the roster handler */ }
+			}
 			if (!party) {
 				// Round 13: party disbanded/kicked -> drop every synced follower bot for
 				// good. This runs BEFORE applyPartyBots' party-size gates could skip the

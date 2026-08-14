@@ -40,6 +40,14 @@ export class OnPlayerChangeMapListener {
 			// follows immediately. No sameMap decision here (the map is stale).
 			if (this.main.loadingMap && !ig.game.isTeleporting()) {
 				if (this.main.playersOnThisMap) this.main.playersOnThisMap[player] = true;
+				// Also queue them for the load-complete reconcile. The old-map spawn below
+				// is cleared by the upcoming load, and the reconcile would otherwise rebuild
+				// an EMPTY playerMapByName (our own changeMapResponse roster was empty
+				// because the other client's changeMap landed a moment later — the
+				// wipe+revive race), dropping this member and leaving isSoloInstance()
+				// stuck true. Queueing keeps them in playerMapByName so the full sync resumes
+				// and their mirror self-heals from their playerState.
+				this.pendingSpawn[player] = { position, map: map || '' };
 				this.spawnMirror(player, position);
 				return;
 			}
@@ -161,7 +169,16 @@ export class OnPlayerChangeMapListener {
 						}
 						for (const n in pending) {
 							const rec = pending[n];
-							if (rec && (!rec.map || rec.map === myMap)) keep.add(n);
+							if (!rec) continue;
+							// A player who entered WHILE we were loading (pendingSpawn) is not
+							// in the changeMapResponse roster when their join landed after our
+							// changeMap was answered (common on a full-party wipe where each
+							// client reloads at a slightly different time). Remember their
+							// sub-map in playerMapByName too, or isSoloInstance() would think we
+							// are alone and collapse the whole sync to the ~1Hz solo beacon.
+							const pm = rec.map || myMap;
+							pmap[n] = pm;
+							if (pm === myMap) keep.add(n);
 						}
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
 						instance.main.newInstanceMembers = undefined;
