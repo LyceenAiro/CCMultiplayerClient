@@ -307,6 +307,27 @@ export class NetSync {
 				+ ' tgt=' + (tgt ? ((tgt.constructor && tgt.constructor.name) || '?') + (tgtMe ? '=PLAYER' : '') + (tgtKilled ? ':killed' : '') + (tgt._mpMirror ? ':mirror' : '') : 'null');
 		} catch (_) { return 'describe-failed'; }
 	}
+
+	// ---- ROUND 73 diagnostics (autumn path-3 ghost enemies) ----
+	/** Once-per-key log latch for the ghost-enemy hunt. A key logs exactly once per
+	 * session (no repeat spam) — use __mpGhostDump() for a full re-check anytime. */
+	private _mpGhostLogged: { [key: string]: boolean } = Object.create(null);
+	public ghostLog(tag: string, key: number | string, ...args: any[]): void {
+		try {
+			const k = tag + '|' + key;
+			if (this._mpGhostLogged[k]) return;
+			this._mpGhostLogged[k] = true;
+			console.log('[mp-ghost] ' + tag + ' ' + key, ...args);
+		} catch (_) { /* diagnostics must never break the frame */ }
+	}
+	/** The enemy's type name (guarded — reads either of the two engine fields). */
+	public ghostName(e: any): string {
+		try { return e.enemyName || (e.enemyType && (e.enemyType as any).name) || ''; } catch (_) { return ''; }
+	}
+	/** The three red "alt" variants reported on autumn path-3 / lake-observatory. */
+	public isGhostType(n: string): boolean {
+		return n === 'buffalo-alt' || n === 'hedgehog-alt' || n === 'meerkat-alt';
+	}
 	// ---- round 21 (issue 1): 1s no-collision grace after teleport / map-enter / revival ----
 	/** CLIENT-WIDE grace deadline (Date.now() + 1000). While `now < this` (or a mirror's
 	 * own _mpNoCollUntil), updateRemoteMirrorFade forces EVERY mirror's coll.type to
@@ -1788,6 +1809,16 @@ export class NetSync {
 			// to-host respawns). Mark those so (a) the member reap pass preserves them
 			// locally instead of silently killing them every host block, and (b) the
 			// sender stream broadcasts them as temporary csPuppets.
+			//
+			// ROUND 73 (autumn path-3 ghost enemies): EnemySpawner.spawnEnemy ALSO spawns
+			// with mapId 0 and NO skipHook (settings = {enemyInfo, boostable:true}), so the
+			// old check mis-flagged every spawner product (buffalo-alt / hedgehog-alt on
+			// autumn/lake-observatory) as a "story cutscene enemy". That made reapStalePuppets
+			// EXEMPT them from the mapId-0 ghost reap (they accumulated into a big horde the
+			// host never owned) AND let a member re-stream them as cutsceneEntity csPuppets
+			// (IGNORE coll + isDefeated()->false = invincible on the receiver). `boostable`
+			// is set ONLY by EnemySpawner.spawnEnemy (verified against game.compiled.js), so
+			// exclude it: genuine story cutscene enemies never carry boostable:true.
 			try {
 				const gProto: any = (ig as any).Game && (ig as any).Game.prototype;
 				if (gProto && typeof gProto.spawnEntity === 'function' && !gProto._mpSpawnWrapped) {
@@ -1799,6 +1830,7 @@ export class NetSync {
 							const Enemy = (ig.ENTITY as any).Enemy;
 							if (r && r instanceof Enemy && !r._mpMirror
 								&& !(settings && settings.skipHook)
+								&& !(settings && settings.boostable)
 								&& (r.mapId || 0) === 0) {
 								r._mpCutsceneSpawned = true;
 							}
@@ -1807,6 +1839,46 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] spawnEntity wrap failed', e); }
+
+			// ROUND 73 diagnostics (manual): dump every live ghost-type enemy on THIS client
+			// with its show/puppet state. Run on BOTH clients (`__mpGhostDump()` in the console)
+			// — paired with the host.skip / host.send / member.spawn lines in the boot log it
+			// shows exactly who owns/shows these enemies.
+			try {
+				(window as any).__mpGhostDump = () => {
+					try {
+						const m = (window as any).__mpMain;
+						const list = ig.game && ig.game.entities;
+						const Enemy = (ig.ENTITY as any).Enemy;
+						const out: any[] = [];
+						if (list) {
+							for (let i = 0; i < list.length; i++) {
+								const e: any = list[i];
+								if (!e || !(e instanceof Enemy) || e._killed) continue;
+								const n = e.enemyName || (e.enemyType && (e.enemyType as any).name) || '';
+								if (n !== 'buffalo-alt' && n !== 'hedgehog-alt' && n !== 'meerkat-alt') continue;
+								out.push({
+									type: n,
+									uid: e.uid,
+									mapId: e.mapId || 0,
+									shownId: e.id,
+									hidden: String(e._hidden),
+									hideReq: !!e._hideRequest,
+									puppet: !!e._mpPuppet,
+									mirror: !!e._mpMirror,
+									mpUid: e._mpUid || 0,
+									cond: (e.settings && e.settings.spawnCondition) || '(none)',
+									hp: e.params ? Math.round(e.params.currentHp || 0) : -1,
+									pos: Math.round(e.coll.pos.x) + ',' + Math.round(e.coll.pos.y),
+								});
+							}
+						}
+						console.log('[mp-ghost] DUMP host=' + (m && !!m.host) + ' map=' + (ig.game && ig.game.mapName)
+							+ ' entities=' + (list ? list.length : -1) + ' found=' + out.length);
+						if (out.length) console.table(out);
+					} catch (e2) { console.warn('[mp-ghost] dump failed', e2); }
+				};
+			} catch (e) { console.warn('[netsync] __mpGhostDump install failed', e); }
 
 			// HOST-side: let enemies actually target remote players' mirrors. The engine's
 			// target selection is hardcoded to ig.game.playerEntity + sc.party.currentParty
@@ -5179,6 +5251,26 @@ export class NetSync {
 			// in the block or members would reap (kill) its puppet and lose the adopted map
 			// enemy. We keep streaming it (frozen in place) so the puppet survives.
 			if (e._mpMirror || e._killed || !e.coll) continue;
+			// ROUND 73 (fix 2c — autumn path-3 ghost enemies): an enemy that was never
+			// FULLY initialized on the host must not enter the block. The engine's
+			// spawnEntity returns null BEFORE show() when an entity's spawnCondition is
+			// false, leaving the quest-wave enemies (buffalo-alt/hedgehog-alt, mapId
+			// 401-448) in ig.game.entities with _hidden undefined, NO `settings` AND —
+			// per the live dumps — NO `params` either (initEntity never ran, so the
+			// entity has no stats at all; they can also end up hidden, id=0/_hidden=true,
+			// still without params). `!e.params` is the reliable zombie test: a real
+			// enemy ALWAYS has params; a burrowed/phased one keeps them, so the burrow
+			// sync (hd:1) is untouched. A skipped zombie re-enters the block by itself
+			// if the quest later shows + initializes it.
+			if (e._hidden === undefined || !e.params) {
+				if (this.isGhostType(this.ghostName(e))) {
+					this.ghostLog('host.skip', e.uid, this.ghostName(e), 'mapId=' + (e.mapId || 0), 'id=' + e.id, 'params=' + (e.params ? 1 : 0));
+				}
+				continue;
+			}
+			if (this.isGhostType(this.ghostName(e))) {
+				this.ghostLog('host.send', e.uid, this.ghostName(e), 'id=' + e.id, 'hidden=' + e._hidden);
+			}
 			if (e.target) continue; // hostile enemies live in the hostile stream
 			this.emitAttackEdgesFor(e); // no-op while unengaged (gated on e.target)
 			this.encodeEnemy(e, out, liveUids, this._mpLastBaseEncoded, forceFull);
@@ -5216,6 +5308,17 @@ export class NetSync {
 			const e: any = list[i];
 			if (!(e instanceof Enemy)) continue;
 			if (e._mpMirror || e._killed || !e.coll) continue;
+			// ROUND 73 (fix 2c): never-initialized zombies stay out of this stream too
+			// (see the base stream's comment — same _hidden-undefined / !params test).
+			if (e._hidden === undefined || !e.params) {
+				if (this.isGhostType(this.ghostName(e))) {
+					this.ghostLog('host.skip', e.uid, this.ghostName(e), 'mapId=' + (e.mapId || 0), 'id=' + e.id, 'params=' + (e.params ? 1 : 0));
+				}
+				continue;
+			}
+			if (this.isGhostType(this.ghostName(e))) {
+				this.ghostLog('host.send', e.uid, this.ghostName(e), 'id=' + e.id, 'hidden=' + e._hidden);
+			}
 			if (!e.target) continue; // idle enemies live in the base stream
 			this.emitAttackEdgesFor(e);
 			this.encodeEnemy(e, out, liveUids, this._mpLastHostileEncoded, forceFull);
@@ -5916,8 +6019,12 @@ export class NetSync {
 					// Sync the level index first — on a lockEntity'd entity, z writes
 					// bypass moveEntityZ (the normal level/floor setter), so a stale level
 					// would make updateBaseZPos look up the wrong floor.
+					// ROUND: round z before the level lookup. The lerp above converges
+					// zProtected GEOMETRICALLY toward the integer _mpToZ, so it settles at
+					// e.g. 15.999… instead of exactly 16 — getLevelIdx(15.999…) then returns
+					// the LOWER floor and the shadow stays pinned to the entry height.
 					try {
-						const lvl = (ig as any).game.getLevelIdx(pz);
+						const lvl = (ig as any).game.getLevelIdx(Math.round(pz));
 						if (typeof lvl === 'number' && lvl !== c.level) c.level = lvl;
 					} catch (_) { /* ignore */ }
 					// ROUND 31 (item 4): updateBaseZPos reads getGroundEntry/holeInfo off
@@ -7958,6 +8065,11 @@ export class NetSync {
 		if (s.mi) e = (mapEnemyIdx && mapEnemyIdx[s.mi]) || this.findMapEnemy(s.mi); // adopt our own typed map enemy
 		if (!e && s.t) e = this.spawnTypedPuppet(s);  // fallback: spawn from the block's type
 		if (!e) return null;
+
+		// ROUND 73 diagnostics: log ghost-type puppet creation (once per host uid).
+		if (!e._mpPuppet && this.isGhostType(s.t)) {
+			this.ghostLog('member.spawn', s.i, s.t, 'mi=' + s.mi, 'hd=' + s.hd, 'mapId=' + (e.mapId || 0));
+		}
 
 		// Bind the host's uid onto this entity so future blocks find it in O(1) and the
 		// cull pass recognises it as host-owned.
