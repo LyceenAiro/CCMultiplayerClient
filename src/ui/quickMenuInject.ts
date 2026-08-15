@@ -503,11 +503,13 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 const m = getMain();
                 if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername) return;
                 if (this._mpFriendAction === 'contact') {
-                    // 联系: close the quick menu and enter the private chat channel
-                    // with this friend (input focused, ready to type).
+                    // 联系: leave the quick-menu SUB-STATE the same way a native item
+                    // use does (sc.model.enterRunning) — QuickMenu only reacts to the
+                    // game-model sub-state change, and calling quickmodel.exitQuickMenu
+                    // directly left the analysis window visible/stuck on screen.
                     try {
-                        const qm = scAny.quickmodel;
-                        if (qm && typeof qm.exitQuickMenu === 'function') qm.exitQuickMenu();
+                        const mdl = scAny.model;
+                        if (mdl && typeof mdl.enterRunning === 'function') mdl.enterRunning();
                     } catch (_) { /* ignore */ }
                     openPrivateChannel(this._mpUsername, true);
                     console.log('[multiplayer] quick-menu: opening private chat with ' + this._mpUsername);
