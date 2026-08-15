@@ -6,6 +6,7 @@ import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
 import { installChatBox } from './ui/chatBox';
 import { installItemUseIndicators } from './ui/itemUseIndicator';
+import { installHealSync } from './ui/healSync';
 import { installVersionDisplay } from './ui/versionDisplay';
 
 /**
@@ -76,6 +77,10 @@ async function startMultiplayer(): Promise<void> {
 		// ROUND 95: item-use indicators — other players see the item icon pop above
 		// our head when we use a consumable (and vice versa).
 		installItemUseIndicators(() => multiplayer);
+
+		// ROUND 99: healing jump-numbers — other players see our green +N heals
+		// (and vice versa).
+		installHealSync(() => multiplayer);
 
 		// Round 23 wave 5: network-quality diamond badges on the party-HUD portraits
 		// and the element-mode indicator, with hover tooltips (ping/loss, name+level).

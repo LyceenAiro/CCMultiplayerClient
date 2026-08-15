@@ -912,6 +912,12 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('itemUse', { item });
 	}
 
+	// ROUND 99: any client -> its instance — the local player healed; every other
+	// same-instance client spawns a green +N healing number above the user's mirror.
+	public playerHeal(amount: number): void {
+		this.syncEmit('playerHeal', { amount });
+	}
+
 	// ROUND 74 (plant destruct sync): any client -> its instance — the local player just
 	// destroyed a map destructible; every other same-instance client destroys its own copy
 	// at the same mapId (see NetSync.applyPlantBreak). syncEmit: solo-instance skip.
@@ -1153,6 +1159,14 @@ export class SocketIoConnector implements IConnection {
 			if (data && typeof data.player === 'string'
 				&& (typeof data.item === 'string' || typeof data.item === 'number')) {
 				callback(data.player, data.item);
+			}
+		});
+	}
+	/** ROUND 99: a same-instance player healed — spawn a green +N above their mirror. */
+	public onPlayerHeal(callback: (player: string, amount: number) => void): void {
+		this.socket.on('playerHeal', (data: any) => {
+			if (data && typeof data.player === 'string' && typeof data.amount === 'number') {
+				callback(data.player, data.amount);
 			}
 		});
 	}

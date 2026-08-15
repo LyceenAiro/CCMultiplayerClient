@@ -3,6 +3,7 @@ import { ILootDrop } from '../connection';
 import { t } from '../i18n';
 import { isSharedTownNow } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
+import { showRemoteHeal } from '../ui/healSync';
 
 /**
  * New sync system — whole-state broadcast, replacing the original mod's per-entity
@@ -530,6 +531,8 @@ export class NetSync {
 		conn.onSoundStop((player) => this.applySoundStop(player));
 		// ROUND 95: a remote player used an item — pop the item icon above their head.
 		if (typeof conn.onItemUse === 'function') conn.onItemUse((player, item) => showItemUse(player, item));
+		// ROUND 99: a remote player healed — spawn their green +N healing jump-number.
+		if (typeof conn.onPlayerHeal === 'function') conn.onPlayerHeal((player, amount) => showRemoteHeal(player, amount));
 		// ROUND 74 (plant destruct sync): a same-instance player destroyed a plant — destroy
 		// our own copy at the same mapId (vanilla chain, idempotent). Guarded like
 		// onSkillSound so a mixed client/server pair never crashes.

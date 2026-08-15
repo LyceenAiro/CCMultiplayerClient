@@ -337,6 +337,11 @@ export interface IConnection {
     /** ROUND 95: a same-instance player used an item (server-relayed, sender
      * excluded). Show the item icon above that player's head. */
     onItemUse(callback: (player: string, item: string | number) => void): void;
+    /** ROUND 99: the local player healed — relay the amount so other players can
+     * spawn the same green +N jump-number above our mirror. */
+    playerHeal(amount: number): void;
+    /** ROUND 99: a same-instance player healed — show the green +N jump-number. */
+    onPlayerHeal(callback: (player: string, amount: number) => void): void;
     /** ROUND 74 (plant destruct sync): a same-instance player destroyed a plant (see
      * plantBreak) — destroy OUR copy at the same mapId if it is still intact (vanilla
      * chain: dropped anim + FX + our own drop rolls + propsDestroyed count + respawn
