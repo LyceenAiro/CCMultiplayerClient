@@ -1401,6 +1401,14 @@ export class SocketIoConnector implements IConnection {
 			}
 		});
 	}
+	/** ROUND 96: our own party transition (join / leave / kicked) from the server. */
+	public onPartySelfEvent(callback: (event: 'join' | 'leave' | 'kicked') => void): void {
+		this.socket.on('partySelfEvent', (data: any) => {
+			if (data && (data.event === 'join' || data.event === 'leave' || data.event === 'kicked')) {
+				callback(data.event);
+			}
+		});
+	}
 	public onPartyInvite(callback: (from: string, partyId: string) => void): void {
 		this.socket.on('partyInvite', (data: any) => callback(data.from, data.partyId));
 	}

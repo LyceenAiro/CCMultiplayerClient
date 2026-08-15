@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.24';
+export const MP_VERSION = '1.70.25';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1210,6 +1210,20 @@ export class Multiplayer {
 						: info.reason === 'disconnected' ? 'partyMemberDisconnected'
 						: 'partyMemberLeft';
 					showMpToast({ title: t(key).replace('{name}', info.name) });
+				} catch (_) { /* ignore */ }
+			});
+		}
+
+		// ROUND 96: our OWN party transitions (join / leave / kicked). The roster-diff
+		// path above only announces other members, and the disband/null paths carry no
+		// self state at all — the server sends these explicitly to the affected player.
+		if (typeof (conn as any).onPartySelfEvent === 'function') {
+			safeWire((conn as any).onPartySelfEvent.bind(conn), (event: string) => {
+				try {
+					const key = event === 'join' ? 'partySelfJoined'
+						: event === 'kicked' ? 'partySelfKicked'
+						: 'partySelfLeft';
+					showMpToast({ title: t(key) });
 				} catch (_) { /* ignore */ }
 			});
 		}

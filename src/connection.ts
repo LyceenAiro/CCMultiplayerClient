@@ -387,6 +387,9 @@ export interface IConnection {
      * partyUpdate null alone cannot express. `{name, reason}` matches lastLeft
      * ('left' | 'kicked' | 'disconnected'); toast it like a normal roster change. */
     onPartyMemberLeft(callback: (info: { name: string, reason?: string }) => void): void;
+    /** ROUND 96: the SERVER tells US about our own party transition — join / leave /
+     * kicked. The roster-diff toast path only announces OTHER members. */
+    onPartySelfEvent(callback: (event: 'join' | 'leave' | 'kicked') => void): void;
     onPartyInvite(callback: (from: string, partyId: string) => void): void;
     onPartyMove(callback: (data: { leader?: string, map?: string, pos?: Vec3 }) => void): void;
     // Server nudge to re-assert our current instance (e.g. after someone joined

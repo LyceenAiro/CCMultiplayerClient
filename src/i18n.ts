@@ -152,6 +152,10 @@ const enDict: { [key: string]: string } = {
     partyMemberLeft: '{name} left the party',
     partyMemberKicked: '{name} was kicked from the party',
     partyMemberDisconnected: '{name} disconnected from the party',
+    // ROUND 96 — self party transitions (partySelfEvent)
+    partySelfJoined: 'You joined the party',
+    partySelfLeft: 'You left the party',
+    partySelfKicked: 'You were kicked from the party',
     // round 23 wave 4 — chat (chatBox.ts)
     chatPlaceholder: 'Type a message, Enter to send…',
     chatSend: 'Send',
@@ -351,6 +355,10 @@ const zhDict: { [key: string]: string } = {
     partyMemberLeft: '{name} 离开了队伍',
     partyMemberKicked: '{name} 被踢出了队伍',
     partyMemberDisconnected: '{name} 断线离开了队伍',
+    // ROUND 96 — self party transitions (partySelfEvent)
+    partySelfJoined: '你已加入队伍',
+    partySelfLeft: '你已退出队伍',
+    partySelfKicked: '你已被踢出队伍',
     // round 23 wave 4 — party chat (chatBox.ts)
     chatPlaceholder: '输入消息，回车发送…',
     chatSend: '发送',
