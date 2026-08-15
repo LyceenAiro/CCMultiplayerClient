@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.16';
+export const MP_VERSION = '1.70.17';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -484,8 +484,6 @@ export class Multiplayer {
 		Object.defineProperty(protectedPos, 'x', { get() { return protectedPos.xProtected; }, set() { return; } });
 		Object.defineProperty(protectedPos, 'y', { get() { return protectedPos.yProtected; }, set() { return; } });
 		Object.defineProperty(protectedPos, 'z', { get() { return protectedPos.zProtected; }, set() { return; } });
-		Object.defineProperty(entity.coll, 'pos',
-			{ get() { return protectedPos; }, set() { /* network-driven: drop physics writes */ } });
 
 		// ROUND 80 (collision-map fix): replacing coll.pos with a protected object
 		// bypasses coll.setPos(), so the impact.js spatial hash keeps the coll
@@ -496,14 +494,33 @@ export class Multiplayer {
 		// swung straight through members, and member balls passed through puppets
 		// while the host's mirrored ball still connected (the 0~1 host-side hits).
 		// Re-bucket the entry NOW so the lock's own position change takes effect.
+		// ROUND 88: remove from the OLD position BEFORE swapping in the protected
+		// pos — removeFromCollMap computes cells from coll.pos, so removing after
+		// the swap would look in the NEW cell and leave a stale entry at the spawn
+		// cell (the same trail leak the reindexer now prevents).
+		const collRaw: any = entity.coll;
+		const physRaw: any = (ig as any).game && (ig as any).game.physics;
+		if (collRaw && collRaw._inCollisionMap && physRaw && typeof physRaw.removeFromCollMap === 'function') {
+			try { physRaw.removeFromCollMap(collRaw); } catch (_) { /* ignore */ }
+		}
+		Object.defineProperty(entity.coll, 'pos',
+			{ get() { return protectedPos; }, set() { /* network-driven: drop physics writes */ } });
+
 		try {
-			const coll: any = entity.coll;
-			const phys: any = (ig as any).game && (ig as any).game.physics;
-			if (coll && coll._inCollisionMap && phys
-				&& typeof phys.removeFromCollMap === 'function'
-				&& typeof phys.addToCollMap === 'function') {
-				phys.removeFromCollMap(coll);
-				phys.addToCollMap(coll);
+			if (collRaw && physRaw && typeof physRaw.addToCollMap === 'function') {
+				try { physRaw.addToCollMap(collRaw); } catch (_) { /* ignore */ }
+			}
+			// ROUND 88 (collision-map leak fix): remember the bucket position we just
+			// added the coll at. netSync's reindexer removes the entry at THIS recorded
+			// position before re-adding at the new network position — removing by the
+			// coll's CURRENT pos would miss the old cell every time a locked entity
+			// crossed a cell boundary, leaving a trail of stale hash entries behind
+			// (the hours-long FPS/ping degradation).
+			if (collRaw) {
+				try {
+					collRaw._mpCollMapX = collRaw.pos.x;
+					collRaw._mpCollMapY = collRaw.pos.y;
+				} catch (_) { /* ignore */ }
 			}
 		} catch (_) { /* the map is rebuilt on the next setPos anyway */ }
 

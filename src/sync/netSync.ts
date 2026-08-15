@@ -195,6 +195,11 @@ export class NetSync {
 	private _mpProjSendTimer = 0;
 	/** Round 62: stale-reap accumulator for visual projectile copies (member side). */
 	private _mpProjReapTimer = 0;
+	/** ROUND 88 (collision-map leak fix): periodic sweep accumulator. Every few
+	 * seconds the impact.js spatial hash is cleaned of entries whose
+	 * `_inCollisionMap` flag is false — the exact stale trail left by a locked
+	 * coll that crossed a cell boundary before the tracked-bucket reindex. */
+	private _mpCollSweepTimer = 0;
 	/** Round 19: last-seen timestamp per cutscene-entity stream owner (username).
 	 * An owner whose stream stops for >2s has its csPuppets reaped as orphans
 	 * (left the map / disconnected). */
@@ -4982,6 +4987,14 @@ export class NetSync {
 			// (remote-player mirrors exist on the HOST and members alike) are both
 			// handled inside interpolatePuppets.
 			this.interpolatePuppets();
+			// ROUND 88 (collision-map leak fix): periodically purge any stale
+			// (already-removed) entries still sitting in the spatial hash so the
+			// collision map can never grow unbounded over a long stay in one area.
+			this._mpCollSweepTimer += ig.system.tick;
+			if (this._mpCollSweepTimer >= 5) {
+				this._mpCollSweepTimer = 0;
+				this._mpSweepStaleCollEntries();
+			}
 			// Round 14 (fix 5): advance member-side delayed-death FX (boom + silent kill).
 			this.processDeathQueue();
 			// ROUND 27 (item 4): the round-26 PURELY LOCAL member-side monster-hit
@@ -6382,15 +6395,95 @@ export class NetSync {
 	 * melee TACKLEs and ball touches. This re-buckets a moved entry at its CURRENT
 	 * position. Only entries already in the map are touched; hidden/PASSIVE entries
 	 * (untracked, _inCollisionMap=false) stay untracked.
+	 * ROUND 88 (collision-map leak fix): the previous implementation called the
+	 * engine's removeFromCollMap while the coll's pos already reported the NEW
+	 * position — once a network entity crossed a 64px cell boundary, removal
+	 * looked in the wrong cell, leaving a stale entry in the OLD cell forever.
+	 * Every hour of movement laid a growing trail of stale entries; map switches
+	 * rebuilt the hash, which is why they "fixed" the slowdown. The old bucket is
+	 * now remembered on the coll (_mpCollMapX/_mpCollMapY) and removed at THOSE
+	 * coordinates before the coll is added at its current position.
 	 */
 	private _mpReindexColl(e: any): void {
 		try {
-			if (!e || e._killed || !e.coll || !e.coll._inCollisionMap) return;
+			if (!e || e._killed || !e.coll) return;
+			const c: any = e.coll;
 			const phys: any = (ig as any).game && (ig as any).game.physics;
-			if (!phys || typeof phys.removeFromCollMap !== 'function' || typeof phys.addToCollMap !== 'function') return;
-			phys.removeFromCollMap(e.coll);
-			phys.addToCollMap(e.coll);
+			if (!phys || !phys.collEntryMap || typeof phys.addToCollMap !== 'function') return;
+			const oldX: number = c._mpCollMapX;
+			const oldY: number = c._mpCollMapY;
+			if (typeof oldX === 'number' && typeof oldY === 'number') {
+				this._mpRemoveCollAt(c, oldX, oldY);
+			} else if (c._inCollisionMap && typeof phys.removeFromCollMap === 'function') {
+				// First reindex after a legacy add (pre-tracking): best effort.
+				try { phys.removeFromCollMap(c); } catch (_) { /* ignore */ }
+			}
+			c._mpCollMapX = c.pos.x;
+			c._mpCollMapY = c.pos.y;
+			// Mirror addToCollMap's own gate (it only skips NONE/PASSIVE). IGNORE is
+			// deliberately kept: the engine's setType also keeps IGNORE bucketed.
+			if (!c._inCollisionMap && c.type !== (ig as any).COLLTYPE.NONE && c.type !== (ig as any).COLLTYPE.PASSIVE) {
+				try { phys.addToCollMap(c); } catch (_) { /* ignore */ }
+			}
 		} catch (_) { /* a failed re-bucket must never break the frame */ }
+	}
+
+	/** ROUND 88: remove a coll from the impact.js spatial hash at an EXPLICIT old
+	 * bucket position (the engine's own cell math, but without reading coll.pos). */
+	private _mpRemoveCollAt(c: any, x: number, y: number): void {
+		try {
+			const phys: any = (ig as any).game && (ig as any).game.physics;
+			const map: any = phys && phys.collEntryMap;
+			if (!map || !map.length) return;
+			const cs: number = phys.cellSize || 64;
+			const padX: number = (c.padding ? c.padding.x : 0) * 2;
+			const padY: number = (c.padding ? c.padding.y : 0) * 2;
+			const x0: number = Math.max(0, Math.floor((x - padX) / cs));
+			const y0: number = Math.max(0, Math.floor((y - padY) / cs));
+			const x1: number = Math.min(map.width, Math.floor((x + c.size.x + padX) / cs) + 1);
+			const y1: number = Math.min(map.height, Math.floor((y + c.size.y + padY) / cs) + 1);
+			for (let cx = x1; cx-- > x0;) {
+				for (let cy = y1; cy-- > y0;) {
+					const cell: any = map[cx] && map[cx][cy];
+					if (!cell) continue;
+					const idx: number = cell.indexOf(c);
+					if (idx !== -1) cell.splice(idx, 1);
+				}
+			}
+			c._inCollisionMap = false;
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 88 (collision-map leak fix): purge spatial-hash cells of entries whose
+	 * `_inCollisionMap` is false (stale trails from cell crossings before tracked
+	 * re-bucketing). Every cell is touched once per sweep — a full map is a few
+	 * thousand cells, so a 5s cadence is effectively free. */
+	private _mpSweepStaleCollEntries(): void {
+		try {
+			const phys: any = (ig as any).game && (ig as any).game.physics;
+			const map: any = phys && phys.collEntryMap;
+			if (!map || !map.length) return;
+			let removed = 0;
+			for (let cx = 0; cx < map.width; cx++) {
+				const col: any = map[cx];
+				if (!col) continue;
+				for (let cy = 0; cy < map.height; cy++) {
+					const cell: any = col[cy];
+					if (!cell || !cell.length) continue;
+					for (let i = cell.length - 1; i >= 0; i--) {
+						const c: any = cell[i];
+						if (c && c._inCollisionMap === false) { cell.splice(i, 1); removed++; }
+					}
+				}
+			}
+			if (removed > 0) {
+				const last: number = (this as any)._mpCollSweepLogAt || 0;
+				if (Date.now() - last > 10000) {
+					(this as any)._mpCollSweepLogAt = Date.now();
+					console.log('[netsync] collision-map sweep removed ' + removed + ' stale entries');
+				}
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	/** ROUND 80: mark an entity whose locked coll position was written directly so
@@ -6757,9 +6850,14 @@ export class NetSync {
 					} catch (_) { /* ignore */ }
 					// ROUND 80: setType keeps the spatial hash consistent with the
 					// collision-type flip (IGNORE <-> base), unlike a raw type write.
+					// ROUND 88: clean the OLD tracked bucket before the flip and
+					// re-bucket under the new type afterwards, so the type flip can
+					// never leave a stale hash entry behind either.
 					try {
+						this._mpReindexColl(e);
 						if (e.coll && typeof e.coll.setType === 'function') e.coll.setType(targetColl);
 						else if (e.coll) e.coll.type = targetColl;
+						this._mpReindexColl(e);
 					} catch (_) { /* ignore */ }
 				}
 			}
