@@ -87,12 +87,20 @@ function tryShowItemUse(player: string, item: string | number): boolean {
         log('no mirror yet for ' + player + ' — queued');
         return false;
     }
-    // FoodIconEntity attaches itself to the target's action-attached list, so
-    // the target must be an actor entity (player mirrors / enemies are).
-    if (typeof ent.addActionAttached !== 'function') {
-        log('mirror for ' + player + ' has no addActionAttached — cannot attach food icon');
-        return true; // unrecoverable for this mirror; don't retry forever
-    }
+
+    // FoodIconEntity attaches itself to the target's action-attached list and
+    // kills itself when the target's current action is cleared. That is correct
+    // for the EATING player (the food icon lives inside the consume action), but
+    // on an observer the remote MIRROR's action is replaced every time the
+    // playerState animation changes (playAnim -> setAction -> clearActionAttached),
+    // so a directly-attached FoodIcon was killed before it could be seen.
+    // Give FoodIcon a lightweight stand-in that still points at the mirror's coll
+    // (so it follows the head) but has no action-attached lifecycle.
+    const standIn: any = {
+        coll: ent.coll,
+        addActionAttached: (): void => { /* intentionally unattached */ },
+        removeActionAttached: (): boolean => true,
+    };
 
     const FoodIcon: any = (sc as any).FoodIconEntity;
     if (!FoodIcon) {
@@ -116,7 +124,7 @@ function tryShowItemUse(player: string, item: string | number): boolean {
         if (old.player === player) killIcon(old);
     }
 
-    const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: ent });
+    const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: standIn });
     if (!fx) {
         log('spawn failed for ' + player);
         return false; // retry — a null spawn is usually a one-frame fluke

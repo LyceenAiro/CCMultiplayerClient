@@ -1701,13 +1701,15 @@ export class NetSync {
 				// below). PVP-duel isolation and the dead-corpse guard remain.
 				try {
 					(ig.ENTITY as any).Player.inject({
-						// Round 14 (fix 3): while partied the menus no longer pause the world
-						// (the setPaused swallow above), so ig.game.isControlBlocked() stays
-						// FALSE with SHIFT/ESC/TAB open and the local player keeps moving /
-						// attacking behind the menu. gatherInput() is the single input choke
-						// point (it returns the shared input object the engine reads), so zero
-						// the movement/attack axes whenever a menu substate is up — only for an
-						// online party (solo players keep the engine's own pause semantics).
+						// Round 14 (fix 3): while partied (and since ROUND 98: while in a
+						// shared town) the menus no longer pause the world (the setPaused
+						// swallow above), so ig.game.isControlBlocked() stays FALSE with
+						// SHIFT/ESC/TAB open and the local player keeps moving / attacking
+						// behind the menu. gatherInput() is the single input choke point
+						// (it returns the shared input object the engine reads), so zero the
+						// movement/attack axes whenever a menu substate is up — for an online
+						// party OR a connected shared-town session (solo players keep the
+						// engine's own pause semantics).
 						// NOT wrapping isPlayerControlBlocked / isControlBlocked — verified they
 						// break quick-menu open and element swapping.
 						gatherInput(this: any) {
@@ -1716,7 +1718,11 @@ export class NetSync {
 								const m: any = (window as any).__mpMain;
 								const connOk = !!(m && m.connection && m.connection.isOpen && m.connection.isOpen());
 								const partied = !!(m && m.partyMembers && m.partyMembers.length > 1);
-								if (connOk && partied) {
+								// ROUND 98: shared towns use the same no-pause + input-block
+								// combination as parties — menus stay open but movement/attack
+								// axes are zeroed while any menu substate is up.
+								const inTown = connOk && isSharedTownNow();
+								if (connOk && (partied || inTown)) {
 									const mdl: any = (sc as any).model;
 									if (mdl && ((mdl.isMenu && mdl.isMenu())
 										|| (mdl.isQuickMenu && mdl.isQuickMenu())
