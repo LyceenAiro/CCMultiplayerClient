@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.11';
+export const MP_VERSION = '1.70.12';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -68,6 +68,12 @@ export class Multiplayer {
 	 *  onPlayerChangeMap's loadingComplete, updated on enters/leaves). A later
 	 *  netSync gate consumes it. */
 	public playersOnThisMap: { [name: string]: boolean } = {};
+	/** ROUND 83: true once a map-load's roster reconcile has run. While false (map
+	 * still loading / first-load window) the stale-state gates fail open so unknown
+	 * members can self-heal; once true, a name NOT in playersOnThisMap is dropped
+	 * even when the roster is empty — this is what stops a departed/fading mirror
+	 * (and its name tag) from being resurrected by a stale playerState. */
+	public playersRosterReady = false;
 	/** Main-city refactor: the SUB-MAP each instance member is currently on
 	 *  (username -> mapName). A town instance spans a whole area, so members on a
 	 *  DIFFERENT sub-map must not be mirrored; onPlayerChangeMap seeds this from the
@@ -555,6 +561,16 @@ export class Multiplayer {
 		for (const name in this.players) {
 			const player = this.players[name];
 			if (!player) continue;
+			// ROUND 83: once the roster is settled, a record that is NOT in
+			// playersOnThisMap is stale — never safety-net-spawn it. (Fading-out
+			// mirrors keep their entity until the leave-fade timer removes them.)
+			if (this.playersRosterReady && this.playersOnThisMap && !this.playersOnThisMap[name]) {
+				if (!player.entity) {
+					this.players[name] = undefined;
+					delete this.players[name];
+				}
+				continue;
+			}
 			// Safety net: if the map has finished loading but this player's mirror was
 			// never spawned (entered during the load), spawn it now at its last known
 			// position so they're not permanently invisible. ROUND 82: a door/teleport
@@ -1666,6 +1682,12 @@ export class Multiplayer {
 	 * netSync -> mpOptions import cycle. */
 	public wipeTags(): void {
 		try { wipeAllNameTags(); } catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 83: drop ONE remote player's cached name tag. Routed through here so
+	 * netSync can clear a stale tag without importing mpOptions (import cycle). */
+	public dropRemoteTag(name: string): void {
+		try { dropNameTag(name); } catch (_) { /* ignore */ }
 	}
 
 	/** Round 21: the host enemy-block tick interval (seconds) from the options tab
@@ -3551,6 +3573,9 @@ export class Multiplayer {
 		this.botMapByName = {};
 		this.playerMapByName = {};
 		this.playersOnThisMap = {};
+		// ROUND 83: a fresh session starts pre-reconcile; drop door fade-in flags too.
+		this.playersRosterReady = false;
+		this.pendingFadeIn = Object.create(null);
 		// Round 22: drop every cached name tag so the module-level tag cache can't
 		// leak into the next session (they project the old session's mirrors).
 		try { wipeAllNameTags(); } catch (_) { /* ignore */ }

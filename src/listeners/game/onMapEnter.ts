@@ -19,6 +19,17 @@ export class OnMapEnterListener {
 	public onMapEnter(data: sc.MapModel.Map): void {
 		this.loadEntity('multiplayer');
 
+		// ROUND 83 (item: local map-change mirror cleanup): clearMap() kills the old
+		// map's entities, but if the roster reconcile below is ever skipped (a
+		// changeMapResponse that lands after loadingComplete, a direct loadLevel, or a
+		// same-instance sub-room hop), the stale player records survive and a later
+		// playerState can respawn off-map mirrors. The OTHER players' transitions don't
+		// need this because the server pushes explicit enters/leaves events for them —
+		// which is exactly the asymmetry that was reported. So on OUR OWN real map
+		// change, remove every remote-player entry that is not already known to be on
+		// the TARGET map BEFORE the level loads.
+		this.cleanupStaleMirrorsForMapChange();
+
 		const pending = this.main.pendingChangeMap;
 		this.main.pendingChangeMap = undefined;
 
@@ -66,6 +77,46 @@ export class OnMapEnterListener {
 				this.main.newInstanceMembers = (result.members || []).map((mm: any) => ({ name: mm.name, map: mm.map }));
 			}).catch(() => { /* keep current flag */ });
 		}
+	}
+
+	/**
+	 * ROUND 83: on OUR OWN real map change, drop remote-player mirrors that are not
+	 * known to be on the target sub-map. Known maps come from playerMapByName (kept
+	 * fresh by every relayed changeMap + roster reconcile). Same-map reloads are
+	 * skipped so checkpoint reloads keep their live mirrors; the follow-up
+	 * loadingComplete reconcile remains authoritative when the roster is available.
+	 */
+	private cleanupStaleMirrorsForMapChange(): void {
+		try {
+			this.main.playersRosterReady = false;
+			// A late changeMapResponse from the PREVIOUS transition must never be
+			// consumed as this load's roster — onMapEnter's pending.then below repopulates
+			// it for the in-flight transition.
+			this.main.newInstanceMembers = undefined;
+			const g: any = ig.game;
+			const targetMap = g && (g.mapName || '');
+			const prevMap = g && (g.previousMap || '');
+			if (typeof prevMap !== 'string' || !prevMap || prevMap === targetMap) return;
+			const pmap = this.main.playerMapByName || {};
+			let removed = 0;
+			for (const name in this.main.players) {
+				const p = this.main.players[name];
+				if (!p) continue;
+				const knownMap = pmap[name];
+				if (knownMap && knownMap === targetMap) continue;
+				if (p.entity && !(p.entity as any)._killed) {
+					try { (p.entity as any).kill(true); } catch (_) { /* ignore */ }
+				}
+				try { delete this.main.pendingFadeIn[name]; } catch (_) { /* ignore */ }
+				delete this.main.players[name];
+				this.main.players[name] = undefined;
+				removed++;
+			}
+			if (removed > 0) {
+				console.log('[multiplayer] map-change cleanup removed ' + removed + ' off-map mirror record(s) for ' + targetMap);
+				try { this.main.wipeTags(); } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* never break a map load */ }
 	}
 
 	/** MEMBER-side: remove Enemy + EnemySpawner entities from the level data BEFORE

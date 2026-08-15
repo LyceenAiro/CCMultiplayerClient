@@ -8031,7 +8031,18 @@ export class NetSync {
 		// block legitimate mirrors.
 		try {
 			const onMap: any = (this.main as any).playersOnThisMap;
-			if (onMap && !onMap[player] && Object.keys(onMap).length > 0) return;
+			if (onMap) {
+				// ROUND 83: before the first roster reconcile (playersRosterReady false)
+				// an empty roster fails open so unknown members can self-heal. Once the
+				// roster is settled, absence from playersOnThisMap is authoritative —
+				// even for an empty room — so a departed/fading mirror can never be
+				// resurrected by a stale playerState.
+				const ready = !!(this.main as any).playersRosterReady;
+				if (!onMap[player] && (ready || Object.keys(onMap).length > 0)) {
+					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
+					return;
+				}
+			}
 		} catch (_) { /* ignore */ }
 		// Main-city refactor: a town instance spans a whole AREA, so a member on a
 		// DIFFERENT sub-map also streams playerState to us (broadcastToInstance reaches
@@ -8042,7 +8053,13 @@ export class NetSync {
 			const pmap: any = (this.main as any).playerMapByName;
 			if (pmap && pmap[player] !== undefined) {
 				const myMap = (ig.game && (ig.game as any).mapName) || '';
-				if (pmap[player] !== myMap) return;
+				if (pmap[player] !== myMap) {
+					// ROUND 83: the player moved to another sub-map — their relayed state is
+					// off-map, so also clear any stale name tag that a missed leave event
+					// would otherwise leave floating.
+					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
+					return;
+				}
 			}
 		} catch (_) { /* ignore */ }
 		let pl = this.main.players[player];

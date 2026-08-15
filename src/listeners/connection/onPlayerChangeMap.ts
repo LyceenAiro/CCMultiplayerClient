@@ -200,6 +200,9 @@ export class OnPlayerChangeMapListener {
 					const roster = instance.main.newInstanceMembers;
 					const keep = new Set<string>();
 					const myMap = ig.game ? (ig.game as any).mapName : '';
+					const prevMap = (ig.game && (ig.game as any).previousMap) || '';
+					const realChange = typeof prevMap === 'string' && !!prevMap && prevMap !== myMap;
+					const prevPmap = instance.main.playerMapByName || {};
 					const pmap: { [k: string]: string } = {};
 					if (roster !== undefined) {
 						// Main-city refactor: a town instance spans a whole area. Keep only
@@ -227,6 +230,44 @@ export class OnPlayerChangeMapListener {
 						}
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
 						instance.main.newInstanceMembers = undefined;
+					} else if (realChange) {
+						// ROUND 83: the roster never arrived (response raced/failed or a
+						// direct loadLevel), but this IS a real map change — clean stale
+						// off-map records instead of the old "keep live mirrors" fallback,
+						// which silently re-admitted departed players through the empty-
+						// roster fail-open gate. playerMapByName entries for OFF-map members
+						// are preserved so their late stale playerState is still dropped by
+						// the map gate.
+						for (const n in instance.main.players) {
+							const p = instance.main.players[n];
+							if (!p) { delete instance.main.players[n]; continue; }
+							const known = prevPmap[n];
+							if (known && known === myMap) {
+								// Known on OUR target sub-map: keep the roster slot even when
+								// its entity was killed by clearMap — the first playerState is
+								// what respawns the mirror.
+								keep.add(n);
+								pmap[n] = myMap;
+								continue;
+							}
+							if (p.entity && !(p.entity as any)._killed) {
+								try { (p.entity as any).kill(true); } catch (_) { /* ignore */ }
+							}
+							try { dropNameTag(n); } catch (_) { /* ignore */ }
+							try { delete instance.main.pendingFadeIn[n]; } catch (_) { /* ignore */ }
+							delete instance.main.players[n];
+							instance.main.players[n] = undefined;
+						}
+						for (const n in prevPmap) {
+							if (pmap[n] === undefined) pmap[n] = prevPmap[n];
+						}
+						for (const n in pending) {
+							const rec = pending[n];
+							if (!rec) continue;
+							const pm = rec.map || myMap;
+							pmap[n] = pm;
+							if (pm === myMap) keep.add(n);
+						}
 					} else {
 						// No roster (same-map checkpoint reload): keep live mirrors.
 						for (const n in instance.main.players) {
@@ -238,6 +279,9 @@ export class OnPlayerChangeMapListener {
 					keep.forEach((n: string) => { onMap[n] = true; });
 					instance.main.playersOnThisMap = onMap;
 					instance.main.playerMapByName = pmap;
+					// ROUND 83: the roster decision is final now — until the NEXT map load,
+					// names not in playersOnThisMap are stale (even when the roster is empty).
+					instance.main.playersRosterReady = true;
 				} catch (_) { /* never break a map load */ }
 				// Round 16: old-map name tags must never survive into the new map.
 				// The reconcile block above killed stale mirrors + dropped their tags,

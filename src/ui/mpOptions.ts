@@ -721,13 +721,17 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const players = (m as any).players || {};
         for (const name in players) {
             try {
-                // Round 22: only tag mirrors actually on THIS map. When the
-                // playersOnThisMap roster is defined and non-empty (maintained by
-                // onPlayerChangeMap on enters/leaves/loads), skip a name not on it —
-                // matches the netSync stale-stream gate so a departed teammate's tag
-                // can't be re-shown by addTagAt from a stale cached entry.
+                // Round 22: only tag mirrors actually on THIS map. ROUND 83: once the
+                // roster is settled (playersRosterReady), absence from the roster is
+                // authoritative even when it's empty — a leaving/fading mirror's tag
+                // must not be re-added. Before the first reconcile, an empty roster
+                // still fails open so unknown members can self-heal.
                 const onMap = (m as any).playersOnThisMap;
-                if (onMap && Object.keys(onMap).length > 0 && !onMap[name]) continue;
+                if (onMap && !onMap[name] && ((m as any).playersRosterReady || Object.keys(onMap).length > 0)) continue;
+                // ROUND 83: a known sub-map that differs from ours also overrides the
+                // roster (missed enter/leave relay) so the old area's tag can't linger.
+                const pmap = (m as any).playerMapByName;
+                if (pmap && pmap[name] !== undefined && pmap[name] !== (ig.game ? (ig.game as any).mapName : '')) continue;
                 const pl = players[name];
                 const ent = pl && pl.entity;
                 // Round 20: hide the tag the very first frame the death flag arrives
