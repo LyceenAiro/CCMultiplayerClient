@@ -3436,7 +3436,12 @@ export class NetSync {
 		// Round 16 (issue 7): the dying corpse must stop body-blocking the player —
 		// the engine's own death flow (_onDeathHit) sets coll.type to IGNORE; do the
 		// same here so the puppet's corpse is walk-through during its ~500ms FX window.
-		try { (e as any).coll.type = (ig as any).COLLTYPE.IGNORE; } catch (_) { /* ignore */ }
+		// ROUND 80: setType keeps the spatial hash consistent on the corpse's
+		// collision flip to IGNORE.
+		try {
+			if (typeof (e as any).coll.setType === 'function') (e as any).coll.setType((ig as any).COLLTYPE.IGNORE);
+			else (e as any).coll.type = (ig as any).COLLTYPE.IGNORE;
+		} catch (_) { /* ignore */ }
 		const uid = e._mpUid || 0;
 		const dieAnim = (e.walkAnims && e.walkAnims.damage) || '';
 		if (dieAnim) {
@@ -6268,6 +6273,54 @@ export class NetSync {
 	}
 
 	/**
+	 * ROUND 80 (collision-map fix): the network writes xProtected/yProtected/
+	 * zProtected directly (lockEntity forbids setPos), which updates the coll's
+	 * VISIBLE position but never re-buckets it in the impact.js spatial hash.
+	 * Physics hit tests only walk the hash cells along the attacker's path, so a
+	 * puppet/mirror that moved from its spawn cell was effectively invisible to
+	 * melee TACKLEs and ball touches. This re-buckets a moved entry at its CURRENT
+	 * position. Only entries already in the map are touched; hidden/PASSIVE entries
+	 * (untracked, _inCollisionMap=false) stay untracked.
+	 */
+	private _mpReindexColl(e: any): void {
+		try {
+			if (!e || e._killed || !e.coll || !e.coll._inCollisionMap) return;
+			const phys: any = (ig as any).game && (ig as any).game.physics;
+			if (!phys || typeof phys.removeFromCollMap !== 'function' || typeof phys.addToCollMap !== 'function') return;
+			phys.removeFromCollMap(e.coll);
+			phys.addToCollMap(e.coll);
+		} catch (_) { /* a failed re-bucket must never break the frame */ }
+	}
+
+	/** ROUND 80: mark an entity whose locked coll position was written directly so
+	 * the next interpolation pass re-buckets its collision entry. */
+	private _mpMarkCollDirty(e: any): void {
+		try { if (e) e._mpCollDirty = true; } catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 80: re-bucket every network entity that was marked dirty (direct
+	 * position snaps + per-frame interpolation targets). */
+	private _mpReindexDirtyColls(): void {
+		try {
+			for (const uidStr in this.puppets) {
+				const e: any = this.puppets[uidStr];
+				if (e && e._mpCollDirty) {
+					e._mpCollDirty = false;
+					this._mpReindexColl(e);
+				}
+			}
+			for (const pName in this.main.players) {
+				const pm = this.main.players[pName];
+				const e: any = pm && pm.entity;
+				if (e && e._mpCollDirty) {
+					e._mpCollDirty = false;
+					this._mpReindexColl(e);
+				}
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/**
 	 * Per-frame interpolation of network-driven entities (puppets on members, and
 	 * remote-player mirrors on both host and member): the synced data arrives only
 	 * ~15-60x/sec, but this runs on EVERY rendered frame, closing a fraction
@@ -6290,11 +6343,13 @@ export class NetSync {
 			if (dx === 0 && dy === 0 && dz === 0) continue;
 			if (dx * dx + dy * dy > 250 * 250 || Math.abs(dz) > 200) {
 				cp.xProtected = e._mpToX; cp.yProtected = e._mpToY; cp.zProtected = e._mpToZ;
+				this._mpMarkCollDirty(e);
 				continue;
 			}
 			if (dx !== 0) cp.xProtected = cp.xProtected + dx * t;
 			if (dy !== 0) cp.yProtected = cp.yProtected + dy * t;
 			if (dz !== 0) cp.zProtected = cp.zProtected + dz * t;
+			this._mpMarkCollDirty(e);
 		}
 		// Fix 3: player-mirror interpolation in the same per-frame pump, same
 		// ~12%/frame rate (t is frame-rate independent via ig.system.tick). Mirrors
@@ -6316,7 +6371,11 @@ export class NetSync {
 			if (dxm !== 0) cpm.xProtected = cpm.xProtected + dxm * t;
 			if (dym !== 0) cpm.yProtected = cpm.yProtected + dym * t;
 			if (dzm !== 0) cpm.zProtected = cpm.zProtected + dzm * t;
+			this._mpMarkCollDirty(e);
 		}
+		// ROUND 80: re-bucket any collision entries whose locked position changed
+		// (direct snaps marked by the block/playerState applies + the lerp above).
+		this._mpReindexDirtyColls();
 	// ROUND 32 (item 7): resolve the synced entities' floor height every frame via
 	// the engine's own `updateGroundEntity`, not `updateBaseZPos` alone. Three
 	// rounds keyed on `updateBaseZPos` left the shadow pinned to the map-entry
@@ -6489,7 +6548,12 @@ export class NetSync {
 							e.statusGui.hook.localAlpha = hpAlpha;
 						}
 					} catch (_) { /* ignore */ }
-					try { if (e.coll) e.coll.type = targetColl; } catch (_) { /* ignore */ }
+					// ROUND 80: setType keeps the spatial hash consistent with the
+					// collision-type flip (IGNORE <-> base), unlike a raw type write.
+					try {
+						if (e.coll && typeof e.coll.setType === 'function') e.coll.setType(targetColl);
+						else if (e.coll) e.coll.type = targetColl;
+					} catch (_) { /* ignore */ }
 				}
 			}
 		} catch (_) { /* never break the frame */ }
@@ -6694,7 +6758,11 @@ export class NetSync {
 			e._mpSnapNext = true;
 			try { this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z }); } catch (_) { /* ignore */ }
 			try { if (e.setTarget) e.setTarget(null); } catch (_) { /* ignore */ }
-			try { if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE; } catch (_) { /* ignore */ }
+			// ROUND 80: setType keeps the spatial hash consistent with IGNORE.
+			try {
+				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
+				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
+			} catch (_) { /* ignore */ }
 			try {
 				if (e.params && !e.params._mpIsDefeatedPatched) {
 					e.params._mpIsDefeatedPatched = true;
@@ -6827,7 +6895,11 @@ export class NetSync {
 			if (!e) return null;
 			// Neutralize: no damage, no collision, no self-destruct, no AI behaviors.
 			e.party = (sc as any).COMBATANT_PARTY.OTHER;
-			try { if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE; } catch (_) { /* ignore */ }
+			// ROUND 80: setType keeps the spatial hash consistent with IGNORE.
+			try {
+				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
+				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
+			} catch (_) { /* ignore */ }
 			e.attackInfo = null;
 			e.hitProxy = null;
 			e.combatant = null;
@@ -7740,6 +7812,9 @@ export class NetSync {
 					// Snap: the mirror is lockEntity-locked, so write through the same
 					// protected backing fields copyEntityPosition uses.
 					this.main.copyEntityPosition(s.pos, ent.coll.pos);
+					// ROUND 80: direct lock-backing write — re-bucket the collision
+					// entry at the snapped position on the next interpolation pass.
+					this._mpMarkCollDirty(ent);
 				}
 				ent._mpToX = s.pos.x; ent._mpToY = s.pos.y; ent._mpToZ = s.pos.z;
 				// ROUND 50: stamp WHEN the owner's real position last advanced, so the
@@ -7941,6 +8016,9 @@ export class NetSync {
 					e._mpSnapNext = false;
 					const cp0: any = e.coll.pos;
 					cp0.xProtected = s.x; cp0.yProtected = s.y; cp0.zProtected = s.z;
+					// ROUND 80: the direct lock-backing write moves the coll without
+					// setPos — re-bucket it in the spatial hash immediately.
+					this._mpMarkCollDirty(e);
 				}
 			}
 			if (isFull && e.face && (e.face.xProtected !== s.fx || e.face.yProtected !== s.fy)) {
@@ -8038,9 +8116,17 @@ export class NetSync {
 					try {
 						if (psvNow) {
 							if (e._mpEnemyCollType === undefined) e._mpEnemyCollType = e.coll.type;
-							e.coll.type = (ig as any).COLLTYPE.PASSIVE;
+							// ROUND 80: use coll.setType(), not a raw type write. setType
+							// removes/re-adds the coll in the impact.js spatial hash when the
+							// PASSIVE flag flips; a raw write left the entry in the map, so a
+							// "burrowed" puppet could still be touched and a re-emerged puppet
+							// could stay untouchable depending on which stale cell the hash had.
+							if (typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.PASSIVE);
+							else e.coll.type = (ig as any).COLLTYPE.PASSIVE;
 						} else {
-							e.coll.type = (e._mpEnemyCollType !== undefined) ? e._mpEnemyCollType : e.coll.type;
+							const restore = (e._mpEnemyCollType !== undefined) ? e._mpEnemyCollType : e.coll.type;
+							if (typeof e.coll.setType === 'function') e.coll.setType(restore);
+							else e.coll.type = restore;
 						}
 						this._sfxLog('psv.sync', 'uid=' + s.i + ' passive=' + (psvNow ? 1 : 0));
 					} catch (_) { /* best-effort */ }

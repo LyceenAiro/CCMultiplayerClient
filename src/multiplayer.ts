@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.4';
+export const MP_VERSION = '1.70.5';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -477,6 +477,26 @@ export class Multiplayer {
 		Object.defineProperty(protectedPos, 'z', { get() { return protectedPos.zProtected; }, set() { return; } });
 		Object.defineProperty(entity.coll, 'pos',
 			{ get() { return protectedPos; }, set() { /* network-driven: drop physics writes */ } });
+
+		// ROUND 80 (collision-map fix): replacing coll.pos with a protected object
+		// bypasses coll.setPos(), so the impact.js spatial hash keeps the coll
+		// bucketed at its OLD position forever. Network position updates write
+		// xProtected directly, which also never re-buckets the entry. That made every
+		// geometry-checked attack (melee TACKLE / ball touch) look for the puppet or
+		// mirror at its spawn cell instead of where the network moved it: enemies
+		// swung straight through members, and member balls passed through puppets
+		// while the host's mirrored ball still connected (the 0~1 host-side hits).
+		// Re-bucket the entry NOW so the lock's own position change takes effect.
+		try {
+			const coll: any = entity.coll;
+			const phys: any = (ig as any).game && (ig as any).game.physics;
+			if (coll && coll._inCollisionMap && phys
+				&& typeof phys.removeFromCollMap === 'function'
+				&& typeof phys.addToCollMap === 'function') {
+				phys.removeFromCollMap(coll);
+				phys.addToCollMap(coll);
+			}
+		} catch (_) { /* the map is rebuilt on the next setPos anyway */ }
 
 		let protectedAnim = entity.currentAnim;
 		Object.defineProperty(entity, 'currentAnim', {
