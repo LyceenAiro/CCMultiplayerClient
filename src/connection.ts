@@ -96,7 +96,7 @@ export interface IConnection {
      * the member applies VERBATIM — `perfect` = a perfect guard (0 damage + counter
      * window), `regular` = a regular guard (chip damage + guard-bar), `knockback` =
      * whether the engine knockback fires. PvP hits (mirror-to-mirror) omit these. */
-    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }): void;
+    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number }): void;
     /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
      * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak

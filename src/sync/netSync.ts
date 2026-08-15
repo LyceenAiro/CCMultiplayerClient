@@ -280,6 +280,16 @@ export class NetSync {
 		} catch (_) { /* never break the frame */ }
 	}
 
+	/** ROUND 79 (damage diagnostics): _sfxLog WITHOUT the 500ms per-tag collapse — the
+	 * host-vs-member damage capture needs EVERY hit logged so one guarded hit on each
+	 * machine lines up exactly. Same __mpSfxDebug gate; never throws. */
+	public _sfxLogRaw(tag: string, ...args: any[]): void {
+		try {
+			if (!(window as any).__mpSfxDebug) return;
+			console.log('[mpsfx] ' + tag, ...args);
+		} catch (_) { /* never break the frame */ }
+	}
+
 	/** ROUND 40 (diagnostics): a one-line description of a playAtEntity (sound, entity) pair
 	 * for the [mpsfx] log — the sound's path, and the entity's constructor name + uid /
 	 * _mpMirror/_mpPuppet/_killed flags + whether it targets the local player. Purely a
@@ -357,11 +367,9 @@ export class NetSync {
 	 * emitted (see sendPlayerState). Keeps the server's memberPos fresh while we are
 	 * the only member of our instance, without the full 10-60Hz stream. */
 	private _mpSoloBeaconAt = 0;
-	/** ROUND 65: map name the gw/gm/ga/def guard fields were last sent from. The
-	 * receiver caches them on the mirror entity and mirrors are destroyed on a map
-	 * change, so a new map must re-send the full set even when unchanged (see the
-	 * omission gate in the playerState packer). */
-	private _mpGuardFieldsMap = '';
+	// ROUND 79: the _mpGuardFieldsMap map-change force-send is gone - the combat-stat
+	// fields now ride EVERY playerState packet (see the packer), so no map tracking
+	// is needed anymore.
 	/** Round 22 (opt 2), split ROUND 23: per-uid last FULLY-ENCODED enemy snapshot for
 	 * the host's NON-HOSTILE entityState block delta (enemies with NO current target,
 	 * streamed at a fixed 15Hz). An enemy whose encoded fields are unchanged emits a
@@ -1724,6 +1732,62 @@ export class NetSync {
 							// chain (game.compiled.js ~bytes 2492349/2494500/~2492700/2501339)
 							// untouched — guard -> i-frames -> knockback -> perfect guard all
 							// stay in the engine where they belong.
+							// ROUND 79 (damage diagnostics): log the engine's OWN native result when the
+							// HOST player is hit by a real enemy - same field names as rc.dmg/ch.dmg so
+							// one captured guarded hit on each machine lines up for comparison.
+							try {
+								const nsN: any = cur();
+								if (nsN && nsN.main && nsN.main.host) {
+									const atkEnt: any = rest[0];
+									const rootN: any = atkEnt && atkEnt.getCombatantRoot ? (atkEnt.getCombatantRoot() || atkEnt) : atkEnt;
+									const u: any = rest[3];
+									const ai: any = rest[1];
+									if (rootN && rootN.party === (sc as any).COMBATANT_PARTY.ENEMY
+										&& !rootN._mpMirror && !rootN._mpPuppet
+										&& u && typeof u.damage === 'number' && u.damage > 0) {
+										let atkN = 0, defN = 0, dfN = 1, gmN = 0, fcN = 0; let efN = ''; let chipN = -1;
+										try {
+											if (rootN.params && typeof rootN.params.getStat === 'function') {
+												atkN = Number(rootN.params.getStat('attack')) || 0;
+											}
+											const pp = this.params;
+											if (pp && typeof pp.getStat === 'function') {
+												defN = Number(pp.getStat('defense')) || 0;
+												fcN = Number(pp.getStat('focus')) || 0;
+												const ea = pp.getStat('elemFactor');
+												if (Array.isArray(ea)) {
+													const eaR = ea.map((v: any) => Math.round(Number(v) * 100) / 100);
+													efN = JSON.stringify(eaR);
+												}
+											}
+											if (pp && typeof pp.damageFactor === 'number') dfN = pp.damageFactor;
+											if (pp && typeof pp.getModifier === 'function') gmN = Number(pp.getModifier('GUARD_STRENGTH')) || 0;
+											// Derive the engine's real chip: defensiveFactor = df x elem x chip.
+											if (typeof u.defensiveFactor === 'number' && dfN > 0) {
+												const elN = (ai && typeof ai.element === 'number' && ai.element >= 1 && ai.element <= 4) ? ai.element : 0;
+												let efEl = 1;
+												if (elN > 0 && pp && typeof pp.getStat === 'function') {
+													const ea2 = pp.getStat('elemFactor');
+													if (Array.isArray(ea2) && typeof ea2[elN - 1] === 'number') efEl = Number(ea2[elN - 1]) || 1;
+												}
+												const denom = dfN * efEl;
+												if (denom > 0) chipN = Math.round((u.defensiveFactor / denom) * 1000) / 1000;
+											}
+										} catch (_) { /* keep zeros */ }
+										nsN._sfxLogRaw('nathit',
+											'atk=' + atkN, 'def=' + defN, 'df=' + dfN, 'gm=' + gmN, 'ef=' + efN, 'fc=' + fcN,
+											'guard=' + (typeof this.currentAnim === 'string' && this.currentAnim === 'guard' ? 1 : 0),
+											'aDf=' + ((ai && typeof ai.damageFactor === 'number') ? ai.damageFactor : 1),
+											'aDefF=' + ((ai && typeof ai.defenseFactor === 'number') ? ai.defenseFactor : 1),
+											'el=' + ((ai && typeof ai.element === 'number') ? ai.element : 0),
+											'crit=' + ((u && u.critical) ? 1 : 0),
+											'dmg=' + Math.round(u.damage),
+											'chip=' + chipN,
+											'off=' + ((u && typeof u.offensiveFactor === 'number') ? Math.round(u.offensiveFactor * 1000) / 1000 : -1),
+											'defF=' + ((u && typeof u.defensiveFactor === 'number') ? Math.round(u.defensiveFactor * 1000) / 1000 : -1));
+									}
+								}
+							} catch (_) { /* diagnostic only */ }
 							return r;
 						},
 					});
@@ -2434,6 +2498,22 @@ export class NetSync {
 		const engineDamage = Math.max(1, Math.round(du.damage));
 		let finalDamage = engineDamage;
 		let perfect = false; let regular = false;
+		// ROUND 78: the guard-BAR damage (engine: e.damageFactor × (atk/def)^1.5, fed to
+		// damageShield BEFORE the chip factor is applied) and the full unguarded damage
+		// (used when the bar BREAKS — the native chain then skips the shield factor and
+		// the victim takes the whole hit). Both ship on the combatHit payload.
+		let shieldDmg = 0;
+		let fullForBreak = 0;
+		// ROUND 79 (element + crit fixes, damage diagnostics): hoisted so the rc.dmg
+		// log AND the emit sites outside the try can use them. 'el' was previously
+		// read from du.element - a field the engine's damageResult does NOT carry
+		// (always undefined -> the member never got element factors). 'crit' is now
+		// rolled HERE with the member's streamed real focus instead of reusing the
+		// engine's husk-focus roll (du.critical). 'chipF' carries the guard chip for
+		// the log (and proves the engine formula matches the host's native one).
+		let el = 0;
+		let crit = false;
+		let chipF = -1;
 		try {
 			// Attack stat for the formula: prefer the live attacker stat, else the hit's
 			// attackerParams (the engine stashes the ATTACKER's params on the DamageInfo).
@@ -2519,37 +2599,91 @@ export class NetSync {
 				}
 				if (!pass) { D('guarddir', 'back turned -> guard broken'); guardHolds = false; }
 			}
-			// ROUND 30 (item 1): replace the old `engineDamage * sqrt(huskDef/memberDef)`
-			// approximation with the engine's OWN damage law. The engine computes
-			// `PERCENTAGE(atk,def)` (game.compiled.js): atk>def -> atk*(1+pow(1-def/atk,0.5)*0.2),
-			// else atk*pow(atk/def,1.5). The sqrt approximation was only exact at def=40 and
-			// INFLATED damage for any member with defense below the husk's 40 (x1.41 at def
-			// 20, x2.0 at def 10) — a low-defense member took a shield hit as hard as (or
-			// harder than) the real unguarded hit, which read as "the shield does nothing".
-			// Use the attacker's real attack stat (already resolved above) against the
-			// member's streamed defense through the exact PERCENTAGE curve.
+			// ROUND 78 (vanilla damage law): replicate sc.CombatParams.getDamage EXACTLY
+			// (game.compiled.js ~line 2150) for an enemy->player hit instead of the old
+			// PERCENTAGE×damageFactor-only base, which drifted from the host's native
+			// number (higher OR lower) because it missed:
+			//   - e.defenseFactor (the AttackInfo's own defense multiplier),
+			//   - g: the victim's params.damageFactor × element factor (elemFactor),
+			//   - o: sc.combat.getGlobalDmgFactor(party) (assist × pvp),
+			//   - the engine's ±5% damage roll.
+			// Every factor is read from the SAME sources the engine reads: the AttackInfo
+			// (hitProps), the attacker's params, and the member's streamed def/elemFactor/
+			// damageFactor. The crit is rolled HERE (below) against the member's streamed
+			// real focus - du.critical used the mirror husk's focus and skewed members.
 			const huskDef = 40; // multiplayer.json mirror husk defense (fallback only)
 			const pct = (a: number, d: number): number =>
 				a > d ? a * (1 + Math.pow(1 - d / a, 0.5) * 0.2) : a * Math.pow(a / d, 1.5);
 			const atkPow = atk > 0 ? atk : engineDamage;
 			const memberDefForBase = memberDef > 0 ? memberDef : huskDef;
-			// ROUND 37 (item 2): the old base stopped at the PERCENTAGE core and dropped the
-			// engine's own multiplicative factors (game.compiled.js getDamage:
-			// `PERCENTAGE(atk,def) * g * k * o`, k = AttackInfo.damageFactor × crit factor,
-			// o = globalDmgFactor). Monster AttackInfos carry damageFactor 1.2-1.5 on their
-			// heavies and ×1.5 again on a crit — omitting them made EVERY member hit read
-			// 17-50% (and crits ~2.25x) low, on the guarded chip and the plain hit alike.
-			// Restore exactly those factors so the recompute matches the engine's number.
-			const dmgK = (hitProps && typeof hitProps.damageFactor === 'number' && hitProps.damageFactor > 0)
+			// l = e.defenseFactor * getStat('defense') — the engine multiplies the
+			// victim's defense by the AttackInfo's defenseFactor before PERCENTAGE.
+			const atkDefFactor = (hitProps && typeof hitProps.defenseFactor === 'number' && hitProps.defenseFactor > 0)
+				? hitProps.defenseFactor : 1;
+			const defEff = memberDefForBase * atkDefFactor;
+			const base = Math.max(1, pct(atkPow, defEff));
+			// g (defensive factor): victim params.damageFactor × element factor.
+			let g = (typeof mirror._mpDf === 'number' && mirror._mpDf > 0) ? mirror._mpDf : 1;
+			// ROUND 79 (element fix): the engine's damageResult carries NO 'element'
+			// field (game.compiled.js getDamage returns damage/defReduced/offensiveFactor/
+			// baseOffensiveFactor/elementalDef/defensiveFactor/critical/status - no
+			// element), so du.element was ALWAYS undefined and the member's recompute
+			// never applied the elemFactor the host's native hit does. Read the element
+			// from the AttackInfo (hitProps) - the same object getDamage reads e.element
+			// from; fall back to du.element in case some future path ever sets it.
+			el = (hitProps && typeof hitProps.element === 'number' && hitProps.element >= 1 && hitProps.element <= 4)
+				? hitProps.element
+				: ((typeof du.element === 'number' && du.element >= 1 && du.element <= 4) ? du.element : 0);
+			if (el > 0 && Array.isArray(mirror._mpEf) && mirror._mpEf.length >= el) {
+				const ef = Number(mirror._mpEf[el - 1]);
+				if (isFinite(ef) && ef > 0) g = g * ef;
+			}
+			// k (offensive factor): AttackInfo.damageFactor × (crit × criticalDmgFactor).
+			// Enemy attackers carry no skillBonus/BERSERK/MOMENTUM, so the engine's other
+			// k-terms are all 0 here.
+			let k = (hitProps && typeof hitProps.damageFactor === 'number' && hitProps.damageFactor > 0)
 				? hitProps.damageFactor : 1;
-			let baseAgainstMember = Math.max(1, Math.round(pct(atkPow, memberDefForBase) * dmgK));
-			if (du && du.critical) {
+			// ROUND 79 (crit fix): the engine rolled the mirror's crit with the HUSK's
+			// focus (multiplayer.json ~40). Its chance curve (atkFocus/vicFocus)^0.35 - 0.9
+			// x critFactor flips completely across that gap - a member whose real focus
+			// makes crits impossible still took the mirror's crits (1.5x damage) and vice
+			// versa. Roll the crit HERE against the member's streamed real focus.
+			try {
+				// 0 is meaningful: an attack with critFactor:0 never crits (chance x 0 = 0).
+				const critFactor = (hitProps && typeof hitProps.critFactor === 'number')
+					? hitProps.critFactor : 1;
+				const memFocus = (typeof mirror._mpFocus === 'number' && mirror._mpFocus > 0) ? mirror._mpFocus : 0;
+				const atkP = (hitProps && hitProps.attackerParams) ? hitProps.attackerParams
+					: ((attacker && attacker.params) ? attacker.params : null);
+				if (memFocus > 0 && atkP && typeof atkP.getStat === 'function') {
+					const atkFocus = Number(atkP.getStat('focus')) || 0;
+					if (atkFocus > 0) {
+						const p = atkFocus / memFocus;
+						const chance = (Math.pow(p, 0.35) - 0.9) * critFactor;
+						crit = Math.random() <= chance;
+					}
+				}
+			} catch (_) { /* any read failure -> no crit (fail toward the low end) */ }
+			if (crit) {
 				const critK = (hitProps && hitProps.attackerParams
 					&& typeof hitProps.attackerParams.criticalDmgFactor === 'number'
 					&& hitProps.attackerParams.criticalDmgFactor > 0)
 					? hitProps.attackerParams.criticalDmgFactor : 1.5;
-				baseAgainstMember = Math.max(1, Math.round(baseAgainstMember * critK));
+				k = k * critK;
 			}
+			// o (global factor): the same call the engine makes for the attacker's party.
+			let o = 1;
+			try {
+				const scC: any = (sc as any).combat;
+				const atkRoot: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
+				if (scC && typeof scC.getGlobalDmgFactor === 'function' && atkRoot) {
+					const og = Number(scC.getGlobalDmgFactor(atkRoot.party));
+					if (isFinite(og) && og > 0) o = og;
+				}
+			} catch (_) { o = 1; }
+			// Full unguarded damage vs the member's REAL stats + the engine's ±5% roll.
+			const rollJitter = (v: number): number => v * (0.95 + Math.random() * 0.1);
+			let baseAgainstMember = Math.max(1, Math.round(rollJitter(base * g * k * o)));
 			if (guardHolds && winLeft > 0) {
 				// PERFECT guard: no damage, no knockback; member plays the counter window.
 				perfect = true;
@@ -2580,8 +2714,8 @@ export class NetSync {
 				try {
 					this.applyCombatHit({
 						player: mirror.name, damage: 0,
-						element: typeof du.element === 'number' ? du.element : 0,
-						critical: !!du.critical, ax, ay, attack: atk, attackType,
+						element: el,
+						critical: crit, ax, ay, attack: atk, attackType,
 						monster: true, perfect: true, regular: false, knockback: false,
 					});
 				} catch (_) { /* mirror FX is cosmetic */ }
@@ -2594,11 +2728,49 @@ export class NetSync {
 				let f = def > 0 ? a / def : 0;
 				f = f <= 1 ? 0.2 - (1 - Math.pow(f, 0.3)) : 0.2 + (Math.pow(f, 1.1) - 1) * 0.35;
 				f = Math.max(0, Math.min(1, f - gm));
+				chipF = f;
 				finalDamage = Math.max(0, Math.round(baseAgainstMember * f));
+				// ROUND 78 (guard-bar fix): the bar does NOT take the chip. The engine's
+				// PLAYER shield isActive runs damageShield(e.damageFactor × (atk/def)^1.5)
+				// BEFORE applying the chip factor (game.compiled.js ~line 4898) — feeding it
+				// the chip (the old member-side p.damageShield(chip)) over-drained the bar
+				// ~10x, which is why the member's shield shattered after one or two guarded
+				// hits. Ship the exact bar value; and ship the FULL hit for the break case
+				// (a bar that breaks makes isActive return false -> the chip factor is
+				// skipped entirely and the victim takes the whole unguarded hit).
+				const atkDf = (hitProps && typeof hitProps.damageFactor === 'number' && hitProps.damageFactor > 0)
+					? hitProps.damageFactor : 1;
+				shieldDmg = Math.max(0, Math.round(atkDf * Math.pow(a / def, 1.5)));
+				fullForBreak = baseAgainstMember;
 			} else {
 				// No guard: real-defense damage + knockback.
 				finalDamage = baseAgainstMember;
 			}
+			// ROUND 79 (damage diagnostics): one-line dump of every input + verdict the
+			// host recompute used. Compared against the host's own native hit (nathit,
+			// same field names) and the member's applied result (ch.dmg) this shows
+			// EXACTLY which input drifted (def/gm/df/ef/focus/crit/roll).
+			try {
+				this._sfxLogRaw('rc.dmg',
+					'atk=' + atk, 'def=' + memberDef,
+					'df=' + (typeof mirror._mpDf === 'number' ? mirror._mpDf : 'nil'),
+					'gm=' + gm, 'ga=' + ga,
+					'ef=' + (Array.isArray(mirror._mpEf) ? JSON.stringify(mirror._mpEf) : 'nil'),
+					'fc=' + (typeof mirror._mpFocus === 'number' ? mirror._mpFocus : 'nil'),
+					'guard=' + (guarding ? 1 : 0), 'holds=' + (guardHolds ? 1 : 0),
+					'aDf=' + ((hitProps && typeof hitProps.damageFactor === 'number') ? hitProps.damageFactor : 1),
+					'aDefF=' + ((hitProps && typeof hitProps.defenseFactor === 'number') ? hitProps.defenseFactor : 1),
+					'el=' + el,
+					'crit=' + (crit ? 1 : 0),
+					'base=' + base,
+					'g=' + (Math.round(g * 1000) / 1000),
+					'k=' + (Math.round(k * 1000) / 1000),
+					'o=' + (Math.round(o * 1000) / 1000),
+					'chip=' + chipF,
+					'final=' + finalDamage, 'bar=' + shieldDmg, 'full=' + fullForBreak,
+					'eng=' + engineDamage,
+					'perfect=' + (perfect ? 1 : 0), 'regular=' + (regular ? 1 : 0));
+			} catch (_) { /* diagnostic only */ }
 		} catch (_) {
 			// Any failure: forward the engine's own number (fail-open toward damage).
 			finalDamage = engineDamage; perfect = false; regular = false;
@@ -2635,8 +2807,8 @@ export class NetSync {
 			try {
 				this.applyCombatHit({
 					player: mirror.name, damage: finalDamage,
-					element: typeof du.element === 'number' ? du.element : 0,
-					critical: !!du.critical, ax, ay, attack: atk, attackType,
+					element: el,
+					critical: crit, ax, ay, attack: atk, attackType,
 					monster: true, perfect: false, regular: true, knockback: false,
 				});
 			} catch (_) { /* mirror FX is cosmetic */ }
@@ -2655,7 +2827,7 @@ export class NetSync {
 					const ms = mirror.coll.size || { x: 0, y: 0, z: 0 };
 					scAny.combat.showHitEffect(mirror,
 						{ x: mirror.coll.pos.x + ms.x / 2, y: mirror.coll.pos.y + ms.y / 2, z: mirror.coll.pos.z + ms.z },
-						1 /* LIGHT */, typeof du.element === 'number' ? du.element : 0,
+						1 /* LIGHT */, el,
 						perfect ? 2 /* SHIELD_RESULT.PERFECT */ : 1 /* SHIELD_RESULT.REGULAR */, false);
 				}
 			} catch (_) { /* guard sfx is cosmetic */ }
@@ -2680,8 +2852,8 @@ export class NetSync {
 					try {
 						scAny.combat.showHitEffect(mirror,
 							{ x: mirror.coll.pos.x + ms.x / 2, y: mirror.coll.pos.y + ms.y / 2, z: mirror.coll.pos.z + ms.z },
-							at, typeof du.element === 'number' ? du.element : 0,
-							0 /* SHIELD_RESULT.NONE */, !!du.critical);
+							at, el,
+							0 /* SHIELD_RESULT.NONE */, crit);
 					} finally { this._mpReplayingFx = false; }
 				}
 			} catch (_) { /* spectator hit sfx is cosmetic */ }
@@ -2695,8 +2867,8 @@ export class NetSync {
 		this.main.connection.combatHit({
 			player: mirror.name,
 			damage: finalDamage,
-			element: typeof du.element === 'number' ? du.element : 0,
-			critical: !!du.critical,
+			element: el,
+			critical: crit,
 			ax, ay,
 			attack: atk,
 			attackType,
@@ -2704,6 +2876,9 @@ export class NetSync {
 			perfect,                // member: perfect-guard FX + counter window, 0 damage
 			regular,                // member: guard-block FX + guard-bar accumulation
 			knockback: !perfect && !regular, // member: knock the player away from the hit
+			// ROUND 78: guard-bar drain (engine's ratio^1.5 value, NOT the HP chip) and
+			// the full unguarded hit for the bar-break case (see the regular branch).
+			shieldDmg, full: fullForBreak,
 		});
 	}
 
@@ -3925,7 +4100,7 @@ export class NetSync {
 	 * unchanged (no `monster` flag): the member still cannot detect another player's hits
 	 * locally, so those keep the old verbatim-apply + knockback path.
 	 */
-	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }): void {
+	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number }): void {
 		try {
 			const D = (t: string, ...a: any[]) => { try { this._sfxLog('ch.' + t, ...a); } catch (_) { /* ignore */ } };
 			// ROUND 38: the attacker's REAL attack-type (sc.ATTACK_TYPE) rides on the packet
@@ -3998,6 +4173,31 @@ export class NetSync {
 				|| (typeof p.currentAnim === 'string' && p.currentAnim === 'guard');
 			let dmg = Math.max(0, Math.round(hit.damage));
 			if (!isMonster) dmg = Math.max(1, dmg); // PvP: unguarded hits keep the min-1 floor
+			// ROUND 79 (damage diagnostics): the member's own LOCAL stats + the verdict it
+			// received - vs the host's rc.dmg (which used the STREAMED copies of these) any
+			// drifted value shows up as a different def/gm/df/ef/fc right here.
+			if (isMonster) {
+				try {
+					let defC = 0, gmC = 0, dfC = 1, fcC = 0; let efC = '';
+					try {
+						if (p.params && typeof p.params.getStat === 'function') {
+							defC = Number(p.params.getStat('defense')) || 0;
+							fcC = Number(p.params.getStat('focus')) || 0;
+							const ea = p.params.getStat('elemFactor');
+							if (Array.isArray(ea)) efC = JSON.stringify(ea.map((v: any) => Math.round(Number(v) * 100) / 100));
+						}
+						if (p.params && typeof p.params.damageFactor === 'number') dfC = p.params.damageFactor;
+						if (p.params && typeof p.params.getModifier === 'function') gmC = Number(p.params.getModifier('GUARD_STRENGTH')) || 0;
+					} catch (_) { /* keep zeros */ }
+					this._sfxLogRaw('ch.dmg',
+						'dmg=' + dmg,
+						'bar=' + (typeof hit.shieldDmg === 'number' ? hit.shieldDmg : -1),
+						'full=' + (typeof hit.full === 'number' ? hit.full : -1),
+						'perfect=' + (perfect ? 1 : 0), 'regular=' + (regular ? 1 : 0),
+						'def=' + defC, 'gm=' + gmC, 'df=' + dfC, 'ef=' + efC, 'fc=' + fcC,
+						'guard=' + (typeof p.currentAnim === 'string' && p.currentAnim === 'guard' ? 1 : 0));
+				} catch (_) { /* diagnostic only */ }
+			}
 			// PERFECT guard (monster): no HP lost, no knockback — play the perfect-guard FX
 			// + open the counter window, then bail out early.
 			if (perfect) {
@@ -4042,23 +4242,39 @@ export class NetSync {
 				// handleGuard blocked every re-guard, so the shield stuck on-screen and worked
 				// only once. Calling the real p.damageShield(dmg) restores the native break +
 				// 5s recovery + dome-FX lifecycle the host has (game.compiled.js ~byte 3018447).
-				try { if (p.guard && typeof p.damageShield === 'function') p.damageShield(dmg); } catch (_) { /* ignore */ }
-				p.params.reduceHp(dmg);
-				try { if ((sc as any).model && (sc as any).model.setCombatMode) (sc as any).model.setCombatMode(true); } catch (_) { /* ignore */ }
-				p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
-				try {
-					const scAny: any = sc as any;
-					if (scAny.combat && typeof scAny.combat.showHitEffect === 'function' && p.coll) {
-						const s = p.coll.size || { x: 0, y: 0, z: 0 };
-						scAny.combat.showHitEffect(p,
-							{ x: p.coll.pos.x + s.x / 2, y: p.coll.pos.y + s.y / 2, z: p.coll.pos.z + s.z },
-							atkType, hit.element || 0, 1 /* SHIELD_RESULT.REGULAR */, !!hit.critical);
-					}
-				} catch (_) { /* ignore */ }
-				// ROUND 31 (item 1a): pass SHIELD_RESULT.REGULAR so a blocked hit shows the
-				// silver-shield GUARD number (the old hardcoded NONE rendered it plain).
-				if (dmg > 0) this.spawnHitNumberOn(p, dmg, !!hit.critical, 1 /* SHIELD_RESULT.REGULAR */);
-				return;
+				// ROUND 78 (guard-bar fix): feed the bar the engine's shield-damage value
+				// (e.damageFactor × (atk/def)^1.5, shipped as shieldDmg) — NOT the HP chip.
+				// The old chip feed over-drained the bar ~10x ("shield breaks too easily").
+				// When damageShield returns true the bar BROKE, and the native chain then
+				// skips the chip factor entirely — the member takes the FULL unguarded hit
+				// (shipped as `full`) with knockback, so fall through to the unguarded
+				// branch below exactly like the engine.
+				const barDmg = (typeof hit.shieldDmg === 'number' && hit.shieldDmg > 0) ? hit.shieldDmg : dmg;
+				let broke = false;
+				try { if (p.guard && typeof p.damageShield === 'function') broke = !!p.damageShield(barDmg); } catch (_) { /* ignore */ }
+				try { this._sfxLogRaw('ch.bar', 'broke=' + (broke ? 1 : 0), 'barDmg=' + barDmg, 'chip=' + dmg); } catch (_) { /* diagnostic only */ }
+				if (broke && typeof hit.full === 'number' && hit.full > 0) {
+					dmg = Math.max(1, Math.round(hit.full));
+					try { (hit as any).knockback = true; } catch (_) { /* ignore */ } // broken guard -> native unguarded reaction (knockback)
+					// fall through: the unguarded branch applies the full hit + knockback
+				} else {
+					p.params.reduceHp(dmg);
+					try { if ((sc as any).model && (sc as any).model.setCombatMode) (sc as any).model.setCombatMode(true); } catch (_) { /* ignore */ }
+					p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
+					try {
+						const scAny: any = sc as any;
+						if (scAny.combat && typeof scAny.combat.showHitEffect === 'function' && p.coll) {
+							const s = p.coll.size || { x: 0, y: 0, z: 0 };
+							scAny.combat.showHitEffect(p,
+								{ x: p.coll.pos.x + s.x / 2, y: p.coll.pos.y + s.y / 2, z: p.coll.pos.z + s.z },
+								atkType, hit.element || 0, 1 /* SHIELD_RESULT.REGULAR */, !!hit.critical);
+						}
+					} catch (_) { /* ignore */ }
+					// ROUND 31 (item 1a): pass SHIELD_RESULT.REGULAR so a blocked hit shows the
+					// silver-shield GUARD number (the old hardcoded NONE rendered it plain).
+					if (dmg > 0) this.spawnHitNumberOn(p, dmg, !!hit.critical, 1 /* SHIELD_RESULT.REGULAR */);
+					return;
+				}
 			}
 			// UNGUARDED hit (monster no-guard, or PvP): apply damage + knockback + flinch.
 			D('apply', 'dmg=' + dmg, 'knockback=' + (doKnockback ? 1 : 0));
@@ -4887,6 +5103,37 @@ export class NetSync {
 			snap.gm = Math.round(gm * 100) / 100;
 			snap.ga = Math.round(ga * 100) / 100;
 			snap.def = def;
+			// ROUND 79 (crit fix): stream our real focus so the host can roll the enemy's
+			// crit against it - the mirror husk's focus (~40) skews the engine's roll.
+			let fc = 0;
+			try {
+				if (p.params && typeof p.params.getStat === 'function') {
+					fc = Math.max(0, Math.round(Number(p.params.getStat('focus')) || 0));
+				}
+			} catch (_) { /* keep 0 */ }
+			snap.fc = fc;
+			// ROUND 78 (vanilla damage law): stream the member's element factors + params
+			// damageFactor so the host's recompute can apply the engine's exact g factor
+			// (victim damageFactor × element factor) against the member's real gear.
+			let ef: number[] = [];
+			let df = 1;
+			try {
+				if (p.params) {
+					if (typeof p.params.getStat === 'function') {
+						const efRaw = p.params.getStat('elemFactor');
+						if (Array.isArray(efRaw)) {
+							ef = [];
+							for (let i = 0; i < efRaw.length; i++) {
+								const v = Number(efRaw[i]);
+								ef.push(isFinite(v) ? Math.round(v * 100) / 100 : 1);
+							}
+						}
+					}
+					if (typeof p.params.damageFactor === 'number') df = Math.round(p.params.damageFactor * 100) / 100;
+				}
+			} catch (_) { /* keep defaults */ }
+			snap.ef = ef;
+			snap.df = df;
 			// Change-gate the guard EDGE (press / release) so the host sees it at network
 			// latency instead of waiting for the 10Hz floor. tok folds in the guard bit
 			// (×1000) plus defense, so any guard-edge or defense change flips tok, bumps
@@ -4917,6 +5164,7 @@ export class NetSync {
 				out.em = snap.em; out.cl = snap.cl;
 				out.gd = snap.gd; out.gst = snap.gst; out.gws = snap.gws;
 				out.gw = snap.gw; out.gm = snap.gm; out.ga = snap.ga; out.def = snap.def; out.ggt = snap.ggt;
+				out.ef = snap.ef; out.df = snap.df; out.fc = snap.fc;
 				this._mpTownStateAt = now;
 			}
 			this._mpLastPlayerStateAt = now;
@@ -4935,25 +5183,20 @@ export class NetSync {
 		const out: any = { ...snap };
 		if (prev && prev.em === snap.em) delete out.em;
 		if (prev && prev.cl === snap.cl) delete out.cl;
-		// Round 27 (item 4): the guard-window/modifier fields change only on equipment /
-		// buff swaps — omit them from the WIRE payload when unchanged since the last send
-		// (the receiver caches them on the mirror). `gst` re-arms on every guard PRESS, so
-		// it is always meaningful; `def` rides the same gate (cheap, and the host's damage
-		// math needs it fresh).
-		// ROUND 65 (skill compatibility): the receiver caches these ON THE MIRROR entity,
-		// and a map change destroys every mirror — the fresh mirror has NO cached ga/gm/
-		// def, while this side's change-gate still sees "unchanged" and keeps omitting
-		// them. The omnidirectional (GUARD_AREA>=1) / top-guard (GUARD_AREA>=2) skills
-		// then silently revert to a plain frontal guard after every map transition until
-		// the player swaps equipment. Force the full field set onto the wire whenever the
-		// map changed since the last send so the new mirrors always learn them.
-		let mapNow = '';
-		try { mapNow = (ig.game && (ig.game as any).mapName) || ''; } catch (_) { /* ignore */ }
-		const mapChanged = mapNow !== this._mpGuardFieldsMap;
-		this._mpGuardFieldsMap = mapNow;
-		if (!mapChanged && prev && prev.gw === snap.gw && prev.gm === snap.gm && prev.ga === snap.ga && prev.def === snap.def) {
-			delete out.gw; delete out.gm; delete out.ga; delete out.def;
-		}
+		// Round 27 (item 4): guard state + timing + the host's damage-recompute inputs
+		// (gw/gm/ga/def/fc/ef/df). `gst` re-arms on every guard PRESS, so it is always
+		// meaningful.
+		// ROUND 79 (item, cache-coherence fix): gw/gm/ga/def/fc/ef/df are now sent on
+		// EVERY playerState packet - the omission gate is GONE. It was the root cause of
+		// the "member takes different damage" report: the packet that SPAWNED the host's
+		// mirror never stashed the fields (the spawn branch skipped the entity-apply
+		// block), and every later packet omitted them as "unchanged", so a fresh mirror
+		// NEVER learned def/gm/ga/df/ef/fc - the host silently recomputed with the husk's
+		// def 40 (member def 26 -> base 19.5 instead of 32.2) and no element/crit data.
+		// ROUND 65 tried to patch this with a map-change force-send, but the common cases
+		// (fresh spawn at join, mirror respawn after death) are NOT map changes. The
+		// fields are ~40 bytes total - always sending them is cheap insurance that every
+		// mirror, whenever it (re)spawns, is fully learned within one packet (~100ms).
 		this.main.connection.updatePlayerState(out);
 	}
 
@@ -7444,13 +7687,7 @@ export class NetSync {
 			// dynamic-shield injection can judge damage/guard/perfect-guard for this player.
 			// gd/gst/gws arrive with the guard packet; gw/gm/ga/def are cached when present
 			// (they ride the same payload but are omitted when unchanged — opt 3).
-			if (typeof s.gd === 'number') ent._mpGd = s.gd;
-			if (typeof s.gst === 'number') { ent._mpGst = s.gst; ent._mpGstAtMs = Date.now(); }
-			if (typeof s.gws === 'number') ent._mpGws = s.gws;
-			if (typeof s.gw === 'number') ent._mpGw = s.gw;
-			if (typeof s.gm === 'number') ent._mpGm = s.gm;
-			if (typeof s.ga === 'number') ent._mpGa = s.ga;
-			if (typeof s.def === 'number') ent._mpDef = s.def;
+			this._applyCombatStash(ent, s);
 			if (s.pos) {
 				// Fix 3: store the network position as an INTERPOLATION TARGET instead of
 				// writing it directly — direct per-packet writes = visible jitter on bad
@@ -7542,7 +7779,14 @@ export class NetSync {
 			// exist yet — record the cutscene flag if it does; the per-frame fade
 			// pass self-heals the mirror when it lands either way.
 			const fresh = this.main.players[player];
-			if (fresh) (fresh as any)._mpCutscene = !!s.cs;
+			if (fresh) {
+				(fresh as any)._mpCutscene = !!s.cs;
+				// ROUND 79 (cache-coherence fix): this packet SPAWNED the mirror, so the
+				// entity-apply branch above did NOT run for it — stash the combat stats on
+				// the fresh entity RIGHT NOW if the spawn was synchronous. (The async case
+				// is covered by the next packet: these fields now ride EVERY playerState.)
+				try { if (fresh.entity) this._applyCombatStash(fresh.entity, s); } catch (_) { /* ignore */ }
+			}
 		}
 		// Party HUD model (top-left HP/SP bars read the MODEL, not the mirror).
 		const model: any = (sc as any).party && (sc as any).party.models && (sc as any).party.models[player];
@@ -7563,6 +7807,31 @@ export class NetSync {
 				try { (sc as any).Model.notifyObserver(p, (sc as any).COMBAT_PARAM_MSG.HP_CHANGED); } catch (_) { /* best-effort */ }
 			}
 		}
+	}
+
+	/** ROUND 79 (cache-coherence fix): stash the owner's guard state + combat stats on
+	 * a mirror entity. Extracted from applyPlayerState so the packet that SPAWNS the
+	 * mirror also applies them (the old code only stashed on the existing-entity branch,
+	 * and the omission gate then dropped the fields from every later packet - so a fresh
+	 * mirror never learned def/gm/ga/df/ef/fc and the host recomputed damage against the
+	 * husk's stats). Now the fields ride EVERY playerState, so every call re-stamps them;
+	 * this helper just makes the spawn packet apply immediately too. Never throws. */
+	private _applyCombatStash(ent: any, s: any): void {
+		try {
+			// Round 27 (item 4): guard state + timing for the host's damage judge.
+			if (typeof s.gd === 'number') ent._mpGd = s.gd;
+			if (typeof s.gst === 'number') { ent._mpGst = s.gst; ent._mpGstAtMs = Date.now(); }
+			if (typeof s.gws === 'number') ent._mpGws = s.gws;
+			if (typeof s.gw === 'number') ent._mpGw = s.gw;
+			if (typeof s.gm === 'number') ent._mpGm = s.gm;
+			if (typeof s.ga === 'number') ent._mpGa = s.ga;
+			if (typeof s.def === 'number') ent._mpDef = s.def;
+			if (typeof s.fc === 'number') ent._mpFocus = s.fc;
+			// ROUND 78/79: element factors + params damageFactor (the engine's g factor
+			// for the host's damage recompute).
+			if (Array.isArray(s.ef)) ent._mpEf = s.ef;
+			if (typeof s.df === 'number') ent._mpDf = s.df;
+		} catch (_) { /* never break the state packet */ }
 	}
 
 	private applyEntityState(map: string, list: IEnemySnap[], cb: boolean, full?: boolean): void {
