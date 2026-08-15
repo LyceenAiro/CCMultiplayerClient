@@ -6408,6 +6408,30 @@ export class NetSync {
 		} catch (_) { /* never break the frame */ }
 	}
 
+	/**
+	 * ROUND 80 (town movement smoothing): render a remote player's mirror from a
+	 * one-packet linear REPLAY segment while in a shared town. Each 10Hz state
+	 * sample starts a new segment that runs from the mirror's current rendered
+	 * position to the new sample over the OBSERVED inter-sample interval, so the
+	 * motion is piecewise-linear, never jumps at packet handoff, and reaches each
+	 * sample right as the next one arrives. The old "converge to the latest sample"
+	 * lerp reached each sample and STOPPED before the next arrived, which read as
+	 * stop-and-go jitter. Returns null outside town / before the first segment.
+	 */
+	private _mpTownRenderTarget(e: any): { x: number, y: number, z: number } | null {
+		try {
+			if (!isSharedTownNow()) return null;
+			const s: any = e && e._mpTownSeg;
+			if (!s || !(s.t0 > 0) || !(s.dur > 0)) return null;
+			const k = Math.max(0, Math.min(1, (Date.now() - s.t0) / s.dur));
+			return {
+				x: s.x0 + (s.x1 - s.x0) * k,
+				y: s.y0 + (s.y1 - s.y0) * k,
+				z: s.z0 + (s.z1 - s.z0) * k,
+			};
+		} catch (_) { return null; }
+	}
+
 	/** ROUND 80: re-bucket every network entity that was marked dirty (direct
 	 * position snaps + per-frame interpolation targets). */
 	private _mpReindexDirtyColls(): void {
@@ -6474,6 +6498,21 @@ export class NetSync {
 			const e: any = pm && pm.entity;
 			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
 			const cpm: any = e.coll.pos;
+			// ROUND 80 (town movement smoothing): in shared towns use the adaptive
+			// one-packet replay segment. Its target is already a continuous linear
+			// render position, so write it directly instead of converging to a fixed
+			// 10Hz sample and stopping between updates. Collision is IGNORE in town,
+			// so the ~one-packet visual delay is harmless there.
+			const townTarget = this._mpTownRenderTarget(e);
+			if (townTarget) {
+				if (cpm.xProtected !== townTarget.x || cpm.yProtected !== townTarget.y || cpm.zProtected !== townTarget.z) {
+					cpm.xProtected = townTarget.x;
+					cpm.yProtected = townTarget.y;
+					cpm.zProtected = townTarget.z;
+					this._mpMarkCollDirty(e);
+				}
+				continue;
+			}
 			const dxm = e._mpToX - cpm.xProtected;
 			const dym = e._mpToY - cpm.yProtected;
 			const dzm = e._mpToZ - cpm.zProtected;
@@ -6586,24 +6625,34 @@ export class NetSync {
 			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * t;
 			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * t;
 		}
-		// Round 62: visual projectile copies glide through the SAME per-frame lerp
-		// targets (applyProjectileState writes _mpTo* exactly like the block-apply path;
-		// the ~250px snap threshold teleports them past a dropped-block gap).
+		// Round 62: visual projectile copies DEAD-RECKON through each host block
+		// (ROUND 80): the render target advances linearly at the projectile's real
+		// speed for up to one observed packet window after the latest sample, so the
+		// visual neither decelerates near snapshots nor stops short of the impact
+		// point when the host's final kill has no packet. If the host ever stops
+		// streaming, reapStaleProjectiles removes it shortly after the window cap.
+		const projBlend = Math.min(1, ig.system.tick * 14);
 		for (const pk in this.projectiles) {
 			const e = this.projectiles[pk];
-			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
+			if (!e || e._killed || !e.coll || typeof e._mpProjBaseX !== 'number') continue;
 			const cpp: any = e.coll.pos;
-			const dx = e._mpToX - cpp.xProtected;
-			const dy = e._mpToY - cpp.yProtected;
-			const dz = e._mpToZ - cpp.zProtected;
-			if (dx === 0 && dy === 0 && dz === 0) continue;
+			const nowMs = Date.now();
+			const ageMs = Math.max(0, nowMs - (e._mpProjBaseAt || nowMs));
+			const winMs = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : 100;
+			const adv = Math.min(ageMs, winMs) / 1000;
+			const tx = e._mpProjBaseX + (e._mpProjVelX || 0) * adv;
+			const ty = e._mpProjBaseY + (e._mpProjVelY || 0) * adv;
+			const tz = e._mpProjBaseZ;
+			const dx = tx - cpp.xProtected;
+			const dy = ty - cpp.yProtected;
+			const dz = tz - cpp.zProtected;
 			if (dx * dx + dy * dy > 250 * 250 || Math.abs(dz) > 200) {
-				cpp.xProtected = e._mpToX; cpp.yProtected = e._mpToY; cpp.zProtected = e._mpToZ;
+				cpp.xProtected = tx; cpp.yProtected = ty; cpp.zProtected = tz;
 				continue;
 			}
-			if (dx !== 0) cpp.xProtected = cpp.xProtected + dx * t;
-			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * t;
-			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * t;
+			if (dx !== 0) cpp.xProtected = cpp.xProtected + dx * projBlend;
+			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * projBlend;
+			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * projBlend;
 		}
 	}
 
@@ -6974,12 +7023,43 @@ export class NetSync {
 						if (cp) { cp.xProtected = s.x; cp.yProtected = s.y; cp.zProtected = s.z; }
 					}
 				}
+				// ROUND 80 (projectile interpolation): dead-reckon from the latest
+				// sample instead of converging to it. Keep the stream's velocity
+				// (falling back to the proxy's nominal speed only when the host
+				// reports a parked projectile), estimate the sample window from
+				// observed packet intervals, and let interpolatePuppets advance a
+				// moving target through that window. The old "converge to snapshot"
+				// lerp visibly decelerated before every block and, without a final
+				// death packet, left the visual short of the impact point.
+				const vxRaw = typeof s.vx === 'number' ? s.vx : 0;
+				const vyRaw = typeof s.vy === 'number' ? s.vy : 0;
+				const rawLen = Math.hypot(vxRaw, vyRaw);
+				// Prefer the host's ACTUAL velocity magnitude (behaviors like
+				// SLOW_DOWN legitimately change it); the proxy's nominal speed is only
+				// a first-sample fallback. Zero means the host projectile is parked —
+				// dead-reckoning must park too, not resume at nominal speed.
+				let spd = rawLen;
+				if (!(spd > 0)) spd = (typeof e.speed === 'number' && e.speed > 0)
+					? e.speed
+					: ((e.coll && typeof e.coll.maxVel === 'number' && e.coll.maxVel > 0) ? e.coll.maxVel : 0);
+				let nvx = vxRaw, nvy = vyRaw;
+				if (rawLen > 0 && spd > 0 && spd !== rawLen) { nvx = vxRaw / rawLen * spd; nvy = vyRaw / rawLen * spd; }
+				e._mpProjVelX = nvx;
+				e._mpProjVelY = nvy;
 				// Flight angle: the projectile rotates from its 2D velocity (Projectile.update
 				// recomputes animState.angle from coll.vel every frame).
-				if (e.coll && e.coll.vel) {
-					if (typeof s.vx === 'number') e.coll.vel.x = s.vx;
-					if (typeof s.vy === 'number') e.coll.vel.y = s.vy;
+				if (e.coll && e.coll.vel) { e.coll.vel.x = nvx; e.coll.vel.y = nvy; }
+				// Observed packet interval -> the dead-reckon window (one host block).
+				const prevAt: number = (typeof e._mpProjBaseAt === 'number' && e._mpProjBaseAt > 0) ? e._mpProjBaseAt : 0;
+				if (prevAt > 0 && now - prevAt >= 5 && now - prevAt <= 500) {
+					const measured = now - prevAt;
+					const old = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : measured;
+					e._mpProjWindowMs = Math.max(16, Math.min(250, old * 0.7 + measured * 0.3));
+				} else if (!(e._mpProjWindowMs > 0)) {
+					e._mpProjWindowMs = Math.max(16, Math.min(250, this.blockInterval * 1000));
 				}
+				e._mpProjBaseX = s.x; e._mpProjBaseY = s.y; e._mpProjBaseZ = s.z;
+				e._mpProjBaseAt = now;
 			}
 		} catch (_) { /* never break block apply */ }
 	}
@@ -7921,7 +8001,8 @@ export class NetSync {
 				const dx = hasTgt ? s.pos.x - ent._mpToX : 0;
 				const dy = hasTgt ? s.pos.y - ent._mpToY : 0;
 				const dz = hasTgt ? Math.abs(s.pos.z - ent._mpToZ) : 0;
-				if (!hasTgt || dx * dx + dy * dy > 120 * 120 || dz > 32) {
+				const snapped = !hasTgt || dx * dx + dy * dy > 120 * 120 || dz > 32;
+				if (snapped) {
 					// Snap: the mirror is lockEntity-locked, so write through the same
 					// protected backing fields copyEntityPosition uses.
 					this.main.copyEntityPosition(s.pos, ent.coll.pos);
@@ -7930,6 +8011,45 @@ export class NetSync {
 					this._mpMarkCollDirty(ent);
 				}
 				ent._mpToX = s.pos.x; ent._mpToY = s.pos.y; ent._mpToZ = s.pos.z;
+				// ROUND 80 (town movement smoothing): keep an adaptive one-packet
+				// replay segment for the shared-town renderer. Each sample starts a
+				// new segment from the mirror's CURRENT rendered position to the new
+				// sample, lasting the observed inter-sample interval (~100ms at 10Hz).
+				// Starting from the rendered position (not the previous sample) makes
+				// the handoff continuous even when packet intervals jitter; a snap
+				// starts a static segment at the snapped position so a teleport/
+				// respawn never glides. Leaving town drops the segment and the normal
+				// combat-capable lerp takes over.
+				try {
+					if (isSharedTownNow()) {
+						const nowMs = Date.now();
+						const prevSeg: any = ent._mpTownSeg;
+						const prevAt: number = (typeof ent._mpTownLastAt === 'number' && ent._mpTownLastAt > 0) ? ent._mpTownLastAt : 0;
+						let sx = s.pos.x, sy = s.pos.y, sz = s.pos.z;
+						if (!snapped) {
+							const cp: any = ent.coll && ent.coll.pos;
+							if (cp) {
+								if (typeof cp.xProtected === 'number') sx = cp.xProtected;
+								if (typeof cp.yProtected === 'number') sy = cp.yProtected;
+								if (typeof cp.zProtected === 'number') sz = cp.zProtected;
+							}
+						}
+						let dur = 100;
+						if (!snapped && prevAt > 0 && nowMs - prevAt >= 40 && nowMs - prevAt <= 500) {
+							dur = nowMs - prevAt;
+						} else if (!snapped && prevSeg && prevSeg.dur > 0) {
+							dur = prevSeg.dur;
+						}
+						ent._mpTownSeg = {
+							x0: sx, y0: sy, z0: sz, t0: nowMs, dur,
+							x1: s.pos.x, y1: s.pos.y, z1: s.pos.z,
+						};
+						ent._mpTownLastAt = nowMs;
+					} else if (ent._mpTownSeg) {
+						ent._mpTownSeg = null;
+						ent._mpTownLastAt = 0;
+					}
+				} catch (_) { /* history is cosmetic */ }
 				// ROUND 50: stamp WHEN the owner's real position last advanced, so the
 				// host's synthetic monster-hit gate (drainSyntheticHits) can reject a
 				// verdict against a mirror whose owner has stopped moving (out of range,
