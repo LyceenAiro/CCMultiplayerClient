@@ -367,11 +367,13 @@ function ensureChatStyle(): void {
     border-radius: 8px; font-size: 10px; line-height: 14px; text-align: center;
 }
 .mpChatClose {
+    display: none;
     margin-left: 7px; width: 15px; height: 15px;
     line-height: 13px; text-align: center;
     color: #9fc7e0; border: 1px solid rgba(159, 199, 224, 0.35);
     border-radius: 8px; font-size: 12px;
 }
+.mpChatTab:hover .mpChatClose, .mpChatTab.active .mpChatClose { display: inline-block; }
 .mpChatClose:hover { color: #fff; background: rgba(214, 69, 69, 0.8); border-color: #ff9a9a; }
 .mpChatMsgs {
     height: 132px;
