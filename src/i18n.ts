@@ -111,6 +111,11 @@ const enDict: { [key: string]: string } = {
     loginSubmit: 'Submit',
     loginRequired: 'Please enter a username',
     loginRecent: 'Recent',
+    // ROUND 103 — new online character start-mode popup
+    startModeTitle: 'Choose Your Start',
+    startModeBody: 'This is a new online character. Start from the very beginning of the story, or jump to Rookie Harbor bridge?',
+    startModeBridge: 'Rookie Harbor bridge (recommended)',
+    startModeFresh: 'Story beginning',
     deathAllDown: 'All party members down — loading last checkpoint…',
     deathCountdown: 'Respawning in {n}s',
     deathSoon: 'Respawning soon…',
@@ -314,6 +319,11 @@ const zhDict: { [key: string]: string } = {
     loginSubmit: '登录',
     loginRequired: '请输入用户名',
     loginRecent: '最近登录',
+    // ROUND 103 — 新线上角色起始方式弹窗
+    startModeTitle: '选择起始方式',
+    startModeBody: '这是一个全新的线上角色。从故事最开始创建存档，还是直接进入新手港新手桥？',
+    startModeBridge: '新手港新手桥（推荐）',
+    startModeFresh: '故事最开始',
     deathAllDown: '全队阵亡 — 正在读取最近存档点…',
     deathCountdown: '复活倒计时：{n} 秒',
     deathSoon: '即将复活…',

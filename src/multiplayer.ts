@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.37';
+export const MP_VERSION = '1.70.38';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -217,6 +217,12 @@ export class Multiplayer {
 	 * and resolved by that callback, so launchGame can AWAIT it (with a timeout
 	 * fallback) before restoring. undefined when connect() never wired the listener. */
 	private _saveDownloadPromise?: Promise<string | undefined>;
+	/** ROUND 103: first-ever login for this account (server handshakeResponse.isNew). */
+	private _isNewAccount = false;
+	/** ROUND 103: how this session's game start should behave. */
+	private _startMode: 'server' | 'fresh' | 'bridge' = 'server';
+	/** ROUND 103: the bridge choice was made; restoreServerSave zeroes playtime. */
+	private _bridgeStart = false;
 	/** Round 24 (save-clobber guard): false while the server save is STILL downloading
 	 * (restore not yet settled — download pending when the game starts fresh). ITEM 3
 	 * removed this gate from allowUpload — it no longer suppresses any upload — but
@@ -338,6 +344,9 @@ export class Multiplayer {
 		this.connection = this.config.getConnectionFor(this, server);
 
 		const username = await this.showLogin();
+		this._isNewAccount = false;
+		this._startMode = 'server';
+		this._bridgeStart = false;
 
 		await this.connection.load();
 
@@ -360,6 +369,7 @@ export class Multiplayer {
 		// this same client process logs out cleanly again (installExitHooks' guard).
 		this.name = username;
 		(this as any)._loggedOut = false;
+		this._isNewAccount = !!result.isNew;
 		(this as any)._disconnectHandled = false;
 		this._mpServerUpdatedHandled = false;
 		this._mpDisconnectTimer = null;
@@ -3174,10 +3184,43 @@ export class Multiplayer {
 		}
 	}
 
+	/** ROUND 103: modal choice for a brand-new online account. Returns 'bridge'
+	 * (restore the server's 新手港新手桥 template with zeroed playtime) or
+	 * 'fresh' (normal story beginning at hideout.entrance). */
+	private chooseStartMode(): Promise<'fresh' | 'bridge'> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const pick = (mode: 'fresh' | 'bridge') => (): void => {
+				if (settled) return;
+				settled = true;
+				resolve(mode);
+			};
+			try {
+				showMpWindow({
+					title: t('startModeTitle'),
+					content: t('startModeBody'),
+					buttons: [
+						{ label: t('startModeBridge'), style: 'mpPrimary', cb: pick('bridge') },
+						{ label: t('startModeFresh'), cb: pick('fresh') },
+					],
+				});
+			} catch (_) { /* popup unavailable -> fresh story */ }
+			// If the player closes the window with ×/outside click, default to fresh.
+			window.setTimeout(pick('fresh'), 30000);
+		});
+	}
+
 	private startConnect(): void {
 		this.connect()
-			.then(() => {
+			.then(async () => {
 				console.log('[multiplayer] Connected');
+				// ROUND 103: a brand-new account picks a start before the game launches.
+				if (this._isNewAccount) {
+					this._startMode = await this.chooseStartMode();
+					this._bridgeStart = this._startMode === 'bridge';
+				} else {
+					this._bridgeStart = false;
+				}
 				this.launchGame();
 			})
 			.catch((err: any) => {
@@ -3279,7 +3322,10 @@ export class Multiplayer {
 					// at the death moment (hp 0 -> native check ran before our death
 					// state was up).
 					const m = (window as any).__mpMain;
-					if (m && m.connection && m.connection.isOpen && m.connection.isOpen()) return false;
+					// ROUND 103: story PVP/arena/cutscene owns defeat natively. Let the
+					// engine evaluate it so the PVP KO / arena round flow can finish.
+					const native = !!(m && m.netSync && typeof m.netSync.nativeOwnsDeath === 'function' && m.netSync.nativeOwnsDeath());
+					if (m && m.connection && m.connection.isOpen && m.connection.isOpen() && !native) return false;
 					const cp = this.currentParty || [];
 					for (let a = cp.length; a--;) {
 						const ent = this.partyEntities && this.partyEntities[cp[a]];
@@ -3832,6 +3878,19 @@ export class Multiplayer {
 		ig.interact.removeEntry(ig.interact.entries[0]);
 		ig.bgm.clear('MEDIUM_OUT'); // Clear BGM
 
+		// ROUND 103 (fresh start): the player chose the story beginning. The server
+		// may have streamed the bridge template, but we deliberately do NOT restore it.
+		// _saveDownloadPromise is left alone (the connector callback resolves it in the
+		// background); no blocking overlay is needed because there is nothing to wait for.
+		if (this._startMode === 'fresh') {
+			this._saveRestoreSettled = true;
+			this.onceGameReady(() => { /* fresh story — nothing to restore */ });
+			this._saveSuppressUntil = Date.now() + 5000;
+			this._saveSuppressLogged = false;
+			ig.game.start(); // story mode: hideout.entrance, the very beginning
+			return;
+		}
+
 		// Round 23: the save arrives as a streamed saveDownload (the connector
 		// reassembles parts and resolves _saveDownloadPromise); the restore runs at
 		// loadingComplete (onceGameReady).
@@ -3964,14 +4023,28 @@ export class Multiplayer {
 	private restoreServerSave(raw: string | undefined): void {
 		if (!raw) return;
 		try {
+			let data: any = raw;
+			const tools: any = (ig as any).StorageTools;
+			// ROUND 103: bridge start must be a clean rookie start — decrypt the
+			// server template, zero BOTH persisted playtime fields (the engine writes
+			// top-level playtime and stats.player.playtime from the same counter),
+			// then continue through the ordinary restore path.
+			if (this._bridgeStart && tools) {
+				try {
+					const obj = tools.isEncrypted(raw) ? tools.decryptSlotData(raw) : JSON.parse(raw);
+					obj.playtime = 0;
+					if (obj.stats && obj.stats.player) obj.stats.player.playtime = 0;
+					this.cleanRestoredParty(obj);
+					data = tools.encryptSlotData(obj);
+					this._bridgeStart = false;
+				} catch (e) { /* fall back to the raw template */ }
+			}
 			// Normalize to the encrypted form before building the SaveSlot:
 			// SaveSlot.init only treats a "[-!_0_!-]"-prefixed string as
 			// encrypted, so a legacy plaintext save would otherwise become a
 			// string `data` and loadSlot would silently no-op (lost save).
-			let data: any = raw;
-			const tools: any = (ig as any).StorageTools;
-			if (typeof raw === 'string' && tools && !tools.isEncrypted(raw)) {
-				try { data = tools.encryptSlotData(JSON.parse(raw)); } catch (e) { /* keep as-is */ }
+			if (typeof data === 'string' && tools && !tools.isEncrypted(data)) {
+				try { data = tools.encryptSlotData(JSON.parse(data)); } catch (e) { /* keep as-is */ }
 			}
 			const slot = new (ig as any).SaveSlot(data);
 			// Defense-in-depth: drop any party members whose model doesn't
@@ -3980,7 +4053,7 @@ export class Multiplayer {
 			// the party HUD (addObserver on an undefined PartyMemberModel).
 			this.cleanRestoredParty(slot.getData());
 			(ig as any).storage.loadSlot(slot, true);
-			console.log('[multiplayer] Restored server save');
+			console.log('[multiplayer] Restored server save' + (data !== raw ? ' (bridge start, playtime zeroed)' : ''));
 		} catch (e) {
 			console.error('[multiplayer] Failed to restore server save, starting fresh', e);
 			ig.game.start();

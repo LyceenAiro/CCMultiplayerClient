@@ -383,6 +383,8 @@ export class SocketIoConnector implements IConnection {
                 mapName: string | null,
                 save?: { slot: string, data: string } | null,
                 failed?: string,
+                // ROUND 103: first-ever login — client prompts fresh vs bridge start.
+                isNew?: boolean,
                 // Round 17: version-mismatch rejections carry the human-readable
                 // reason in `message` (the older rejections use `failed`).
                 message?: string,
@@ -394,7 +396,7 @@ export class SocketIoConnector implements IConnection {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, isNew: !!data.isNew});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).

@@ -137,6 +137,7 @@ export class NetSync {
 	private _mpDeathGuiText = '';
 	private _mpDeathPos: { x: number, y: number, z: number } | null = null;
 	private _mpDeathMap = '';
+	private _mpSafeRespawnPos: { x: number, y: number, z: number } | null = null;
 	private _mpDeathCollType: any = null;
 	/** Round 11: corpse stays visible with death FX for ~1s, then gets hidden. */
 	private _mpCorpseHidden = false;
@@ -478,6 +479,49 @@ export class NetSync {
 	/** Read by the ig.game.respawn shadow installed in install(). */
 	public allowNativeRespawn(): boolean { return this._mpAllowRespawn; }
 
+	/** ROUND 103: true when a NATIVE system owns player death rather than the
+	 * multiplayer soft-death system — story PVP duels (map isolation), arena rounds
+	 * and cutscenes. In those states netSync must not swallow native death hooks,
+	 * must not enter its own corpse state, and must let the engine's defeat/KO flow
+	 * run. */
+	public nativeOwnsDeath(): boolean {
+		try {
+			if (this.main.isolated) return true;
+			const c: any = sc as any;
+			if (c.pvp && typeof c.pvp.isActive === 'function' && c.pvp.isActive()) return true;
+			if (c.arena && c.arena.active) return true;
+			if (this.inCutscene) return true;
+			if (c.model && typeof c.model.isCutscene === 'function' && c.model.isCutscene()) return true;
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** ROUND 103: true while a mirror is standing over FALL terrain (water/hole)
+	 * and should therefore be granted a short aggro grace. Each frame spent over
+	 * fall terrain pushes the deadline forward (bounded by live playerState
+	 * updates; the engine quick-fall/respawn teleports the mirror back quickly). */
+	public prolongMirrorFallGrace(t: any, now: number): boolean {
+		try {
+			if (!t || !t.coll || !t._mpMirror) return false;
+			const terr: any = (ig as any).terrain;
+			if (!terr || typeof terr.getPointTerrain !== 'function') return false;
+			const w = t.coll.size ? t.coll.size.x : 16;
+			const h = t.coll.size ? t.coll.size.y : 16;
+			const val = terr.getPointTerrain(
+				t.coll.pos.x + w / 2,
+				t.coll.pos.y + h / 2,
+				t.coll.pos.z + 4,
+				Math.min(w, 4),
+				Math.min(h, 4),
+			);
+			if (val && typeof terr.isFallTerrain === 'function' && terr.isFallTerrain(val)) {
+				t._mpWaterGraceUntil = now + 1500;
+				return true;
+			}
+		} catch (_) { /* ignore */ }
+		return !!(t && t._mpWaterGraceUntil && now < t._mpWaterGraceUntil);
+	}
+
 	constructor(private main: Multiplayer) { }
 
 	public install(): void {
@@ -587,7 +631,8 @@ export class NetSync {
 							const m = (window as any).__mpMain;
 							const pl: any = ig.game && ig.game.playerEntity;
 							const connOk = !!(m && m.connection && m.connection.isOpen && m.connection.isOpen());
-							if (b && pl && b === pl && m && m.netSync && connOk) return;
+							const native = !!(m && m.netSync && m.netSync.nativeOwnsDeath && m.netSync.nativeOwnsDeath());
+							if (b && pl && b === pl && m && m.netSync && connOk && !native) return;
 						} catch (_) { /* fall through to native */ }
 						return origDeathHit(a, b);
 					};
@@ -611,7 +656,8 @@ export class NetSync {
 							const m = (window as any).__mpMain;
 							const connOk = !!(m && m.connection && m.connection.isOpen && m.connection.isOpen());
 							const allowed = !!(m && m.netSync && m.netSync.allowNativeRespawn && m.netSync.allowNativeRespawn());
-							if (connOk && !allowed) {
+							const native = !!(m && m.netSync && m.netSync.nativeOwnsDeath && m.netSync.nativeOwnsDeath());
+							if (connOk && !allowed && !native) {
 								console.log('[netsync] native ig.game.respawn suppressed (mp death system owns it)');
 								return;
 							}
@@ -2074,7 +2120,11 @@ export class NetSync {
 						// Round 19 (Part 4): host enemies must NOT aggro a cutscene-bound
 						// member — their mirror is faded and they can't defend mid-story.
 						if (pl && (pl as any)._mpCutscene) continue;
-						if (ent && !ent._killed && ent.coll && !ent._hidden) out.push(ent);
+						// ROUND 103: never acquire a dying/fading/roster-detached mirror.
+						if (!ent || ent._killed || ent._hidden || !ent.coll) continue;
+						if (ent._mpFadeOutUntil && Date.now() < ent._mpFadeOutUntil) continue;
+						if (m.players[name] && m.players[name].entity !== ent) continue;
+						out.push(ent);
 					}
 					return out;
 				};
@@ -2095,6 +2145,23 @@ export class NetSync {
 						return r;
 					},
 					updateTarget(this: any, enemy: any) {
+						// ROUND 103: validate an existing MIRROR target BEFORE any engine use.
+						// Mirrors despawn/fade on leave; the engine raw ref would otherwise
+						// stay latched forever. Drop it and let the acquire paths below (or
+						// the vanilla reselect) pick a reachable live target.
+						try {
+							const t0 = enemy.target;
+							if (t0 && t0._mpMirror) {
+								const m0 = (window as any).__mpMain;
+								const rec = m0 && m0.players && m0.players[t0.name];
+								const invalid = !rec || rec.entity !== t0 || t0._killed || !t0.coll
+									|| t0._hidden || (t0._mpFadeOutUntil && Date.now() < t0._mpFadeOutUntil);
+								if (invalid) {
+									if (enemy._mpEngaged && enemy._mpEngaged.name === t0.name) enemy._mpEngaged = null;
+									try { enemy.setTarget(null); } catch (_) { /* ignore */ }
+								}
+							}
+						} catch (_) { /* ignore */ }
 						// ROUND 41 (item 3): an ENGAGED member (fighting alongside the host)
 						// keeps the enemy AI from falling asleep on them. The vanilla
 						// updateTarget lose-check below (distance > loseDistance for loseTime)
@@ -2200,6 +2267,12 @@ export class NetSync {
 										// bar). In range it stays pinned and keeps fighting.
 										let loseD = 320;
 										try { const td2 = this.targetDetect; if (td2 && td2.loseDistance > 0) loseD = td2.loseDistance; } catch (_) { /* ignore */ }
+										// ROUND 103: a player who fell into water/quick-fall is being
+										// respawned by the engine. Hold the target through the short
+										// grace instead of de-aggroing the enemy mid-fall.
+										const m0x = (window as any).__mpMain;
+										const waterGrace = !!(m0x && m0x.netSync && m0x.netSync.prolongMirrorFallGrace
+											&& m0x.netSync.prolongMirrorFallGrace(mir, Date.now()));
 										// ROUND 48 (the persistent "member takes NO enemy damage" fix): the ROUND 47
 										// far-drop released _mpEngaged but left enemy.target STILL set on the far mirror
 										// — and the proximity-acquire branch below requires a TARGETLESS enemy
@@ -2210,7 +2283,7 @@ export class NetSync {
 										// the mirror proximity-acquire below, or the connect re-latch (mirror branch of
 										// onPreDamageModification) — so an enemy that can genuinely reach the member still
 										// attacks; one that cannot re-acquires a close target instead of idling while red.
-										if (enemy.distanceTo(mir) > loseD) {
+										if (!waterGrace && enemy.distanceTo(mir) > loseD) {
 											try { const m2 = (window as any).__mpMain; if (m2 && m2.netSync) m2.netSync._sfxLog('tg.hostlose', 'uid=' + (enemy && enemy.uid) + ' eng=' + (eng && eng.name) + ' d=' + Math.round(enemy.distanceTo(mir)) + '>' + Math.round(loseD)); } catch (_) { /* ignore */ }
 											enemy._mpEngaged = null;
 											// ROUND 48: drop the stale far-mirror target too, so the proximity-acquire
@@ -2249,12 +2322,15 @@ export class NetSync {
 							if (enemy.target && !enemy._killed) {
 								const tgt = enemy.target;
 								if (tgt && tgt._mpMirror) {
+									const m0w = (window as any).__mpMain;
+									const inWaterGrace = !!(m0w && m0w.netSync && m0w.netSync.prolongMirrorFallGrace
+										&& m0w.netSync.prolongMirrorFallGrace(tgt, Date.now()));
 									let sameBlock2 = true;
 									try {
 										sameBlock2 = (ig.game as any).getLevelIdx(enemy.coll.pos.z)
 											=== (ig.game as any).getLevelIdx(tgt.coll.pos.z);
 									} catch (_) { sameBlock2 = true; }
-									if (!sameBlock2) {
+									if (!inWaterGrace && !sameBlock2) {
 										try { enemy.setTarget(null); } catch (_) { /* ignore */ }
 										try { enemy._mpEngaged = null; } catch (_) { /* ignore */ }
 									} else {
@@ -2264,7 +2340,7 @@ export class NetSync {
 										// the instant they close back within loseDistance, so a real fight is intact.
 										let loseD2 = 320;
 										try { const td3 = this.targetDetect; if (td3 && td3.loseDistance > 0) loseD2 = td3.loseDistance; } catch (_) { /* ignore */ }
-										if (!enemy._mpEngaged && enemy.distanceTo(tgt) > loseD2) {
+										if (!inWaterGrace && !enemy._mpEngaged && enemy.distanceTo(tgt) > loseD2) {
 											try { const m3 = (window as any).__mpMain; if (m3 && m3.netSync) m3.netSync._sfxLog('tg.rangeless', 'uid=' + (enemy && enemy.uid) + ' d=' + Math.round(enemy.distanceTo(tgt)) + '>' + Math.round(loseD2)); } catch (_) { /* ignore */ }
 											try { enemy.setTarget(null); } catch (_) { /* ignore */ }
 										}
@@ -7578,8 +7654,25 @@ export class NetSync {
 	private checkOwnDeath(): void {
 		const p: any = ig.game.playerEntity;
 		if (!p || !p.params) return;
+		// ROUND 103: story PVP/arena/cutscene owns player death. Let the native
+		// defeat flow run and clear any multiplayer soft-death state a switch into
+		// one of those states could leave behind.
+		if (this.nativeOwnsDeath()) {
+			this._mpAllDeadAt = 0;
+			if (this._mpDead) {
+				try { this.respawn(p, true); } catch (_) { /* ignore */ }
+			}
+			return;
+		}
 		if (!this._mpDead) {
-			if (p.params.currentHp <= 0 && !p._killed) this.enterDeath(p);
+			// ROUND 103: use the engine's real defeat flag. HP can legitimately sit
+			// at 0 without a defeat (SET_HP_CRITICAL / Karma Scale absorb), which used
+			// to start the multiplayer death flow falsely.
+			const defeated = !!(p.params
+				&& typeof p.params.isDefeated === 'function'
+				? (p.params.isDefeated() === true || (p.params.defeated === true))
+				: p.params.currentHp <= 0);
+			if (defeated && !p._killed) this.enterDeath(p);
 			return;
 		}
 		// ---- dead ----
@@ -7758,6 +7851,13 @@ export class NetSync {
 		this.clearChargeFreeze();
 		this._mpDeathPos = p.coll ? { x: p.coll.pos.x, y: p.coll.pos.y, z: p.coll.pos.z } : null;
 		this._mpDeathMap = (ig.game as any).mapName || '';
+		// ROUND 103: remember the engine's last-safe respawn anchor for revival
+		// placement (the mirror can be mid-air/over water; see pickReviveSpot).
+		try {
+			this._mpSafeRespawnPos = (p && p.respawn && p.respawn.pos && isFinite(p.respawn.pos.x))
+				? { x: p.respawn.pos.x, y: p.respawn.pos.y, z: p.respawn.pos.z }
+				: (this._mpDeathPos ? { ...this._mpDeathPos } : null);
+		} catch (_) { this._mpSafeRespawnPos = this._mpDeathPos ? { ...this._mpDeathPos } : null; }
 		// The engine's death flow (_onDeathHit) sets coll.type to IGNORE; remember
 		// the prior type to restore on respawn. If it already ran (IGNORE), leave
 		// null -> respawn restores the player default (COLLTYPE.VIRTUAL).
@@ -8031,23 +8131,31 @@ export class NetSync {
 		// model invisible but movable. Force alpha back to 1 the moment we show.
 		try { if ((p as any).animState) (p as any).animState.alpha = 1; } catch (_) { /* ignore */ }
 		// Restore the collision type the engine's death flow set to IGNORE.
-		try { if (p.coll) p.coll.type = (this._mpDeathCollType != null) ? this._mpDeathCollType : (ig as any).COLLTYPE.VIRTUAL; } catch (_) { /* ignore */ }
+		try {
+			if (p.coll) {
+				const targetType = (this._mpDeathCollType != null) ? this._mpDeathCollType : (ig as any).COLLTYPE.VIRTUAL;
+				if (typeof p.coll.setType === 'function') p.coll.setType(targetType);
+				else p.coll.type = targetType;
+			}
+		} catch (_) { /* ignore */ }
 		this._mpDeathCollType = null;
 		// Stand back up next to a live PARTY teammate when one is present (a live
 		// party mirror is by definition on our map). keepPos = a teleport is about
 		// to place us; don't fight it.
 		const mirror = keepPos ? null : this.firstLiveMirror();
-		if (mirror && mirror.coll && p.coll) {
+		if (!keepPos && p.coll) {
 			try {
-				// Round 21 (issue 2): pick a WALL-FREE spot next to the teammate instead
-				// of the old hard-coded +24 X (which landed the player inside a wall when
-				// the mirror stands against an east wall). Falls back to the mirror's exact
-				// position (guaranteed walkable) or, on any engine error, the old +24 spot.
-				const spot = this.findFreeReviveSpot(mirror, p);
-				p.coll.pos.x = spot.x;
-				p.coll.pos.y = spot.y;
-				p.coll.pos.z = spot.z;
-			} catch (_) { /* ignore */ }
+				const spot = this.pickReviveSpot(mirror, p);
+				if (spot) {
+					// ROUND 103: commit through the engine setter (validates the point,
+					// updates collision-map bucketing + baseZ), not raw coll.pos writes.
+					if (typeof p.setPos === 'function') p.setPos(spot.x, spot.y, spot.z);
+					else { p.coll.pos.x = spot.x; p.coll.pos.y = spot.y; p.coll.pos.z = spot.z; }
+					if (p.respawn && p.respawn.pos) {
+						try { (p.respawn.pos as any).x = spot.x; (p.respawn.pos as any).y = spot.y; (p.respawn.pos as any).z = spot.z; } catch (_) { /* ignore */ }
+					}
+				}
+			} catch (_) { /* ignore — revival must never be blocked */ }
 		}
 		// REVIVE PRESENTATION (round 11): the vanilla water/checkpoint-respawn
 		// visuals — a beam from the death spot to the revive spot (`respawnLine` on
@@ -8104,6 +8212,7 @@ export class NetSync {
 		try { p.invincibleTimer = 2; } catch (_) { /* ignore */ }
 		this._mpDeathPos = null;
 		this._mpDeathMap = '';
+		this._mpSafeRespawnPos = null;
 		try { if (p.setCurrentAnim) p.setCurrentAnim('idle', true, null, true); } catch (_) { /* ignore */ }
 		// Round 21 (issue 3): wipe-and-rebuild name tags on LOCAL revival (position +
 		// coll already restored above). The per-frame pump rebuilds the own tag at the
@@ -8128,39 +8237,66 @@ export class NetSync {
 	 * else the mirror's EXACT position (guaranteed walkable — the mirror stands there).
 	 * On ANY exception falls back to the old +24 spot — revival must never break.
 	 */
-	private findFreeReviveSpot(mirror: any, p: any): { x: number, y: number, z: number } {
-		const fallback = {
-			x: mirror.coll.pos.x + 24,
-			y: mirror.coll.pos.y,
-			z: mirror.coll.pos.z,
-		};
+	/** ROUND 103: validate a soft-revive spot: solid, grounded, not over fall/
+	 * dangerous terrain. Used before re-placing the player body at revive time. */
+	private validReviveSpot(x: number, y: number, z: number, w: number, h: number, d: number): { x: number, y: number, z: number } | null {
 		try {
 			const g: any = ig.game;
-			if (!g || typeof g.isAreaBlocked !== 'function' || !p.coll || !mirror.coll) return fallback;
+			const t: any = (ig as any).terrain;
+			const phy: any = g && g.physics;
+			if (!g || !g.isAreaBlocked) return null;
+			if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+			const lvl = (typeof g.getLevelIdx === 'function') ? g.getLevelIdx(z) : -1;
+			if (lvl < 0 || !g.levels || !g.levels[lvl] || !g.levels[lvl].collision) return null;
+			if (g.isAreaBlocked(x, y, z, w, h, Math.min(d, 4), true)) return null;
+			let ground = z;
+			if (phy && typeof phy.getBaseZPos === 'function') {
+				ground = phy.getBaseZPos(x + w / 2, y + h / 2, z, w, h);
+				if (!Number.isFinite(ground) || ground < -900 || Math.abs(ground - z) > 24) return null;
+			}
+			if (g.isAreaBlocked(x, y, ground, w, h, Math.min(d, 4), true)) return null;
+			if (typeof g.isOverHole === 'function' && g.isOverHole(x, y, ground, w, h, Math.min(4, d), false)) return null;
+			if (t && typeof t.getPointTerrain === 'function') {
+				const val = t.getPointTerrain(x + w / 2, y + h / 2, ground + 4, Math.min(w, 4), Math.min(h, 4));
+				if (val && ((typeof t.isFallTerrain === 'function' && t.isFallTerrain(val))
+					|| (typeof t.isDangerTerrain === 'function' && t.isDangerTerrain(val)))) return null;
+			}
+			return { x, y, z: ground };
+		} catch (_) { return null; }
+	}
+
+	/** ROUND 103: pick a safe revive spot. Candidate order: offsets around the
+	 * live teammate mirror, the mirror itself, the engine-maintained safe respawn
+	 * anchor, the death spot, then map start — each validated by validReviveSpot. */
+	private pickReviveSpot(mirror: any, p: any): { x: number, y: number, z: number } | null {
+		try {
 			const w = p.coll.size.x;
 			const h = p.coll.size.y;
-			const z = mirror.coll.pos.z;
-			// Candidate top-left corners are mirror.coll.pos + offset; test with the PLAYER's
-			// collision size (w,h) on the same z-plane. includeEntities=false.
-			const blocked = (x: number, y: number): boolean => {
-				try { return !!g.isAreaBlocked(x, y, z, w, h, 0, false); }
-				catch (_) { return true; } // engine error -> treat as blocked, try next candidate
-			};
-			const bx = mirror.coll.pos.x;
-			const by = mirror.coll.pos.y;
-			if (!blocked(bx + 24, by)) return { x: bx + 24, y: by, z };
-			// Ring-search same Z-plane alternatives around the mirror, nearest first.
-			const offsets: Array<[number, number]> = [
-				[-24, 0], [0, -24], [0, 24], [-48, 0], [48, 0], [0, -48], [0, 48],
-				[-24, -24], [-24, 24], [24, -24], [24, 24], [-64, 0], [64, 0], [0, -64], [0, 64],
-			];
-			for (const [dx, dy] of offsets) {
-				if (!blocked(bx + dx, by + dy)) return { x: bx + dx, y: by + dy, z };
+			const d = p.coll.size.z;
+			const cands: Array<{ x: number, y: number, z: number }> = [];
+			if (mirror && mirror.coll) {
+				const b = mirror.coll.pos;
+				const offs: Array<[number, number]> = [
+					[24, 0], [-24, 0], [0, -24], [0, 24], [-48, 0], [48, 0], [0, -48], [0, 48],
+					[-24, -24], [-24, 24], [24, -24], [24, 24], [-64, 0], [64, 0], [0, -64], [0, 64],
+				];
+				for (const [dx, dy] of offs) cands.push({ x: b.x + dx, y: b.y + dy, z: b.z });
+				cands.push({ x: b.x, y: b.y, z: b.z });
 			}
-			// Everything blocked: the mirror's exact position is guaranteed walkable.
-			return { x: bx, y: by, z };
+			if (this._mpSafeRespawnPos) cands.push(this._mpSafeRespawnPos);
+			if (this._mpDeathPos) cands.push(this._mpDeathPos);
+			if (p.respawn && p.respawn.pos) cands.push({ x: p.respawn.pos.x, y: p.respawn.pos.y, z: p.respawn.pos.z });
+			if (p.mapStartPos) cands.push({ x: p.mapStartPos.x, y: p.mapStartPos.y, z: p.mapStartPos.z });
+			for (const c of cands) {
+				if (!c || !Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) continue;
+				const ok = this.validReviveSpot(c.x, c.y, c.z, w, h, d);
+				if (ok) return ok;
+			}
+			return null;
 		} catch (_) {
-			return fallback; // never break revival
+			return (mirror && mirror.coll)
+				? { x: mirror.coll.pos.x + 24, y: mirror.coll.pos.y, z: mirror.coll.pos.z }
+				: null; // revival must never break
 		}
 	}
 
