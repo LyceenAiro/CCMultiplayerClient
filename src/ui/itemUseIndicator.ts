@@ -25,6 +25,8 @@ let getMain: () => Multiplayer | undefined = () => undefined;
 interface IIcon {
     player: string;
     entity: any;      // spawned sc.FoodIconEntity
+    coll: any;        // target mirror's coll (the stand-in follows this too)
+    until: number;
 }
 
 interface IPending {
@@ -129,7 +131,15 @@ function tryShowItemUse(player: string, item: string | number): boolean {
         log('spawn failed for ' + player);
         return false; // retry — a null spawn is usually a one-frame fluke
     }
-    const ic: IIcon = { player, entity: fx };
+    // Force the renderer to never cull the icon (its coll starts at 0,0,0 until
+    // the first deferredUpdate / our manual per-frame position below).
+    try { fx.coll.alwaysRender = true; } catch (_) { /* ignore */ }
+    // Full scale from the very first frame (see the per-frame pump below).
+    try { fx.timer = 0; } catch (_) { /* ignore */ }
+    // Belt-and-braces: make sure the freshly spawned icon is actually shown.
+    try { (fx as any).show(); } catch (_) { /* ignore */ }
+
+    const ic: IIcon = { player, entity: fx, coll: ent.coll, until: Date.now() + 1500 };
     live.push(ic);
     log('spawned food icon for ' + player + ' item=' + item + ' sprite=' + foodName);
 
@@ -200,11 +210,35 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
         const s: any = (window as any).simplify;
         if (s && typeof s.registerUpdate === 'function') {
             s.registerUpdate(() => {
-                if (!pending.length) return;
                 const now = Date.now();
+
+                // Retry queued spawns until the mirror exists.
                 for (let i = pending.length - 1; i >= 0; i--) {
                     const p = pending[i];
                     if (now >= p.until || tryShowItemUse(p.player, p.item)) pending.splice(i, 1);
+                }
+
+                // Keep live icons glued to their mirror + expire them. This manual
+                // per-frame setPos makes the icon independent of FoodIconEntity's
+                // own deferredUpdate pipeline (culling/deferred ordering can differ
+                // in the modded engine; alwaysRender is set at spawn too).
+                for (let i = live.length - 1; i >= 0; i--) {
+                    const ic = live[i];
+                    if (!ic || !ic.entity) { live.splice(i, 1); continue; }
+                    if (ic.entity._killed || now >= ic.until) { killIcon(ic); continue; }
+                    try {
+                        if (ic.coll) {
+                            const x = ic.coll.pos.x + ic.coll.size.x / 2;
+                            const y = ic.coll.pos.y + ic.coll.size.y;
+                            const z = ic.coll.pos.z;
+                            ic.entity.setPos(x, y, z);
+                        }
+                        // FoodIconEntity's sprite scale derives from `timer` (0 => full
+                        // scale for HOLD/BUBBLE). Force it to 0 every frame so the icon
+                        // is ALWAYS fully visible, even if the entity's deferredUpdate
+                        // (which normally decrements it) didn't run for any reason.
+                        try { if (ic.entity.timer > 0 && ic.entity.state !== 2) ic.entity.timer = 0; } catch (_) { /* ignore */ }
+                    } catch (_) { /* ignore */ }
                 }
             });
         }
