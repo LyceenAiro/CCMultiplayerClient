@@ -2,6 +2,7 @@ import { Multiplayer } from '../multiplayer';
 import { dropNameTag, wipeAllNameTags } from './mpOptions';
 import { t } from '../i18n';
 import { showMpToast } from './toasts';
+import { openPrivateChannel } from './chatBox';
 
 /**
  * Social-menu overhaul (replaces the old L-key overlay). Injects into the game's
@@ -1988,7 +1989,16 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             return this.parent(b);
         },
         contactMember(this: any, b: string) {
-            if (isMpPlayer(b)) return; // no single-player "contact" for a real player
+            if (isMpPlayer(b)) {
+                // ROUND 93: 联系 on a real player opens the private chat channel with
+                // them (multi-tab, closable — see chatBox.ts). Close the options popup
+                // and the social menu first so the chat input owns the focus.
+                try { if (this.options && typeof this.options.hideSortMenu === 'function') this.options.hideSortMenu(); } catch (_) { /* ignore */ }
+                try { if (typeof this.onOptionsBack === 'function') this.onOptionsBack(); } catch (_) { /* ignore */ }
+                try { if (typeof this.exitMenu === 'function') this.exitMenu(); } catch (_) { /* ignore */ }
+                openPrivateChannel(b, true);
+                return;
+            }
             return this.parent(b);
         },
         // The options popup is rebuilt deterministically on every open (see

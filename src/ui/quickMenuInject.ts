@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
+import { openPrivateChannel } from './chatBox';
 
 /**
  * Quick-menu (SHIFT) inspect enhancements:
@@ -332,8 +333,8 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
 
     // Info box: enemy-box layout — title, HP/ATK/DEF/FOC icon lines, element
     // resistances, then TWO independent action rows below:
-    //   - friend row: 添加好友 (only while NOT a friend; confirmed friends never
-    //     see add/remove-friend buttons)
+    //   - friend row: 添加好友 for non-friends, 联系 for confirmed friends (opens
+    //     the private chat channel — ROUND 93)
     //   - party row:  踢出队伍 (I am the leader), 退出队伍 (I am a member), or
     //     邀请组队 (friend, not in party, shared town)
     // ROUND 91: the level is NOT in the box — it lives on the head plate above
@@ -474,12 +475,12 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 const inParty = !!(m && Array.isArray(m.partyMembers) && m.partyMembers.indexOf(username) !== -1);
                 const isLeader = !!(m && m.partyLeader && m.name && m.partyLeader === m.name);
                 const friend = isFriend(username);
-                // Friend row: ONLY for non-friends. Confirmed friends never see
-                // add-friend and never see remove-friend.
-                const friendAction = friend ? '' : 'friend';
+                // Friend row (ROUND 93): non-friends get 加好友; CONFIRMED friends get
+                // 联系, which opens the private chat channel with that player.
+                const friendAction = friend ? 'contact' : 'friend';
                 this._mpFriendAction = friendAction;
-                this.friendBtn.setText(friendAction ? t('addFriend') : '', true);
-                try { this.friendBtn.hook._visible = !!friendAction; } catch (_) { /* ignore */ }
+                this.friendBtn.setText(friendAction === 'contact' ? t('optContact') : t('addFriend'), true);
+                try { this.friendBtn.hook._visible = true; } catch (_) { /* ignore */ }
                 // Party row: kick when I lead this party, leave when I'm just a
                 // member inspecting another member, and INVITE for every other
                 // online player — friend or not (ROUND 92).
@@ -500,7 +501,19 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
         _mpFriendPress(this: any) {
             try {
                 const m = getMain();
-                if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername || this._mpFriendAction !== 'friend') return;
+                if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername) return;
+                if (this._mpFriendAction === 'contact') {
+                    // 联系: close the quick menu and enter the private chat channel
+                    // with this friend (input focused, ready to type).
+                    try {
+                        const qm = scAny.quickmodel;
+                        if (qm && typeof qm.exitQuickMenu === 'function') qm.exitQuickMenu();
+                    } catch (_) { /* ignore */ }
+                    openPrivateChannel(this._mpUsername, true);
+                    console.log('[multiplayer] quick-menu: opening private chat with ' + this._mpUsername);
+                    return;
+                }
+                if (this._mpFriendAction !== 'friend') return;
                 m.connection.friendAdd(this._mpUsername);
                 this.friendBtn.setText(t('friendReqSent'), true);
                 console.log('[multiplayer] quick-menu: friend request sent to ' + this._mpUsername);

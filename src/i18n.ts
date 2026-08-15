@@ -152,10 +152,22 @@ const enDict: { [key: string]: string } = {
     partyMemberLeft: '{name} left the party',
     partyMemberKicked: '{name} was kicked from the party',
     partyMemberDisconnected: '{name} disconnected from the party',
-    // round 23 wave 4 — party chat (chatBox.ts)
+    // round 23 wave 4 — chat (chatBox.ts)
     chatPlaceholder: 'Type a message, Enter to send…',
     chatSend: 'Send',
     chatNotInParty: 'Not in a party — party chat unavailable',
+    // ROUND 93 — MMO-style chat channels (chatBox.ts)
+    chatWorld: 'World',
+    chatParty: 'Party',
+    chatPrivatePh: 'Message {name}, Enter to send…',
+    chatClosePrivate: 'Close private chat',
+    chatNotConnected: 'Not connected to the server',
+    chatPrivateOffline: '{name} is offline',
+    chatRateLimited: 'You are sending messages too fast',
+    chatSelf: "You can't message yourself",
+    chatInvalidTarget: 'Invalid chat recipient',
+    chatSendFailed: 'Failed to send message',
+    chatPartyDisbanded: 'The party has been disbanded',
     // round 24 — save-toast toggle + simplified party-invite popup
     optShowSaveToast: 'Show Save Toast',
     optShowSaveToastDesc: 'Shows a toast when your save has been uploaded to the server.',
@@ -341,6 +353,18 @@ const zhDict: { [key: string]: string } = {
     chatPlaceholder: '输入消息，回车发送…',
     chatSend: '发送',
     chatNotInParty: '你不在队伍中，无法发送小队消息',
+    // ROUND 93 — MMO式聊天频道 (chatBox.ts)
+    chatWorld: '世界',
+    chatParty: '小队',
+    chatPrivatePh: '私聊 {name}，回车发送…',
+    chatClosePrivate: '关闭私聊',
+    chatNotConnected: '未连接到服务器',
+    chatPrivateOffline: '{name} 不在线',
+    chatRateLimited: '发送消息太快了，请稍后再试',
+    chatSelf: '不能私聊自己',
+    chatInvalidTarget: '无效的聊天对象',
+    chatSendFailed: '消息发送失败',
+    chatPartyDisbanded: '队伍已解散',
     // round 24 — 保存提示开关 + 简化版组队邀请弹窗
     optShowSaveToast: '显示保存提示',
     optShowSaveToastDesc: '存档成功上传到服务器后显示提示通知',

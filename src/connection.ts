@@ -203,13 +203,17 @@ export interface IConnection {
     /** Ask the server for a teammate's location (manual regroup). `target` = the
      * clicked teammate's username; without it the leader is used. */
     partyRegroup(target?: string): void;
-    /** Round 23 wave 4 (party chat): send a PARTY-ONLY chat message. The server
-     * relays it to every other party member in the SAME map instance; the sender
-     * echoes locally (the server never echoes). */
-    chat(text: string): void;
-    /** Round 23 wave 4 (party chat): a party teammate's chat message arrived
-     * (server-relayed, only from same-instance party members). */
-    onChat(cb: (msg: { from: string, text: string }) => void): void;
+    /** ROUND 93 (chat channels): send a chat message. `channel` is 'world'
+     * (global), 'party' (team) or 'private' (direct message to `target`). The
+     * server relays it and never echoes to the sender. */
+    chat(text: string, channel: 'world' | 'party' | 'private', target?: string): void;
+    /** ROUND 93 (chat channels): an incoming chat message. `channel` tells the
+     * UI which tab it belongs to ('world' / 'party' / 'private'). */
+    onChat(cb: (msg: { from: string, text: string, channel?: string, target?: string }) => void): void;
+    /** ROUND 93: the server rejected an outgoing chat message. Reasons: 'rate',
+     * 'notInParty', 'invalidTarget', 'offline'. `target` names the private-chat
+     * recipient when relevant. */
+    onChatError(cb: (err: { reason?: string, channel?: string, target?: string }) => void): void;
     /** Host -> all: the native party BOTS currently in the roster (round 11).
      * Members spawn local follower copies so they can SEE the host's bots.
      * Round 27 (item 2): `maps` carries the HOST's map for each BOT so the party

@@ -2,44 +2,77 @@ import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 
 /**
- * Round 23 wave 4 — PARTY CHAT.
+ * ROUND 93 — MMO-STYLE CHAT CHANNELS (replaces the round-23 party-only popup).
  *
- * Press Enter in-game to open a bottom-center chat input (same navy/cyan visual
- * language as the login panel — see ensureChatStyle). Chat is PARTY-ONLY: the
- * server relays a `chat {text}` to every OTHER party member in the SAME map
- * instance, and the sender echoes locally (the server never echoes).
+ * The chat lives in a fixed DOM panel at the BOTTOM-LEFT of the game screen:
+ *   - channel tabs/cards along the top (世界 / 小队 / one card per private chat),
+ *   - a message list under them, auto-scrolled to the newest row,
+ *   - an input strip that appears when Enter is pressed and stays open after
+ *     sending (Enter with an empty box closes it, Escape cancels).
  *
- * Incoming messages render as a look-alike NPC dialogue box: an sc.ArrowBoxGui
- * (POINTER.TOP_RIGHT speech-bubble) + sc.TextGui (IMMEDIATE text speed) + a green
- * sender-name plate, stacked bottom-left in a persistent ig.gui overlay (zIndex
- * 7 — above the name tags / net-HUD). Messages auto-fade after ~8s and the stack
- * is capped at MAX_CHAT_MSGS (oldest dropped).
+ * Three channel kinds, routed server-side:
+ *   world   — global server broadcast (1/s per player).
+ *   party   — every party member, regardless of map/instance.
+ *   private — one named player; tabs are created by the 联系 buttons (quick-menu
+ *             friend row + social-menu option) and by incoming private messages.
+ *             Private tabs are closable; world/party tabs are permanent.
  *
  * The Enter hook is a CAPTURE-phase window keydown listener (never a rebind of
- * ig.KEY.ENTER / sc.control). It consumes the keypress — preventDefault +
- * stopPropagation — ONLY when it opens the chat or while the chat is open;
- * otherwise the event passes to the game untouched. It also refuses to fire when
- * the event target is an input/textarea/select/contentEditable (so typing in the
- * login/F8/add-friend boxes is never hijacked).
+ * ig.KEY.ENTER / sc.control). While the input is open it consumes every key not
+ * aimed at a text-entry element so game bindings never fire; while closed, a
+ * bare Enter opens the input. IME composition events are never treated as send
+ * (keyCode 229 / isComposing pass untouched).
  *
- * Round 24 wave — HISTORY + FLIPPED BUBBLE.
- *  - The bubble pointer is vertically flipped (BOTTOM_RIGHT) so the tail points
- *    DOWN instead of up.
- *  - Chat history (last 50, client-local, persisted to localStorage) is recorded
- *    for every message that passes through displayChat — incoming and own-sent —
- *    and shown in a small panel above the input strip while the chat is open.
- *    The panel shows the newest 3 rows, scrolls smoothly on mouse wheel over it
- *    (capture-phase, so the game camera/menu never reacts), and pins to the
- *    bottom while the user is at the newest message.
- *  - Pressing Enter with an empty box now CLOSES the chat (previously a no-op).
+ * History is per-channel, per-ACCOUNT (localStorage key includes the username so
+ * one login's messages never leak into another) and capped at 50 persisted rows
+ * per channel. System lines are shown but never persisted.
  */
+
+type ChatKind = 'world' | 'party' | 'private';
+
+interface ChatMessage {
+    from: string;   // '' => system line
+    text: string;
+    ts: number;
+}
+
+interface ChatChannel {
+    id: string;
+    kind: ChatKind;
+    /** private recipient username (the OTHER side of the conversation) */
+    target?: string;
+    messages: ChatMessage[];
+    unread: number;
+}
+
+export interface IChatMessage {
+    from: string;
+    text: string;
+    channel?: string;
+    target?: string;
+}
+
+export interface IChatError {
+    reason?: string;
+    channel?: string;
+    target?: string;
+}
 
 let getMain: () => Multiplayer | undefined = () => undefined;
 
-let overlay: any = null;                 // persistent ig.GuiElementBase added to ig.gui
-let messages: any[] = [];                // live message wrappers, newest LAST
-let installed = false;                   // once-per-process keydown capture guard
+let installed = false;                       // once-per-process keydown capture guard
 let captureKeydown: ((e: KeyboardEvent) => void) | null = null;
+
+let chatOpen = false;                        // input strip currently visible
+let panel: HTMLElement | null = null;        // fixed bottom-left panel
+let tabsEl: HTMLElement | null = null;
+let msgsEl: HTMLElement | null = null;
+let inputRowEl: HTMLElement | null = null;
+let inputEl: HTMLInputElement | null = null;
+let chatFocusListener: (() => void) | null = null;
+
+let channels: ChatChannel[] = [];
+let activeId = 'world';
 
 // X1: the engine's ig.input.keydown/keyup saved once at install and replaced with
 // wrappers that no-op while the chat input is open (game bindings must never fire
@@ -49,35 +82,12 @@ let captureKeydown: ((e: KeyboardEvent) => void) | null = null;
 let origInputKeydown: ((a: any) => void) | null = null;
 let origInputKeyup: ((a: any) => void) | null = null;
 
-let chatOpen = false;                    // chat input currently shown
-let inputBox: JQuery | null = null;      // the DOM strip
-let inputEl: JQuery | null = null;       // the text input inside it
-let chatFocusListener: (() => void) | null = null;
-
-// Round 24 — persistent client-local chat history + the history panel shown above
-// the input strip while the chat is open. History survives restarts (localStorage,
-// write-through on every append). Rows are stored RAW and sanitized/escaped only
-// at render time.
-const HISTORY_KEY = 'mpChatHistory';
-const MAX_HISTORY = 50;
-const HIST_PANEL_ROWS = 3;               // rows visible in the panel at once
-const HIST_ROW_H = 21;                   // px per history row (line-height)
-const HIST_ROW_GAP = 1;                  // px gap between rows
-const HIST_ROW_STEP = HIST_ROW_H + HIST_ROW_GAP;
-const HIST_PANEL_H = HIST_PANEL_ROWS * HIST_ROW_STEP;
-let history: { n: string, t: string, ts: number }[] = []; // newest LAST
-let histPanel: HTMLElement | null = null;   // fixed container above the input strip
-let histColumn: HTMLElement | null = null;  // scrollable inner column (newest at bottom)
-let histWheelHandler: ((e: any) => void) | null = null;
-let histOffset = 0;                      // float scroll offset, clamped to [0, maxHistOffset()]
-
-const MAX_CHAT_MSGS = 4;
-const CHAT_MSG_TTL_MS = 8000;
-const CHAT_FADE_MS = 0.3;
-const MSG_GAP = 8;
-const MSG_MARGIN_X = 12;
-const MSG_MARGIN_Y = 12;
-const MSG_MAX_WIDTH = 340;
+const WORLD_ID = 'world';
+const PARTY_ID = 'party';
+const PRIVATE_PREFIX = 'pm:';
+const MAX_MESSAGES = 80;        // live rows kept per channel
+const PERSIST_MAX = 50;         // persisted rows kept per channel
+const PERSIST_PREFIX = 'mpChatChannelsV2:';
 
 /** True when the keydown event target is a text-entry element — the chat hook
  * must never hijack keys while the player is typing somewhere else. */
@@ -91,8 +101,8 @@ function isTypingTarget(e: Event): boolean {
 }
 
 /** The F8 command box and the login panel are DOM modals; when either is up the
- * Enter key belongs to them, not to party chat. Same detection the modules
- * themselves use (gamecodeMessage / mpLogin class names). */
+ * Enter key belongs to them, not to chat. Same detection the modules themselves
+ * use (gamecodeMessage / mpLogin class names). */
 function modalPanelOpen(): boolean {
     try {
         if (document.querySelector('.mpLogin')) return true;             // login panel
@@ -113,10 +123,7 @@ function canOpenChat(): boolean {
         if (main.anyMenuOpen()) return false;
         const mdl: any = (sc as any).model;
         if (mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene()) return false;
-        // Board/private/tutorial message boxes (NOT cutscene-driven) also block
-        // interact — but ig.interact.isBlocked() only covers blockTimer>0, which
-        // expires ~0.1s after the box shows, so gate on the message model itself
-        // (sc.model.message.isBlocking()).
+        // Board/private/tutorial message boxes also block interact.
         const msg: any = mdl && mdl.message;
         if (msg && typeof msg.isBlocking === 'function' && msg.isBlocking()) return false;
         const inter: any = (ig as any).interact;
@@ -134,7 +141,6 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
     getMain = gm;
     if (installed) return;
     installed = true;
-    loadHistory(); // Round 24: restore the client-local history once per process
     captureKeydown = (e: KeyboardEvent): void => {
         try {
             const code = e.keyCode || e.which;
@@ -157,13 +163,13 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
             // open. Typing in the chat input itself (target = the text input) still
             // passes through untouched, so the input element handles it normally.
             if (chatOpen) {
-                if (code === 27) { // Escape cancels (X2) — consume in every case
+                if (code === 27) { // Escape cancels — consume in every case
                     e.preventDefault();
                     e.stopPropagation();
-                    closeChatInput();
+                    closeInput();
                     return;
                 }
-                if (code === 13 || code === 108) { // Enter / keypad Enter (X3)
+                if (code === 13 || code === 108) { // Enter / keypad Enter
                     // Enter NOT aimed at the chat input must never reach the game —
                     // consume it. When it IS aimed at the input (typing=true) the
                     // input's own submit handler sends it.
@@ -181,7 +187,7 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
                 if (canOpenChat()) {
                     e.preventDefault();
                     e.stopPropagation();
-                    openChat();
+                    openInput();
                 }
                 return;
             }
@@ -191,10 +197,6 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
 
     // X1 belt-and-braces: wrap ig.input.keydown/keyup so game bindings cannot fire
     // while the chat input is open, for any code path that reaches them directly.
-    // The engine's own window listener was bound to the ORIGINAL at input-init, so
-    // the capture-phase suppression above is the primary gate; these wrappers are
-    // harmless if the engine never calls them. When the chat closes (chatOpen=false)
-    // they pass straight through to the originals — the suppression restores itself.
     const inp: any = (ig as any).input;
     if (inp && typeof inp.keydown === 'function' && !origInputKeydown) {
         const origKeydown: (a: any) => void = inp.keydown;
@@ -214,478 +216,587 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
     }
 }
 
-// ---- history (persistent client-local + the panel above the input strip) ----
+// ---- persistent per-channel history (per account) ----
 
-/** Restore persisted history from localStorage (try/catch — storage may throw or
- * hold malformed data; any failure just starts empty). Called once at install. */
-function loadHistory(): void {
+function persistKey(): string {
     try {
-        const raw = window.localStorage.getItem(HISTORY_KEY);
-        if (!raw) return;
+        const main = getMain();
+        const name = main && main.name ? String(main.name) : 'default';
+        return PERSIST_PREFIX + name;
+    } catch (_) { return PERSIST_PREFIX + 'default'; }
+}
+
+function loadPersisted(): { [id: string]: Array<{ from: string, text: string, ts: number }> } {
+    try {
+        const raw = window.localStorage.getItem(persistKey());
+        if (!raw) return {};
         const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return;
-        const out: { n: string, t: string, ts: number }[] = [];
-        for (let i = 0; i < parsed.length; i++) {
-            const h = parsed[i];
-            if (!h || typeof h !== 'object' || typeof h.t !== 'string') continue;
-            out.push({
-                n: typeof h.n === 'string' ? h.n : '',
-                t: h.t,
-                ts: typeof h.ts === 'number' ? h.ts : Date.now(),
-            });
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const out: { [id: string]: Array<{ from: string, text: string, ts: number }> } = {};
+        for (const id of Object.keys(parsed)) {
+            if (typeof id !== 'string' || !Array.isArray(parsed[id])) continue;
+            const rows: Array<{ from: string, text: string, ts: number }> = [];
+            for (const h of parsed[id]) {
+                if (!h || typeof h !== 'object' || typeof h.text !== 'string') continue;
+                rows.push({
+                    from: typeof h.from === 'string' ? h.from : '',
+                    text: h.text,
+                    ts: typeof h.ts === 'number' ? h.ts : Date.now(),
+                });
+            }
+            out[id] = rows.slice(-PERSIST_MAX);
         }
-        history = out.slice(-MAX_HISTORY);
-    } catch (_) { history = []; /* storage/JSON failed — start empty */ }
+        return out;
+    } catch (_) { return {}; /* storage/JSON failed — start empty */ }
 }
 
-/** Persist history (write-through on every append; the payload is tiny). */
-function saveHistory(): void {
-    try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (_) { /* ignore */ }
-}
-
-/** Record a message in history (RAW text; sanitization happens at render time),
- * cap at MAX_HISTORY (drop oldest), persist, and refresh the live panel so a new
- * message is reflected while the chat is open. Capture whether the panel was pinned
- * to the newest row BEFORE the append — history mutates first, so the pin check has
- * to run against the pre-append max offset. */
-function appendHistory(from: string, text: string): void {
+function savePersisted(): void {
     try {
-        const wasAtBottom = chatOpen && histOffset >= maxHistOffset() - 0.5;
-        history.push({ n: from || '', t: String(text || ''), ts: Date.now() });
-        if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
-        saveHistory();
-        if (chatOpen) refreshHistoryPanel(wasAtBottom);
+        const out: { [id: string]: Array<{ from: string, text: string, ts: number }> } = {};
+        for (const ch of channels) {
+            const rows = ch.messages.filter((m) => m.from).slice(-PERSIST_MAX);
+            if (rows.length) out[ch.id] = rows;
+        }
+        window.localStorage.setItem(persistKey(), JSON.stringify(out));
     } catch (_) { /* a history write must never break the frame */ }
 }
 
-/** Highest scroll offset the panel can show: 0 when everything fits in the panel,
- * otherwise (total column height − panel height), so the newest row can rest at
- * the bottom of the panel. */
-function maxHistOffset(): number {
-    const rows = history.length;
-    if (rows <= HIST_PANEL_ROWS) return 0;
-    return Math.max(0, rows * HIST_ROW_STEP - HIST_PANEL_H);
-}
-
-/** Build ONE history row: green sender name (or nothing for a system line) + the
- * sanitized/HTML-escaped text. textContent handles HTML escaping; sanitizeChatText
- * strips any game \c[\..\] / \i[\..\] styling the sender might have typed. */
-function renderHistoryRow(h: { n: string, t: string, ts: number }): HTMLElement {
-    const row = document.createElement('div');
-    row.className = 'mpChatHistRow';
-    if (h.n) {
-        const nm = document.createElement('span');
-        nm.className = 'mpChatHistName';
-        nm.textContent = sanitizeChatText(h.n) + ' ';
-        row.appendChild(nm);
-    }
-    const tx = document.createElement('span');
-    tx.className = 'mpChatHistText';
-    tx.textContent = sanitizeChatText(h.t);
-    row.appendChild(tx);
-    return row;
-}
-
-/** Ease the inner column toward its scroll offset (CSS transition on translateY). */
-function applyHistOffset(): void {
-    const col = histColumn;
-    if (!col) return;
+function removePersisted(id: string): void {
     try {
-        col.style.transition = 'transform 0.16s ease-out';
-        col.style.transform = 'translateY(' + (-histOffset) + 'px)';
+        const all = loadPersisted();
+        if (Object.prototype.hasOwnProperty.call(all, id)) {
+            delete all[id];
+            window.localStorage.setItem(persistKey(), JSON.stringify(all));
+        }
     } catch (_) { /* ignore */ }
 }
 
-/** Rebuild the inner column from history (newest LAST, i.e. newest at the bottom),
- * clamp the scroll offset, and — when the view is already at the newest row — pin it
- * to the new bottom so the live tail stays in view. `forcePin` is supplied by
- * appendHistory (pre-append state); when omitted (fresh panel build) it's derived
- * from the current offset. */
-function refreshHistoryPanel(forcePin?: boolean): void {
-    const col = histColumn;
-    if (!col) return;
-    try {
-        const wasAtBottom = forcePin !== undefined ? forcePin : (histOffset >= maxHistOffset() - 0.5);
-        while (col.firstChild) col.removeChild(col.firstChild);
-        for (let i = 0; i < history.length; i++) col.appendChild(renderHistoryRow(history[i]));
-        const mOff = maxHistOffset();
-        if (wasAtBottom) histOffset = mOff; // pinned to newest while already at the bottom
-        histOffset = Math.min(mOff, Math.max(0, histOffset));
-        applyHistOffset();
-    } catch (_) { /* never break the frame */ }
+// ---- channel state ----
+
+function privateId(name: string): string {
+    return PRIVATE_PREFIX + String(name);
 }
 
-/** Build the history panel DOM (fixed container above the input strip + the
- * scrollable inner column) and seed it. Default view = bottom (newest). */
-function buildHistoryPanel(): HTMLElement | null {
-    try {
-        const panel = document.createElement('div');
-        panel.className = 'mpChatHist';
-        const col = document.createElement('div');
-        col.className = 'mpChatHistCol';
-        panel.appendChild(col);
-        histPanel = panel;
-        histColumn = col;
-        histOffset = maxHistOffset(); // default = newest at the bottom
-        refreshHistoryPanel();
-        return panel;
-    } catch (_) { return null; }
+function getChannel(id: string): ChatChannel | undefined {
+    for (const ch of channels) if (ch.id === id) return ch;
+    return undefined;
 }
 
-/** Capture-phase wheel handler active ONLY while the chat is open (registered in
- * openChat, removed in closeChatInput). Mirrors the party-box wheel pattern: while
- * the pointer is over the panel, consume the event so ig.input.mousewheel — and the
- * game camera/menu scrolling — never sees it. Wheel up walks toward OLDER history,
- * wheel down toward NEWER (offset grows down). */
-function onHistoryWheel(e: any): void {
-    try {
-        if (!histPanel) return;
-        const target = e.target;
-        if (!(target instanceof Node) || !histPanel.contains(target)) return;
-        const mOff = maxHistOffset();
-        if (mOff <= 0) { e.preventDefault(); e.stopPropagation(); return; }
-        // Normalize direction across the modern 'wheel' (deltaY), legacy
-        // 'mousewheel' (wheelDelta) and Firefox 'DOMMouseScroll' (detail).
-        let up = false;
-        if (typeof e.deltaY === 'number') up = e.deltaY < 0;
-        else if (e.wheelDelta != null) up = e.wheelDelta > 0;
-        else up = (e.detail || 0) < 0;
-        const next = Math.min(mOff, Math.max(0, histOffset + (up ? -HIST_ROW_STEP : HIST_ROW_STEP)));
-        if (next === histOffset) return;
-        e.preventDefault();
-        e.stopPropagation(); // keep the game camera/menu from reacting to the wheel
-        histOffset = next;
-        applyHistOffset();
-    } catch (_) { /* never throw out of a DOM listener */ }
+function activeChannel(): ChatChannel {
+    return getChannel(activeId) || getChannel(WORLD_ID) || channels[0];
 }
 
-/** Attach the history-panel wheel listener (active only while the chat is open). */
-function attachHistoryWheel(): void {
-    histWheelHandler = onHistoryWheel;
-    try { window.addEventListener('wheel', onHistoryWheel, true); } catch (_) { /* ignore */ }
-    try { window.addEventListener('mousewheel', onHistoryWheel, true); } catch (_) { /* ignore */ }
-    try { window.addEventListener('DOMMouseScroll', onHistoryWheel, true); } catch (_) { /* ignore */ }
+function ensureChannel(id: string, kind: ChatKind, target?: string): ChatChannel {
+    let ch = getChannel(id);
+    if (ch) return ch;
+    ch = { id, kind, target, messages: [], unread: 0 };
+    channels.push(ch);
+    return ch;
 }
 
-/** Tear down the history-panel wheel listener + panel DOM (panel is a child of the
- * input strip, which closeChatInput removes; here we just drop the references). */
-function detachHistory(): void {
-    if (histWheelHandler) {
-        try { window.removeEventListener('wheel', histWheelHandler, true); } catch (_) { /* ignore */ }
-        try { window.removeEventListener('mousewheel', histWheelHandler, true); } catch (_) { /* ignore */ }
-        try { window.removeEventListener('DOMMouseScroll', histWheelHandler, true); } catch (_) { /* ignore */ }
-        histWheelHandler = null;
+/** Seed the two permanent tabs plus every private tab found in persisted history. */
+function seedChannels(): void {
+    channels = [];
+    ensureChannel(WORLD_ID, 'world');
+    ensureChannel(PARTY_ID, 'party');
+    const saved = loadPersisted();
+    for (const id of Object.keys(saved)) {
+        if (id === WORLD_ID || id === PARTY_ID) continue;
+        if (id.indexOf(PRIVATE_PREFIX) === 0) {
+            const ch = ensureChannel(id, 'private', id.slice(PRIVATE_PREFIX.length));
+            ch.messages = (saved[id] || []).slice();
+        }
     }
-    histPanel = null;
-    histColumn = null;
 }
 
-// ---- chat input (DOM) ----
+// ---- panel DOM ----
 
-/** Inject the bottom-center input strip stylesheet exactly once (reuses the
- *  login panel's navy/cyan visual language, prefixed .mpChat). */
 function ensureChatStyle(): void {
     if (document.getElementById('mpChatStyle')) return;
     const style = document.createElement('style');
     style.id = 'mpChatStyle';
     style.textContent = `
-.mpChat {
-    position: fixed; left: 50%; bottom: 24px;
-    transform: translateX(-50%);
-    width: 420px; max-width: 94vw;
-    background: rgba(6, 18, 30, 0.94);
-    border: 2px solid #6fc7ff; border-radius: 6px;
-    box-shadow: 0 0 18px rgba(111, 199, 255, 0.35), inset 0 0 26px rgba(13, 42, 66, 0.8);
-    color: #eaf7ff; font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
-    z-index: 10000; padding: 10px 12px;
-    animation: mpChatIn 0.18s ease-out;
+.mpChatBox {
+    position: fixed; left: 12px; bottom: 12px;
+    width: 360px; max-width: calc(100vw - 24px);
+    z-index: 9000;
+    color: #eaf7ff;
+    font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
+    pointer-events: none;
+    user-select: none;
 }
-@keyframes mpChatIn { from { opacity: 0; transform: translateX(-50%) translateY(12px); }
-                      to   { opacity: 1; transform: translateX(-50%) translateY(0); } }
-.mpChatForm { display: flex; gap: 8px; }
-.mpChatInput { flex: 1; min-width: 0; box-sizing: border-box; padding: 8px 10px;
+.mpChatTabs {
+    display: flex; align-items: stretch; gap: 3px;
+    overflow-x: auto; overflow-y: hidden;
+    padding: 4px 4px 0 4px;
+    background: rgba(6, 18, 30, 0.9);
+    border: 1px solid rgba(111, 199, 255, 0.55);
+    border-bottom: none;
+    border-radius: 7px 7px 0 0;
+    pointer-events: auto;
+}
+.mpChatTab {
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center;
+    padding: 3px 9px;
+    font-size: 12px; line-height: 16px;
+    color: #a9d8f2; background: rgba(13, 42, 66, 0.75);
+    border: 1px solid rgba(111, 199, 255, 0.35);
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+}
+.mpChatTab:hover { color: #eaf7ff; background: rgba(27, 70, 104, 0.85); }
+.mpChatTab.active {
+    color: #ffffff; background: rgba(41, 98, 140, 0.95);
+    border-color: #6fc7ff;
+    box-shadow: inset 0 -2px 0 #6fc7ff;
+}
+.mpChatTab.unread { color: #ffd76f; border-color: rgba(255, 215, 111, 0.7); }
+.mpChatUnread {
+    margin-left: 6px; min-width: 15px; padding: 0 4px;
+    background: #d64545; color: #fff;
+    border-radius: 8px; font-size: 10px; line-height: 14px; text-align: center;
+}
+.mpChatClose {
+    margin-left: 7px; width: 15px; height: 15px;
+    line-height: 13px; text-align: center;
+    color: #9fc7e0; border: 1px solid rgba(159, 199, 224, 0.35);
+    border-radius: 8px; font-size: 12px;
+}
+.mpChatClose:hover { color: #fff; background: rgba(214, 69, 69, 0.8); border-color: #ff9a9a; }
+.mpChatMsgs {
+    height: 132px;
+    overflow-y: auto;
+    padding: 4px 6px;
+    background: rgba(4, 12, 20, 0.62);
+    border: 1px solid rgba(111, 199, 255, 0.55);
+    border-top: none;
+    pointer-events: none;
+}
+.mpChatBox.open .mpChatMsgs { pointer-events: auto; }
+.mpChatRow {
+    display: flex; align-items: flex-start;
+    padding: 1px 2px;
+    font-size: 12.5px; line-height: 16px;
+    word-break: break-word;
+}
+.mpChatName { color: #7dffa0; flex: 0 0 auto; margin-right: 5px; }
+.mpChatText { color: #eaf7ff; flex: 1 1 auto; white-space: pre-wrap; }
+.mpChatSysRow { padding: 1px 2px; font-size: 12px; line-height: 16px;
+    color: #8fd6ff; font-style: italic; opacity: 0.9; word-break: break-word; }
+.mpChatInputRow {
+    display: none;
+    align-items: center; gap: 7px;
+    padding: 6px;
+    background: rgba(6, 18, 30, 0.94);
+    border: 1px solid rgba(111, 199, 255, 0.55); border-top: none;
+    border-radius: 0 0 7px 7px;
+    pointer-events: auto;
+}
+.mpChatBox.open .mpChatInputRow { display: flex; }
+.mpChatInput {
+    flex: 1 1 auto; min-width: 0; box-sizing: border-box;
+    padding: 7px 9px;
     background: rgba(8, 26, 44, 0.9); color: #eaf7ff;
     border: 1px solid #6fc7ff; border-radius: 4px;
-    font-size: 14px; font-family: inherit; outline: none; }
+    font-size: 13px; font-family: inherit; outline: none;
+    user-select: text;
+}
 .mpChatInput:focus { box-shadow: 0 0 8px rgba(111,199,255,0.6); }
-.mpChatSend { padding: 8px 16px; cursor: pointer;
+.mpChatSend {
+    flex: 0 0 auto; padding: 7px 13px; cursor: pointer;
     background: rgba(31, 111, 74, 0.9); color: #eafff2;
     border: 1px solid #7dffa8; border-radius: 4px;
-    font-size: 14px; font-family: inherit; letter-spacing: 2px; }
+    font-size: 12.5px; font-family: inherit; letter-spacing: 2px;
+}
 .mpChatSend:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 8px rgba(125,255,168,0.6); }
-.mpChatHist {
-    position: absolute; left: 50%; bottom: calc(100% + 4px);
-    transform: translateX(-50%);
-    width: 380px; max-width: 94vw;
-    height: 66px;
-    overflow: hidden;
-    pointer-events: auto;
-    background: rgba(4, 12, 20, 0.6);
-    border: 1px solid rgba(111, 199, 255, 0.55); border-radius: 5px;
-    z-index: 10001;
-    font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
-}
-.mpChatHistCol { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
-.mpChatHistRow {
-    display: flex; align-items: flex-start;
-    height: 21px; line-height: 21px;
-    font-size: 12px; color: #eaf7ff;
-    background: rgba(6, 18, 30, 0.85);
-    margin-bottom: 1px; padding: 0 8px;
-    white-space: nowrap;
-}
-.mpChatHistName { color: #7dffa0; flex: 0 0 auto; }
-.mpChatHistText { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
     document.head.appendChild(style);
 }
 
-/** Close the chat input (idempotent): restore game focus exactly like showLogin —
- * regainFocus + a block delay so the closing key/click can't hit a game button. */
-function closeChatInput(): void {
+/** Build the fixed bottom-left panel once (kept across map loads; removed only by
+ * clearChat on logout/server loss). Seeding channels happens before any render. */
+function ensurePanel(): HTMLElement {
+    if (panel) return panel;
+    ensureChatStyle();
+    if (!channels.length) seedChannels();
+
+    const root = document.createElement('div');
+    root.className = 'mpChatBox';
+
+    tabsEl = document.createElement('div');
+    tabsEl.className = 'mpChatTabs';
+
+    msgsEl = document.createElement('div');
+    msgsEl.className = 'mpChatMsgs';
+
+    inputRowEl = document.createElement('div');
+    inputRowEl.className = 'mpChatInputRow';
+
+    const form = document.createElement('form');
+    form.className = 'mpChatForm';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'mpChatInput';
+    input.autocomplete = 'off';
+    const send = document.createElement('button');
+    send.type = 'submit';
+    send.className = 'mpChatSend';
+    send.textContent = t('chatSend');
+    form.appendChild(input);
+    form.appendChild(send);
+    inputRowEl.appendChild(form);
+
+    form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        sendActive();
+    });
+    input.addEventListener('keydown', (e) => {
+        if (!e) return;
+        const anyE = e as any;
+        if (anyE.isComposing || e.keyCode === 229) return;
+        if (e.keyCode === 27) {
+            e.preventDefault();
+            closeInput();
+        }
+    });
+
+    root.appendChild(tabsEl);
+    root.appendChild(msgsEl);
+    root.appendChild(inputRowEl);
+    document.body.appendChild(root);
+
+    panel = root;
+    inputEl = input;
+    renderTabs();
+    renderMessages();
+    return root;
+}
+
+// ---- rendering ----
+
+/** Strip game text-command sequences (\c[..] colors, \i[..] icons, ...) so chat
+ * text can't spoof system styling. textContent handles HTML escaping. */
+function sanitizeChatText(text: string): string {
+    return String(text || '').replace(/\\[a-zA-Z]\[[^\]]*\]/g, '');
+}
+
+function renderTabs(): void {
+    if (!tabsEl) return;
+    while (tabsEl.firstChild) tabsEl.removeChild(tabsEl.firstChild);
+    for (const ch of channels) {
+        const tab = document.createElement('div');
+        tab.className = 'mpChatTab';
+        if (ch.id === activeId) tab.className += ' active';
+        if (ch.unread > 0) tab.className += ' unread';
+
+        const label = document.createElement('span');
+        label.textContent = ch.kind === 'private' ? String(ch.target || ch.id) : (ch.kind === 'party' ? t('chatParty') : t('chatWorld'));
+        tab.appendChild(label);
+
+        if (ch.unread > 0) {
+            const badge = document.createElement('span');
+            badge.className = 'mpChatUnread';
+            badge.textContent = ch.unread > 99 ? '99+' : String(ch.unread);
+            tab.appendChild(badge);
+        }
+        if (ch.kind === 'private') {
+            const close = document.createElement('span');
+            close.className = 'mpChatClose';
+            close.textContent = '×';
+            close.title = t('chatClosePrivate');
+            close.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const keepInput = chatOpen;
+                closeChannel(ch.id);
+                if (keepInput && inputEl) inputEl.focus();
+            });
+            tab.appendChild(close);
+        }
+
+        tab.addEventListener('click', () => {
+            // Switching tabs always works; the input only opens when the game is in
+            // a typeable state (never steal the keyboard mid-cutscene/menu).
+            setActiveChannel(ch.id, canOpenChat());
+            if (!chatOpen) {
+                try { if (document.activeElement === tab) (tab as HTMLElement).blur(); } catch (_) { /* ignore */ }
+                try { (ig as any).system.regainFocus(); } catch (_) { /* ignore */ }
+            }
+        });
+        tabsEl.appendChild(tab);
+    }
+}
+
+function renderMessages(): void {
+    if (!msgsEl) return;
+    while (msgsEl.firstChild) msgsEl.removeChild(msgsEl.firstChild);
+    const ch = activeChannel();
+    if (!ch) return;
+    for (const m of ch.messages) {
+        if (!m.from) {
+            const row = document.createElement('div');
+            row.className = 'mpChatSysRow';
+            row.textContent = sanitizeChatText(m.text);
+            msgsEl.appendChild(row);
+            continue;
+        }
+        const row = document.createElement('div');
+        row.className = 'mpChatRow';
+        const name = document.createElement('span');
+        name.className = 'mpChatName';
+        name.textContent = sanitizeChatText(m.from) + ':';
+        const text = document.createElement('span');
+        text.className = 'mpChatText';
+        text.textContent = sanitizeChatText(m.text);
+        row.appendChild(name);
+        row.appendChild(text);
+        msgsEl.appendChild(row);
+    }
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+/** Switch the active tab. `focus` opens (or re-focuses) the input strip so the
+ * player can type right away — used by tab clicks and the 联系 buttons. */
+function setActiveChannel(id: string, focus: boolean): void {
+    const ch = getChannel(id);
+    if (!ch) return;
+    activeId = id;
+    ch.unread = 0;
+    renderTabs();
+    renderMessages();
+    updatePlaceholder();
+    if (focus) openInput();
+    else if (chatOpen && inputEl) inputEl.focus();
+}
+
+// ---- input strip ----
+
+function updatePlaceholder(): void {
+    if (!inputEl) return;
+    const ch = activeChannel();
+    if (ch && ch.kind === 'private' && ch.target) {
+        inputEl.placeholder = t('chatPrivatePh').replace('{name}', ch.target);
+    } else {
+        inputEl.placeholder = t('chatPlaceholder');
+    }
+}
+
+/** Open the bottom-left chat input. Suppresses game key handling via
+ * ig.system.setFocusLost() (the login-panel pattern); the focus listener re-applies
+ * it while the focus stays inside the chat panel and closes the input if focus
+ * escapes the panel entirely (e.g. the player clicked into the world). */
+function openInput(): void {
+    try {
+        ensurePanel();
+        if (!panel || !inputRowEl || !inputEl) return;
+        if (chatOpen) {
+            updatePlaceholder();
+            inputEl.focus();
+            return;
+        }
+        panel.classList.add('open');
+        inputRowEl.style.display = 'flex';
+        updatePlaceholder();
+
+        const onFocus = (): void => {
+            if (!chatOpen) return;
+            try {
+                const ae = document.activeElement;
+                if (ae && panel && panel.contains(ae)) {
+                    (ig as any).system.setFocusLost();
+                    return;
+                }
+            } catch (_) { /* fall through to closing */ }
+            closeInput();
+        };
+        // Register BEFORE chatOpen flips true (the login-panel pattern): if the
+        // engine invokes the focus listener synchronously on registration, the
+        // input isn't "open" yet and the callback is a harmless no-op.
+        chatFocusListener = onFocus;
+        try { (ig as any).system.addFocusListener(onFocus); } catch (_) { /* ignore */ }
+        chatOpen = true;
+        try { (ig as any).system.setFocusLost(); } catch (_) { /* ignore */ }
+        inputEl.focus();
+    } catch (_) { /* an open must never break the frame */ }
+}
+
+/** Close only the input strip (the panel + tabs stay visible). Restores game focus
+ * exactly like showLogin — regainFocus + a block delay so the closing key/click
+ * can't hit a game button. */
+function closeInput(): void {
     if (!chatOpen) return;
     chatOpen = false;
     try {
         if (chatFocusListener) { (ig as any).system.removeFocusListener(chatFocusListener); chatFocusListener = null; }
     } catch (_) { /* ignore */ }
-    const box = inputBox;
-    inputBox = null;
-    inputEl = null;
-    try { if (box) box.remove(); } catch (_) { /* ignore */ }
-    detachHistory(); // Round 24: hide + teardown the history panel (wheel + DOM)
+    try { if (panel) panel.classList.remove('open'); } catch (_) { /* ignore */ }
+    try { if (inputRowEl) inputRowEl.style.display = 'none'; } catch (_) { /* ignore */ }
+    try { if (inputEl) inputEl.blur(); } catch (_) { /* ignore */ }
     try { (ig as any).system.regainFocus(); } catch (_) { /* ignore */ }
     try { (ig as any).interact.setBlockDelay(0.2); } catch (_) { /* ignore */ }
 }
 
-/** Open the bottom-center chat input. Suppresses game key handling via
- * ig.system.setFocusLost() (the login-panel pattern); the focus listener re-applies
- * it while the input holds focus and closes the box if focus escapes it. */
-function openChat(): void {
-    if (chatOpen) return;
+function sendActive(): void {
     try {
-        ensureChatStyle();
-        const box = $('<div class="mpChat"></div>');
-        const input = $('<input type="text" class="mpChatInput" />');
-        input.attr('placeholder', t('chatPlaceholder'));
-        const send = $('<button type="submit" class="mpChatSend">' + t('chatSend') + '</button>');
-        const form = $('<form class="mpChatForm"></form>');
-
-        const sendText = (): void => {
-            const text = String(input.val() || '').trim();
-            // Round 24: Enter with an empty box CLOSES the chat (no send, no
-            // system message) instead of silently doing nothing.
-            if (!text) { closeChatInput(); return; }
-            const main = getMain();
-            if (!main) { closeChatInput(); return; }
-            const conn: any = main.connection;
-            if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) { closeChatInput(); return; }
-            // Party-only: outside a party, sending shows a local-only system message
-            // in the chat display and nothing is emitted. Keep the box open so the
-            // player reads it, then Escape cancels.
-            if (!main.partyMembers || main.partyMembers.length <= 1) {
-                displayChat('', t('chatNotInParty'));
-                input.val('');
-                input.focus();
-                return;
-            }
-            // In a party: local echo + emit. The server never echoes to the sender.
-            displayChat(main.name || '', text);
-            try { conn.chat(text); } catch (_) { /* ignore */ }
-            closeChatInput();
-        };
-
-        // Mirror showLogin's focus management: while the input holds focus keep the
-        // game focus-lost; if focus escapes (user clicked into the world, a menu
-        // stole it) close the box so the game never stays in a half-input state.
-        const onFocus = (): void => {
-            if (!chatOpen) return;
-            if (inputEl && inputEl[0] && document.activeElement === inputEl[0]) {
-                try { (ig as any).system.setFocusLost(); } catch (_) { /* ignore */ }
-                return;
-            }
-            closeChatInput();
-        };
-        chatFocusListener = onFocus;
-        try { (ig as any).system.addFocusListener(onFocus); } catch (_) { /* ignore */ }
-
-        // Enter sends (form submit — implicit submission works with a single input +
-        // the submit button; the capture hook above lets it through to this input).
-        form.submit(() => { sendText(); return false; });
-        // Escape cancels. IME (CJK) composition keydowns (229 / isComposing) pass
-        // through so a composition-commit Enter never closes or sends the box.
-        input.on('keydown', (e: any) => {
-            if (!e) return;
-            if (e.isComposing || e.keyCode === 229) return;
-            if (e.keyCode === 27) { e.preventDefault(); closeChatInput(); return false; }
-        });
-
-        form.append(input).append(send);
-        box.append(form);
-        // Round 24: the history panel is a child of the fixed .mpChat strip, so it
-        // shares its exact left/bottom anchoring automatically (sits just above it).
-        const histPanelEl = buildHistoryPanel();
-        if (histPanelEl) box.append(histPanelEl);
-        $(document.body).append(box);
-
-        inputBox = box;
-        inputEl = input;
-        chatOpen = true;
-        attachHistoryWheel(); // wheel over the panel scrolls history only while open
-        try { (ig as any).system.setFocusLost(); } catch (_) { /* ignore */ }
-        input.focus();
-    } catch (_) { /* an open must never break the frame */ }
-}
-
-// ---- message display overlay (in-canvas, NPC-dialogue look-alike) ----
-
-/** Persistent ig.gui overlay that owns every rendered chat message. Created once;
- * zIndex 7 (above name tags' 5 and the net-HUD's 6). */
-function ensureOverlay(): any {
-    if (overlay) return overlay;
-    overlay = new (ig as any).GuiElementBase();
-    try { overlay.hook.zIndex = 7; } catch (_) { /* ignore */ }
-    try { overlay.hook._visible = true; } catch (_) { /* ignore */ }
-    try { (ig as any).gui.addGuiElement(overlay); } catch (_) { /* ignore */ }
-    return overlay;
-}
-
-/** The speech-bubble pointer enum — Round 24: vertically flipped so the tail/
- * arrow points DOWN (it previously pointed up). The game enum (see
- * ultimate-crosscode-typedefs boxes.d.ts) is NONE=0, TOP_LEFT=1, BOTTOM_LEFT=2,
- * TOP_RIGHT=3, BOTTOM_RIGHT=4 — the vertical mirror of TOP_RIGHT is BOTTOM_RIGHT.
- * Returns BOTTOM_RIGHT when exposed, else the numeric mirror of TOP_RIGHT (top+1,
- * i.e. 4). */
-function chatPointer(): any {
-    const box: any = (sc as any).ArrowBoxGui;
-    const ptr = box && box.POINTER;
-    if (ptr && ptr.BOTTOM_RIGHT != null) return ptr.BOTTOM_RIGHT;
-    const top = ptr && ptr.TOP_RIGHT;
-    return top != null ? top + 1 : 4;
-}
-
-/** Build ONE chat message: an ArrowBoxGui speech bubble (IMMEDIATE text) plus a
- * green sender-name plate above it, wrapped in a gui element auto-expiring after
- * CHAT_MSG_TTL_MS (fade via the gui loop, then remove + relayout). `from` empty =>
- * system message (no name plate). */
-function makeMessageEl(from: string, text: string): any {
-    const msg = new (sc as any).TextGui(String(text), {
-        font: (sc as any).fontsystem.font,
-        maxWidth: MSG_MAX_WIDTH,
-    });
-    try { msg.setTextSpeed((ig as any).TextBlock.SPEED.IMMEDIATE); } catch (_) { /* ignore */ }
-    const ms = msg.hook.size;
-    const PAD_X = 12;
-    const PAD_Y = 8;
-    const boxW = ms.x + PAD_X * 2;
-    const boxH = ms.y + PAD_Y * 2;
-
-    const bubble = new (sc as any).ArrowBoxGui(boxW, boxH, chatPointer());
-    bubble.addChildGui(msg);
-    msg.setPos(PAD_X, PAD_Y);
-
-    const wrap = new (ig as any).GuiElementBase();
-    let name: any = null;
-    let nameH = 0;
-    if (from) {
-        // Green sender plate above the bubble (\c[2] = the game's green text set).
-        name = new (sc as any).TextGui('\\c[2]' + from, { font: (sc as any).fontsystem.smallFont });
-        wrap.addChildGui(name);
-        name.setPos(2, 0);
-        nameH = name.hook.size.y + 3;
-    }
-    wrap.addChildGui(bubble);
-    bubble.setPos(0, nameH);
-    try {
-        wrap.setSize(Math.max(name ? name.hook.size.x : 0, boxW), nameH + boxH);
-    } catch (_) { /* ignore */ }
-    try { wrap.hook._visible = true; } catch (_) { /* ignore */ }
-    wrap._mpBubble = bubble;
-    wrap._mpName = name;
-
-    // Auto-expire after ~8s: fade out (the gui loop drives the transition), then
-    // detach + relayout. Guarded so a clearChat race can't double-remove.
-    wrap._mpTimer = window.setTimeout(() => {
-        try {
-            const spl = (window as any).KEY_SPLINES;
-            if (spl && spl.EASE && typeof wrap.doTempStateTransition === 'function') {
-                wrap.doTempStateTransition({ alpha: 0 }, CHAT_FADE_MS, spl.EASE, false, true, () => {
-                    try { removeMessage(wrap); } catch (_) { /* ignore */ }
-                });
-            } else {
-                try { removeMessage(wrap); } catch (_) { /* ignore */ }
-            }
-        } catch (_) { /* ignore */ }
-    }, CHAT_MSG_TTL_MS);
-
-    return wrap;
-}
-
-/** Detach + forget a message wrapper (idempotent), then reflow the stack. */
-function removeMessage(wrap: any): void {
-    const idx = messages.indexOf(wrap);
-    if (idx !== -1) messages.splice(idx, 1);
-    try { if (wrap._mpTimer) window.clearTimeout(wrap._mpTimer); } catch (_) { /* ignore */ }
-    try { overlay && overlay.removeChildGui(wrap); } catch (_) { /* ignore */ }
-    layoutMessages();
-}
-
-/** Reflow the bottom-left stack: newest at the bottom, older upward. */
-function layoutMessages(): void {
-    try {
-        const sys: any = (ig as any).system;
-        if (!sys) return;
-        let y = sys.height - MSG_MARGIN_Y;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const el = messages[i];
-            if (!el) continue;
-            const h = el.hook && el.hook.size ? el.hook.size.y : 0;
-            y -= h;
-            try { el.setPos(MSG_MARGIN_X, y); } catch (_) { /* ignore */ }
-            y -= MSG_GAP;
+        const main = getMain();
+        const ch = activeChannel();
+        if (!ch || !inputEl) { closeInput(); return; }
+        const text = String(inputEl.value || '').trim();
+        if (!text) { closeInput(); return; } // Enter with an empty box closes
+        const conn: any = main && main.connection;
+        if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) {
+            addMessage(ch, '', t('chatNotConnected'), true);
+            inputEl.value = '';
+            inputEl.focus();
+            return;
         }
-    } catch (_) { /* never break the frame */ }
+        if (ch.kind === 'party' && (!main || !main.partyMembers || main.partyMembers.length <= 1)) {
+            addMessage(ch, '', t('chatNotInParty'), true);
+            inputEl.value = '';
+            inputEl.focus();
+            return;
+        }
+        if (ch.kind === 'private') {
+            if (!ch.target || (main && ch.target === main.name)) {
+                addMessage(ch, '', t('chatSelf'), true);
+                inputEl.value = '';
+                inputEl.focus();
+                return;
+            }
+        }
+        // Local echo; the server never echoes back to the sender.
+        addMessage(ch, main ? main.name || '' : '', text, false);
+        try { conn.chat(text, ch.kind, ch.target); } catch (_) { /* ignore */ }
+        inputEl.value = '';
+        inputEl.focus(); // MMO-style: stay open for the next message
+    } catch (_) { /* a send must never break the frame */ }
 }
 
-/** Strip game text-command sequences (\c[..] colors, \i[..] icons, \s[..] and
- * friends) from a message BODY so a party member can't spoof system styling/
- * effects. The mod's own name-plate prefix (\c[2]) is added in makeMessageEl and
- * is untouched — this only scrubs the message text itself. */
-function sanitizeChatText(text: string): string {
-    return String(text || '').replace(/\\[a-zA-Z]\[[^\]]*\]/g, '');
+// ---- messages / channels ----
+
+function addMessage(ch: ChatChannel, from: string, text: string, system: boolean): void {
+    ch.messages.push({ from: from || '', text: String(text || ''), ts: Date.now() });
+    while (ch.messages.length > MAX_MESSAGES) ch.messages.shift();
+    if (!system) savePersisted();
+    if (panel && activeId === ch.id) renderMessages();
+    else if (panel) renderTabs();
 }
 
-/** Show a chat message in the overlay. `from` empty => system message (no plate). */
+function closeChannel(id: string): void {
+    const idx = channels.findIndex((ch) => ch.id === id);
+    if (idx === -1) return;
+    const ch = channels[idx];
+    if (ch.kind !== 'private') return;
+    channels.splice(idx, 1);
+    removePersisted(id);
+    if (activeId === id) activeId = WORLD_ID;
+    renderTabs();
+    renderMessages();
+    updatePlaceholder();
+    if (chatOpen && inputEl) inputEl.focus();
+}
+
+/**
+ * Open (or create + focus) the private channel with `name`. This is the 联系
+ * button path: quick-menu friend row and social-menu option both land here.
+ */
+export function openPrivateChannel(name: string, openInputNow = true): void {
+    try {
+        const clean = String(name || '').trim();
+        if (!clean) return;
+        ensurePanel();
+        const main = getMain();
+        if (main && main.name === clean) {
+            addMessage(activeChannel(), '', t('chatSelf'), true);
+            return;
+        }
+        const id = privateId(clean);
+        ensureChannel(id, 'private', clean);
+        setActiveChannel(id, openInputNow);
+    } catch (_) { /* a channel open must never break the frame */ }
+}
+
+/** An incoming server-relayed chat message. Routes to the correct channel tab and
+ * creates a private tab on demand when a new person messages us. */
+export function receiveChat(msg: IChatMessage): void {
+    try {
+        if (!msg || typeof msg.text !== 'string' || !msg.text) return;
+        const main = getMain();
+        if (msg.from === (main && main.name)) return; // server never echoes; belt-and-braces
+        const kind: ChatKind = msg.channel === 'world' || msg.channel === 'party' || msg.channel === 'private'
+            ? msg.channel : 'party';
+        ensurePanel();
+        let id: string;
+        let target: string | undefined;
+        if (kind === 'private') {
+            if (!msg.from) return;
+            id = privateId(msg.from);
+            target = msg.from;
+        } else {
+            id = kind;
+        }
+        const ch = ensureChannel(id, kind, target);
+        const isActive = activeId === id;
+        if (!isActive) ch.unread++;
+        addMessage(ch, msg.from, msg.text, false);
+        if (!isActive) renderTabs();
+    } catch (_) { /* a message must never break the socket */ }
+}
+
+/** Server rejection of an outgoing message -> a system line in the right channel. */
+export function receiveChatError(err: IChatError): void {
+    try {
+        let text = t('chatSendFailed');
+        if (err && err.reason === 'rate') text = t('chatRateLimited');
+        else if (err && err.reason === 'notInParty') text = t('chatNotInParty');
+        else if (err && err.reason === 'offline') text = t('chatPrivateOffline').replace('{name}', err.target || '?');
+        else if (err && err.reason === 'invalidTarget') text = t('chatInvalidTarget');
+        let id = (err && err.channel) || activeId;
+        if (id === 'private') id = (err && err.target) ? privateId(err.target) : activeId;
+        ensurePanel();
+        let ch = getChannel(id);
+        if (!ch && id.indexOf(PRIVATE_PREFIX) === 0) {
+            ch = ensureChannel(id, 'private', id.slice(PRIVATE_PREFIX.length));
+        } else if (!ch) {
+            ch = ensureChannel(id, id === PARTY_ID ? 'party' : 'world');
+        }
+        addMessage(ch, '', text, true);
+    } catch (_) { /* an error must never break the socket */ }
+}
+
+/** Compatibility + internal system-line helper: show a message in the active tab.
+ * `from` empty => system line (never persisted). */
 export function displayChat(from: string, text: string): void {
     try {
-        // Round 24: persist the RAW message (incoming AND own-sent both funnel
-        // through here) before rendering — sanitization happens at render time.
-        // System lines (from === '') are shown in the overlay but NOT persisted:
-        // they would pollute the cap-50 cross-session log with locale-bound text.
-        if (from) appendHistory(from, text);
-        const ov = ensureOverlay();
-        if (!ov) return;
-        // Cap the stack: drop the oldest live message first.
-        while (messages.length >= MAX_CHAT_MSGS) {
-            const old = messages.shift();
-            if (old) removeMessage(old);
-        }
-        const el = makeMessageEl(from || '', sanitizeChatText(text));
-        messages.push(el);
-        try { ov.addChildGui(el); } catch (_) { /* ignore */ }
-        layoutMessages();
+        if (!text) return;
+        ensurePanel();
+        addMessage(activeChannel(), from || '', text, !from);
     } catch (_) { /* a message must never break the frame */ }
 }
 
-/** Clear every rendered message + close the input. Called on party disband /
- * logout / server loss so no chat residue leaks into the next session. */
-export function clearChat(): void {
+/** Party disbanded/kicked — keep world/private history intact; just annotate the
+ * (permanent) party tab with a system line. No-op when the panel was never built,
+ * so a roster event can't pop the chat UI up for someone who doesn't use chat. */
+export function chatPartyDisbanded(): void {
     try {
-        for (let i = 0; i < messages.length; i++) {
-            const w = messages[i];
-            try { if (w && w._mpTimer) window.clearTimeout(w._mpTimer); } catch (_) { /* ignore */ }
-            try { if (overlay) overlay.removeChildGui(w); } catch (_) { /* ignore */ }
-        }
-        messages = [];
+        if (!panel) return;
+        const ch = getChannel(PARTY_ID) || ensureChannel(PARTY_ID, 'party');
+        addMessage(ch, '', t('chatPartyDisbanded'), true);
     } catch (_) { /* ignore */ }
-    closeChatInput();
+}
+
+/** Full session reset (logout / server loss): close the input, remove the DOM
+ * panel and drop every in-memory channel. Persisted per-account history survives
+ * for the next login of the same account. */
+export function clearChat(): void {
+    try { closeInput(); } catch (_) { /* ignore */ }
+    try { if (panel && panel.parentNode) panel.parentNode.removeChild(panel); } catch (_) { /* ignore */ }
+    panel = null;
+    tabsEl = null;
+    msgsEl = null;
+    inputRowEl = null;
+    inputEl = null;
+    channels = [];
+    activeId = WORLD_ID;
 }

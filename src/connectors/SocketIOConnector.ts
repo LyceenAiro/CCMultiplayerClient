@@ -751,16 +751,30 @@ export class SocketIoConnector implements IConnection {
 		this.socket.emit('partyRegroup', target ? { target } : {});
 	}
 
-	// ---- round 23 wave 4: PARTY CHAT ----
-	public chat(text: string): void {
+	// ---- round 23 wave 4 + ROUND 93: WORLD / PARTY / PRIVATE CHAT ----
+	public chat(text: string, channel: 'world' | 'party' | 'private' = 'party', target?: string): void {
 		if (!this.socket || !this.socket.connected) return;
-		this.socket.emit('chat', { text });
+		this.socket.emit('chat', { text, channel, target });
 	}
-	public onChat(callback: (msg: { from: string, text: string }) => void): void {
+	public onChat(callback: (msg: { from: string, text: string, channel?: string, target?: string }) => void): void {
 		this.socket.on('chat', (data: any) => {
 			if (data && typeof data.from === 'string' && typeof data.text === 'string') {
-				callback({ from: data.from, text: data.text });
+				callback({
+					from: data.from,
+					text: data.text,
+					channel: typeof data.channel === 'string' ? data.channel : undefined,
+					target: typeof data.target === 'string' ? data.target : undefined,
+				});
 			}
+		});
+	}
+	public onChatError(callback: (err: { reason?: string, channel?: string, target?: string }) => void): void {
+		this.socket.on('chatError', (data: any) => {
+			callback({
+				reason: data && typeof data.reason === 'string' ? data.reason : undefined,
+				channel: data && typeof data.channel === 'string' ? data.channel : undefined,
+				target: data && typeof data.target === 'string' ? data.target : undefined,
+			});
 		});
 	}
 

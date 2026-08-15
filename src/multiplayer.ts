@@ -41,7 +41,7 @@ import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
-import { displayChat, clearChat } from './ui/chatBox';
+import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
 import { t } from './i18n';
 import { showServerList } from './ui/serverList';
 
@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.21';
+export const MP_VERSION = '1.70.22';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1174,10 +1174,10 @@ export class Multiplayer {
 				// projected position. The per-frame applyNameTagsNow rebuilds fresh for
 				// whatever is still live next frame.
 				try { wipeAllNameTags(); } catch (_) { /* ignore */ }
-				// Round 23 wave 4: party disband/kick -> clear the party-chat overlay and
-				// close the input (a disbanded party has nobody left to talk to; no chat
-				// residue may leak into the next party/session).
-				try { clearChat(); } catch (_) { /* ignore */ }
+				// ROUND 93: party disband/kick no longer wipes the whole chat UI —
+				// world + private channels must survive it. Just annotate the party
+				// tab with a system line (no-op if the panel was never opened).
+				try { chatPartyDisbanded(); } catch (_) { /* ignore */ }
 				// Round 16: party lost on a wild map -> self-reload it as solo host
 				// (kick received / voluntary leave / 2-person disband all surface here).
 				// The teleport wrapper awaits changeMapResponse, which flips host=true
@@ -1197,15 +1197,20 @@ export class Multiplayer {
 			this.syncBotStream();
 		});
 
-		// Round 23 wave 4: PARTY CHAT — a teammate's message arrived (server-relayed
-		// to same-instance party members only). Render it in the chat display. The
-		// server never echoes to the sender, but the self-check is belt-and-braces.
+		// ROUND 93: WORLD / PARTY / PRIVATE CHAT — an incoming message routes into
+		// the matching bottom-left channel tab (private tabs are created on demand).
+		// The server never echoes to the sender, but the self-check is belt-and-braces.
 		safeWire(conn.onChat.bind(conn), (msg) => {
 			try {
 				if (!msg || typeof msg.text !== 'string' || !msg.text) return;
 				if (msg.from === this.name) return;
-				displayChat(msg.from, msg.text);
+				receiveChat(msg);
 			} catch (_) { /* a message must never break the socket */ }
+		});
+
+		// ROUND 93: server rejection (rate / not-in-party / private target offline).
+		safeWire(conn.onChatError.bind(conn), (err) => {
+			try { receiveChatError(err || {}); } catch (_) { /* ignore */ }
 		});
 
 		// After accepting an invite the server tells us to regroup: disband our
