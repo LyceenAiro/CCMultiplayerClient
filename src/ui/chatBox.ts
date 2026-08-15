@@ -455,7 +455,7 @@ function ensureChatStyle(): void {
     font-size: 13px; font-family: inherit; outline: none;
     user-select: text;
 }
-.mpChatInput:focus { box-shadow: inset 0 0 0 1px rgba(111,199,255,0.55); }
+.mpChatInput:focus { box-shadow: none; }
 .mpChatSend {
     flex: 0 0 auto; padding: 9px 16px; cursor: pointer;
     background: rgba(31, 111, 74, 0.9); color: #eafff2;
