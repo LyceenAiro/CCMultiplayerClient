@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.5';
+export const MP_VERSION = '1.70.6';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -644,6 +644,13 @@ export class Multiplayer {
 			(entity as any)._mpMirror = true;
 			entity.proxies = ig.game.playerEntity.proxies;
 			this.lockEntity(entity, position);
+			// ROUND 80 (body-push fix): the mirror is a network telepresence of the
+			// remote player — keep it hittable but IMMOVABLE (weight 0) so it never
+			// shoves the local player, and an attacking enemy is no longer pushed
+			// aside by the mirror husk. This is what lets the meerkat's underground
+			// charge surface at the member's synced position instead of being shoved
+			// off-target before attacking.
+			try { (entity as any).coll.weight = 0; } catch (_) { /* ignore */ }
 			// Round 21 (issue 1): 1s no-collision grace after mirror SPAWN (covers remote
 			// player map-enter, remote revival re-spawn, and pvp-isolation exit re-spawns).
 			// The single per-frame coll decision-maker (netSync.updateRemoteMirrorFade)

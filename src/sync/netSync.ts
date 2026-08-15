@@ -1284,6 +1284,28 @@ export class NetSync {
 						} catch (_) { /* never break shield updates */ }
 						return this.parent();
 					},
+					// ROUND 80 (extra-0 guard): on the HOST a member's MIRRORED ball is a
+					// real ig.ENTITY.Ball and can physically touch the real enemy natively —
+					// producing a second, engine-computed ~0 damage number next to the
+					// authoritative forwarded number. The onPreDamageModification branch below
+					// already tries to cancel it, but only AFTER Combatant.damage's entry gates
+					// and getDamage have run. Block it at the entry point instead: any
+					// mirror-rooted hit on a host real enemy is ONLY allowed while
+					// applyEnemyDamage has stamped the mirror with _mpForcedDamage (the one
+					// authoritative chain). Every other mirror-rooted touch is the stray
+					// mirrored-projectile hit and is swallowed before any number/HP write.
+					damage(this: any, ...args: any[]) {
+						try {
+							const ns = cur();
+							if (ns && ns.main.host && !(this as any)._mpMirror) {
+								const attacker: any = args[0];
+								const root: any = attacker && attacker.getCombatantRoot
+									? (attacker.getCombatantRoot() || attacker) : attacker;
+								if (root && root._mpMirror && root._mpForcedDamage == null) return false;
+							}
+						} catch (_) { /* detection failure: fall through to native */ }
+						return this.parent(...args);
+					},
 					// Damage hook. Two distinct roles depending on WHO the victim is:
 					//
 					//  (A) victim is a PUPPET (member-side enemy): the member's hit DOES apply
@@ -1587,9 +1609,23 @@ export class NetSync {
 										// the host. Force the attacker's rolled crit flag the
 										// same way the damage value is forced.
 										if (root._mpForcedCrit) du.critical = true;
+										// ROUND 80 (number style sync): the host chain also
+										// recomputes baseOffensiveFactor/defensiveFactor from the
+										// fabricated MEDIUM attack + the mirror-husk params, so an
+										// uncharged member ball (LIGHT, small thin number) rendered
+										// as a normal-size melee number on the host. Force the
+										// attacker's own rolled factors, exactly like damage/crit.
+										if (typeof root._mpForcedOff === 'number') du.baseOffensiveFactor = root._mpForcedOff;
+										if (typeof root._mpForcedDef === 'number') du.defensiveFactor = root._mpForcedDef;
+										// ROUND 80: weakness rides the same style block (drives the
+										// STRONG/WEAK appendix on the number).
+										if (typeof root._mpForcedWeak === 'boolean') a.weakness = root._mpForcedWeak;
 									}
 									root._mpForcedDamage = null;
 									root._mpForcedCrit = null;
+									root._mpForcedOff = null;
+									root._mpForcedDef = null;
+									root._mpForcedWeak = null;
 								}
 							} catch (_) { /* ignore */ }
 							// ROUND 72 (host-hit number sync): the host's OWN hit on a real
@@ -3567,7 +3603,7 @@ export class NetSync {
 	 * back to the member via combatHit). This is "member attacks -> host enters
 	 * combat -> monsters attack member" in one packet.
 	 */
-	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean }): void {
+	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
 		if (!this.main.host) return;                 // only the host owns real enemies
 		try {
 			const list = ig.game.entities;
@@ -3709,6 +3745,16 @@ export class NetSync {
 					// attacker's rolled crit; branch C forces it onto the damageResult the
 					// same way _mpForcedDamage forces the value. Cleared alongside it.
 					mirrorAny._mpForcedCrit = hit.critical === true;
+					// ROUND 80 (number style sync): carry the attacker's rolled number
+					// style too — baseOffensiveFactor/defensiveFactor set the number's
+					// SIZE (uncharged ranged hits are the small thin ones), and weakness
+					// drives the STRONG/WEAK appendix. Branch C forces them onto the
+					// damageResult, so the host renders the exact number the member saw.
+					mirrorAny._mpForcedOff = (typeof hit.off === 'number' && isFinite(hit.off) && hit.off > 0 && hit.off <= 10)
+						? hit.off : null;
+					mirrorAny._mpForcedDef = (typeof hit.def === 'number' && isFinite(hit.def) && hit.def > 0 && hit.def <= 10)
+						? hit.def : null;
+					mirrorAny._mpForcedWeak = hit.weak === true;
 					// getElement() reads tackle.attackInfo.element — neutral passes
 					// element shields/filters that would otherwise swallow the hit.
 					// The fake tackle MUST be restored synchronously: left in place,
@@ -3807,9 +3853,23 @@ export class NetSync {
 							mirrorAny.coll.vel.x = prevVelX;
 							mirrorAny.coll.vel.y = prevVelY;
 						}
+						// ROUND 80: never leave force/style stashes on the mirror — a
+						// stale stamp would let a future stray mirrored projectile through
+						// the new damage-entry guard.
+						mirrorAny._mpForcedDamage = null;
+						mirrorAny._mpForcedCrit = null;
+						mirrorAny._mpForcedOff = null;
+						mirrorAny._mpForcedDef = null;
+						mirrorAny._mpForcedWeak = null;
 					}
 				} catch (_) { applied = false; }
-				if (!applied) { (mirror as any)._mpForcedDamage = null; (mirror as any)._mpForcedCrit = null; }
+				if (!applied) {
+					(mirror as any)._mpForcedDamage = null;
+					(mirror as any)._mpForcedCrit = null;
+					(mirror as any)._mpForcedOff = null;
+					(mirror as any)._mpForcedDef = null;
+					(mirror as any)._mpForcedWeak = null;
+				}
 				// ROUND 60 (diagnostics): the outcome of the engine chain for a forwarded member hit.
 				// `applied` = did target.damage() run the full chain; `forced` = was the forwarded number
 				// left unconsumed (branch C never fired → the engine's own reduced number showed, which
@@ -3870,7 +3930,11 @@ export class NetSync {
 				target.params.reduceHp(dmg);
 				// ROUND 72: pass the attacker's rolled crit through to the fallback number
 				// too (was hardcoded false — a fallback crit rendered plain white).
-				this.spawnHitNumberOn(target, dmg, hit.critical === true, shieldFb > 0 ? shieldFb : undefined);
+				// ROUND 80: pass the attacker's style block too, so a fallback number keeps
+				// the small-thin uncharged-ball formatting instead of the melee default.
+				this.spawnHitNumberOn(target, dmg, hit.critical === true,
+					shieldFb > 0 ? shieldFb : undefined,
+					{ off: hit.off, def: hit.def, weak: hit.weak === true });
 				// Round 20 (fix 3): the fallback skips the engine's whole damage chain, so
 				// there was no knockback at all — apply the away-from-mirror knockback here.
 				// ROUND 34 (item 1/2): pass the poise gate + real fly level so a weak hit
@@ -8543,6 +8607,13 @@ export class NetSync {
 			e._mpPuppet = true;
 			e._mpSnapNext = true; // first block after adoption snaps instead of gliding
 			try { this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z }); } catch (_) { /* ignore */ }
+			// ROUND 80 (body-push fix): a synced puppet is a telepresence of the HOST
+			// enemy — it must never physically shove the local player. weight 0 keeps
+			// the coll hittable (ball/melee touch still register) while making it
+			// immovable for the impact push solver, so the meerkat's underground
+			// charge can't push the member away from the spot where the host's
+			// attack will land.
+			try { if (e.coll) e.coll.weight = 0; } catch (_) { /* ignore */ }
 			// Puppets must NOT run the enemy AI attack pick — the host streams
 			// animations (mpAnim pins), and a self-picked REAL attack action's
 			// DIRECT_HIT step (selectType TARGET) can damage the local player with NO
