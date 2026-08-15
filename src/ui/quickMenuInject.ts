@@ -1,6 +1,5 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
-import { isSharedTownNow } from '../util/areaUtil';
 
 /**
  * Quick-menu (SHIFT) inspect enhancements:
@@ -361,7 +360,7 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
         _mpFriendAction: '',
         _mpPartyAction: '',
         init(this: any) {
-            this.parent(127, 164);
+            this.parent(127, 184);
             // Mouse record: keeps box.hook.screenCoords fresh every frame so the
             // sticky isMouseOver (section 1b) treats hovering THIS box as hovering
             // the anchor — without it the box dies as soon as the cursor leaves the
@@ -381,12 +380,12 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
             this.addChildGui(this.resistance);
             this.friendBtn = new sc.ButtonGui(t('addFriend'), 100, true, sc.BUTTON_TYPE.SMALL);
             this.friendBtn.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.friendBtn.setPos(0, 120);
+            this.friendBtn.setPos(0, 136);
             this.friendBtn.onButtonPress = () => this._mpFriendPress();
             this.addChildGui(this.friendBtn);
             this.partyBtn = new sc.ButtonGui(t('inviteParty'), 100, true, sc.BUTTON_TYPE.SMALL);
             this.partyBtn.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.partyBtn.setPos(0, 140);
+            this.partyBtn.setPos(0, 158);
             this.partyBtn.onButtonPress = () => this._mpPartyPress();
             this.addChildGui(this.partyBtn);
             this.doStateTransition('HIDDEN', true);
@@ -411,8 +410,8 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 const d = this.hook;
                 const snap = d.currentState && d.currentState.alpha === 0;
                 const ax = a.pos.x + Math.floor(a.size.x / 2);
-                const rawY = a.pos.y + Math.floor(a.size.y / 2) - 70;
-                const cy = Math.max(10, Math.min((ig as any).system.height - 180, rawY));
+                const rawY = a.pos.y + Math.floor(a.size.y / 2) - 82;
+                const cy = Math.max(10, Math.min((ig as any).system.height - 200, rawY));
                 const w = (d.size && d.size.x) || 127;
                 if (ax + w + 60 < (ig as any).system.width) {
                     this.currentTileOffset = 'default';
@@ -482,14 +481,14 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 this.friendBtn.setText(friendAction ? t('addFriend') : '', true);
                 try { this.friendBtn.hook._visible = !!friendAction; } catch (_) { /* ignore */ }
                 // Party row: kick when I lead this party, leave when I'm just a
-                // member inspecting another member, invite when we're friends in a
-                // shared town but not sharing a party.
+                // member inspecting another member, and INVITE for every other
+                // online player — friend or not (ROUND 92).
                 let partyAction = '';
                 let partyLabel = '';
                 if (inParty) {
                     partyAction = isLeader ? 'kick' : 'leave';
                     partyLabel = isLeader ? t('kickParty') : t('leaveParty');
-                } else if (friend && isSharedTownNow()) {
+                } else {
                     partyAction = 'invite';
                     partyLabel = t('inviteParty');
                 }
