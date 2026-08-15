@@ -204,7 +204,7 @@ export class NetSync {
 	 * gets its fade written on the next pass — a name-keyed cache would inherit a
 	 * stale "already applied" entry and leave a mid-cutscene respawn at full alpha).
 	 * Reset on map change / disconnect / cutscene end. */
-	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number }> = new Map();
+	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number, status?: boolean }> = new Map();
 	// ---- round 26: member-side local monster-hit detection (REMOVED in round 27) ----
 	// The round-26 purely-local collision-gated monster-hit model (_mpPendingAtk /
 	// _mpLastLocalHit / _mpLocalHitActive) is GONE: the host is now the single
@@ -530,6 +530,11 @@ export class NetSync {
 		// Round 62: the host streamed enemy projectiles (Ball/Stone) so members see
 		// ranged attacks (弹幕). Spawn/update visual-only copies; reap absent uids.
 		conn.onProjectileState((map, list) => this.applyProjectileState(map, list));
+		// ROUND 82 (door transition visuals): a remote player opened a door on OUR map —
+		// open our matching door so their enter/exit walk is visible.
+		if (typeof conn.onDoorTransition === 'function') {
+			conn.onDoorTransition((info) => this.applyRemoteDoorOpen(info));
+		}
 
 		// MEMBER-side puppet handling. Round 17: puppets run NO local Enemy AI — the AI's
 		// attack clock/timers are never synced, so a member-side monster's attack timing
@@ -6493,6 +6498,9 @@ export class NetSync {
 			const pm = this.main.players[pName];
 			const e: any = pm && pm.entity;
 			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
+			// ROUND 82: a mirror fading out at a door is already "gone" — freeze it in
+			// place instead of interpolating the last stale position target.
+			if (typeof e._mpFadeOutUntil === 'number') continue;
 			const cpm: any = e.coll.pos;
 			// ROUND 80 (town movement smoothing): in shared towns use the adaptive
 			// one-packet replay segment. Its target is already a continuous linear
@@ -6660,13 +6668,18 @@ export class NetSync {
 	 * rule (formerly refreshTownCollision's write) into the cutscene-fade rule so
 	 * the two can never fight:  target coll = (inTown || fade) ? IGNORE : base.
 	 * Fade applies to animState.alpha (body + shadow via the sprite path) and the
-	 * under-feet StatusBar's hook.localAlpha (the HP bar). Writes ONLY on change
-	 * (cached per mirror) — mirrors may be mid-spawn (guarded), and a mirror
-	 * spawned mid-fade self-heals on the next tick.
+	 * under-feet StatusBar's hook (the HP bar). Writes ONLY on change (cached per
+	 * mirror) — mirrors may be mid-spawn (guarded), and a mirror spawned mid-fade
+	 * self-heals on the next tick.
+	 * ROUND 82: also owns the door-transition fades (_mpFadeInStart / _mpFadeOutUntil)
+	 * and hides the under-feet HP bar with hook._visible — StatusBar.update overwrites
+	 * hook.localAlpha every frame, so an alpha write alone never hid the town bar.
 	 */
 	public updateRemoteMirrorFade(): void {
 		try {
+			this._mpEnsureDoorHook();
 			const inTown = isSharedTownNow();
+			const nowMs = Date.now();
 			for (const name in this.main.players) {
 				const pm = this.main.players[name];
 				if (!pm) continue;
@@ -6674,7 +6687,27 @@ export class NetSync {
 				const e = entry.entity;
 				if (!e || e._killed || !e.coll) continue;
 				const fade = this.inCutscene || !!entry._mpCutscene;
-				const targetAlpha = fade ? 0.25 : 1;
+				// ROUND 82: door leave/enter transitions fade the mirror in/out over
+				// ~450-500ms. A cutscene fade still falls back to the base 0.25 alpha
+				// when no transition is active.
+				let targetAlpha = fade ? 0.25 : 1;
+				let hideStatus = inTown;
+				if (typeof e._mpFadeInStart === 'number') {
+					const start = e._mpFadeInStart;
+					const dur = (typeof e._mpFadeInDur === 'number' && e._mpFadeInDur > 0) ? e._mpFadeInDur : 500;
+					const k = (nowMs - start) / dur;
+					if (k >= 1) {
+						e._mpFadeInStart = undefined;
+						e._mpFadeInDur = undefined;
+					} else {
+						targetAlpha = Math.max(0, Math.min(1, k));
+						hideStatus = true;
+					}
+				} else if (typeof e._mpFadeOutUntil === 'number') {
+					const dur = (typeof e._mpFadeOutDur === 'number' && e._mpFadeOutDur > 0) ? e._mpFadeOutDur : 450;
+					targetAlpha = Math.max(0, Math.min(1, (e._mpFadeOutUntil - nowMs) / dur));
+					hideStatus = true;
+				}
 				// Capture the mirror's base coll type once (the same _mpBaseCollType
 				// pattern refreshTownCollision used — it captures it there too, so this
 				// just reads it back if already set).
@@ -6685,25 +6718,32 @@ export class NetSync {
 				// IGNORE so the freshly-placed local player can't overlap this mirror.
 				// `||` folds both to the earliest deadline; the change-gated cache below
 				// handles both the activation and the time-based expiry automatically.
-				const nowMs = Date.now();
 				const grace = nowMs < ((e as any)._mpNoCollUntil || this._mpMirrorGraceUntil || 0);
-				const targetColl = (inTown || fade || grace) ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
+				const transition = typeof e._mpFadeInStart === 'number' || typeof e._mpFadeOutUntil === 'number';
+				const targetColl = (inTown || fade || grace || transition) ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
 				// Main-city refactor: hide the under-feet HP bar entirely while in a shared
 				// town (a room full of auto-matched players would stack dozens of HP bars).
-				if (e.statusGui && e.statusGui.hook && e._mpBaseHpAlpha === undefined) {
-					e._mpBaseHpAlpha = (typeof e.statusGui.hook.localAlpha === 'number') ? e.statusGui.hook.localAlpha : 1;
+				// ROUND 82: use hook._visible (the only reliable gate — StatusBar.update
+				// resets hook.localAlpha to 0.9/1 every frame, so the old alpha write never
+				// survived). Capture the normal visibility once and restore it exactly.
+				if (e.statusGui && e.statusGui.hook && e._mpBaseStatusVisible === undefined
+					&& e.statusGui.hook._visible === true) {
+					e._mpBaseStatusVisible = true;
 				}
+				const statusVisible = !hideStatus && e._mpBaseStatusVisible !== false;
 				const hpAlpha = inTown ? 0 : (fade ? 0.25 : (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1));
 				const cached = this._mpMirrorFadeCache.get(e);
-				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl || cached.hp !== hpAlpha) {
-					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, hp: hpAlpha });
+				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl
+					|| cached.hp !== hpAlpha || cached.status !== statusVisible) {
+					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, hp: hpAlpha, status: statusVisible });
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
 					try { if (e.animState) e.animState.alpha = targetAlpha; } catch (_) { /* ignore */ }
-					// HP bar via the StatusBar hook's localAlpha (base ~0.7): 0 in town,
-					// 0.25 while faded, base otherwise. Capture once and restore exactly.
+					// HP bar: _visible is the real gate; localAlpha still follows the
+					// cutscene/base convention while the engine keeps overriding it.
 					try {
 						if (e.statusGui && e.statusGui.hook) {
 							e.statusGui.hook.localAlpha = hpAlpha;
+							e.statusGui.hook._visible = statusVisible;
 						}
 					} catch (_) { /* ignore */ }
 					// ROUND 80: setType keeps the spatial hash consistent with the
@@ -6717,11 +6757,107 @@ export class NetSync {
 		} catch (_) { /* never break the frame */ }
 	}
 
+	/**
+	 * ROUND 82 (door transition visuals): lazily hook ig.ENTITY.Door.collideWith so
+	 * a LOCAL player stepping into a mapped door broadcasts it before the original
+	 * method runs the walk+teleport event. Door is a lazy map-content module, so the
+	 * hook waits (once) until the first door entity type exists.
+	 */
+	private _mpDoorHookInstalled = false;
+	private _mpEnsureDoorHook(): void {
+		try {
+			if (this._mpDoorHookInstalled) return;
+			const Door: any = (ig.ENTITY as any).Door;
+			if (!Door || typeof Door.inject !== 'function') return;
+			this._mpDoorHookInstalled = true;
+			Door.inject({
+				collideWith(this: any, other: any, dir: any) {
+					try {
+						const m = (window as any).__mpMain;
+						const p = ig.game && ig.game.playerEntity;
+						const canLeave = !(sc as any).model || !(sc as any).model.isMapLeaveBlocked
+							|| !(sc as any).model.isMapLeaveBlocked();
+						if (m && m.netSync && p && other === p && this.map && this.active && canLeave
+							&& typeof (ig.game as any).isInterruptible === 'function' && (ig.game as any).isInterruptible()
+							&& this.coll && p.coll && this.coll.pos.z === p.coll.pos.z) {
+							m.netSync.broadcastDoorOpen(this);
+						}
+					} catch (_) { /* the native walk must never break */ }
+					return this.parent(other, dir);
+				},
+			});
+		} catch (_) { /* hook is cosmetic */ }
+	}
+
+	/** ROUND 82: send our door's identity/position to the instance so members on the
+	 * same map can open their matching door and watch us walk through it. */
+	public broadcastDoorOpen(door: any): void {
+		try {
+			const conn: any = this.main && this.main.connection;
+			if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
+			if (typeof conn.doorTransition !== 'function') return;
+			conn.doorTransition({
+				map: ((ig.game as any).mapName || ''),
+				x: Math.round(door.coll.pos.x),
+				y: Math.round(door.coll.pos.y),
+				z: Math.round(door.coll.pos.z),
+				dir: typeof door.dir === 'string' ? door.dir : 'SOUTH',
+				targetMap: typeof door.map === 'string' ? door.map : '',
+				marker: typeof door.marker === 'string' ? door.marker : '',
+			});
+		} catch (_) { /* never break the walk */ }
+	}
+
+	/** ROUND 82: a remote player opened a door on our map — find our matching door
+	 * (same target map/marker nearest the relayed spot), open it, and let the remote
+	 * mirror pass during the open window (restoring collision right after it closes). */
+	public applyRemoteDoorOpen(info: any): void {
+		try {
+			if (!info || !ig.game || (ig.game as any).mapName !== info.map) return;
+			const doors: any[] = Array.isArray(ig.game.entities) ? ig.game.entities : [];
+			let best: any = null;
+			let bestDist = Infinity;
+			for (let i = 0; i < doors.length; i++) {
+				const d = doors[i];
+				if (!d || !(d instanceof (ig.ENTITY as any).Door) || !d.coll || d._killed) continue;
+				if (info.targetMap && d.map !== info.targetMap) continue;
+				if (info.marker && d.marker !== info.marker) continue;
+				const dx = d.coll.pos.x - (typeof info.x === 'number' ? info.x : 0);
+				const dy = d.coll.pos.y - (typeof info.y === 'number' ? info.y : 0);
+				const dist = dx * dx + dy * dy;
+				if (dist < bestDist) { bestDist = dist; best = d; }
+			}
+			if (!best || bestDist > 96 * 96) return;
+			try {
+				const prevIgnore = !!best.coll.ignoreCollision;
+				best.coll.ignoreCollision = true;
+				// open(false) plays the sound at the door (spatial) and auto-closes after
+				// the same preWait window the owner's door uses.
+				best.open(false);
+				const holdMs = Math.max(1200, ((best.doorType && best.doorType.preWait) || 0) * 1000 + 1200);
+				setTimeout(() => {
+					try {
+						// Only restore when nobody is currently mid-transition on this door
+						// (the local player may have used the same door in the meantime).
+						if (best && best.coll && !best._killed && !best.openTimer) best.coll.ignoreCollision = prevIgnore;
+					} catch (_) { /* ignore */ }
+				}, holdMs);
+			} catch (_) { /* ignore */ }
+		} catch (_) { /* cosmetic — never break the frame */ }
+	}
+
 	/** Round 19 (Part 2): drop cached per-mirror fade/collision state (map change /
 	 * disconnect / cutscene end — the next per-frame pass re-evaluates from
 	 * scratch, so freshly-spawned mirrors start correct). */
 	public resetMirrorFadeCache(): void {
 		try { this._mpMirrorFadeCache.clear(); } catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 82: drop ONE mirror's cached fade state after its leave-fade kill, so a
+	 * long town session with many door round-trips can't grow the cache with dead
+	 * entity keys. */
+	public forgetMirrorFade(e: any): void {
+		try { this._mpMirrorFadeCache.delete(e); } catch (_) { /* ignore */ }
 	}
 
 	/**

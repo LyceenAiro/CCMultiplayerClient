@@ -910,6 +910,25 @@ export class SocketIoConnector implements IConnection {
 	public updateCutsceneEntityBlock(state: { map: string, list: any[] }): void {
 		this.syncEmit('cutsceneEntity', state);
 	}
+	// ROUND 82: door open/close visuals for map doors. Instance-scoped (solo-skipped);
+	// the server whitelists the small payload and relays it to the other members.
+	public doorTransition(info: { map: string; x: number; y: number; z: number; dir: string; targetMap: string; marker: string }): void {
+		this.syncEmit('doorTransition', info);
+	}
+	public onDoorTransition(callback: (info: { map: string; x: number; y: number; z: number; dir: string; targetMap: string; marker: string }) => void): void {
+		this.socket.on('doorTransition', (data: any) => {
+			if (!data || typeof data.map !== 'string') return;
+			callback({
+				map: data.map,
+				x: typeof data.x === 'number' ? data.x : 0,
+				y: typeof data.y === 'number' ? data.y : 0,
+				z: typeof data.z === 'number' ? data.z : 0,
+				dir: data.dir === 'NORTH' || data.dir === 'SOUTH' || data.dir === 'EAST' || data.dir === 'WEST' ? data.dir : 'SOUTH',
+				targetMap: typeof data.targetMap === 'string' ? data.targetMap : '',
+				marker: typeof data.marker === 'string' ? data.marker : '',
+			});
+		});
+	}
 	// Round 62: host-only stream of enemy projectiles (Ball/Stone). The server relays it
 	// as `projectileState` via broadcastHostState (no-op unless the sender is the instance
 	// host); the payload is whitelisted server-side.

@@ -79,6 +79,13 @@ export interface IConnection {
      * relays this to the instance as `cutsceneEntity` with the sender stamped as
      * `from`; receivers render them as csPuppets and reap them when the stream stops. */
     updateCutsceneEntityBlock(state: { map: string, list: any[] }): void;
+    /** ROUND 82 (door transition visuals): the local player walked into a mapped
+     * door (Door.collideWith) — broadcast the door's identity/position so other
+     * clients on the same map open their matching door and see the enter/exit
+     * walk instead of a remote player passing through a closed door. */
+    doorTransition(info: { map: string; x: number; y: number; z: number; dir: string; targetMap: string; marker: string }): void;
+    /** ROUND 82: a remote player opened a door on our map — replay the open. */
+    onDoorTransition(callback: (info: { map: string; x: number; y: number; z: number; dir: string; targetMap: string; marker: string }) => void): void;
     /** Round 62: host-only stream of live enemy projectiles (Ball/Stone, party ENEMY)
      * so members can see enemy ranged attacks (弹幕). The server relays it as
      * `projectileState` (host-only like entityState); receivers spawn visual-only

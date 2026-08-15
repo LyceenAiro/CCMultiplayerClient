@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.10';
+export const MP_VERSION = '1.70.11';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -557,8 +557,13 @@ export class Multiplayer {
 			if (!player) continue;
 			// Safety net: if the map has finished loading but this player's mirror was
 			// never spawned (entered during the load), spawn it now at its last known
-			// position so they're not permanently invisible.
+			// position so they're not permanently invisible. ROUND 82: a door/teleport
+			// entry that is waiting for the first authoritative playerState (so it can
+			// spawn at the REAL destination instead of the old-map door position) gets a
+			// short grace before this fallback fires.
 			if (!player.entity && !ig.game.isTeleporting() && ig.game.entities.length !== 0) {
+				const rec: any = player as any;
+				if (rec._mpWaitForStateUntil && Date.now() < rec._mpWaitForStateUntil) continue;
 				this.spawnMirrorAt(name, player.position);
 				continue;
 			}
@@ -575,6 +580,11 @@ export class Multiplayer {
 	 *  instance spans a whole area) so the load-complete reconcile can keep only
 	 *  the members actually on our map. undefined = no changeMap for this load. */
 	public newInstanceMembers?: Array<{ name: string; map?: string }>;
+
+	/** ROUND 82: players whose NEXT mirror spawn should fade in (door/teleport
+	 * arrivals). Independent of the players record so the flag survives the
+	 * clearMap/reconcile window; consumed by spawnMirrorNow. */
+	public pendingFadeIn: { [name: string]: boolean } = Object.create(null);
 
 	/** Round 15: the LOCAL player changed maps. clearMap() killed every old-map
 	 *  mirror but this.players still references them, and the server never tells
@@ -624,6 +634,10 @@ export class Multiplayer {
 		// enemy type was loading.
 		const existing = this.players[player];
 		if (existing && existing.entity) return;
+		// ROUND 82 (door transition visuals): a map-enter record that waits for the
+		// first real playerState is marked for fade-in so the mirror materializes with
+		// a short fade instead of popping in at the destination door.
+		const wantFadeIn = !!(existing && (existing as any)._mpFadeIn) || !!this.pendingFadeIn[player];
 		try {
 			const entity: IMultiplayerEntity = ig.game.spawnEntity('Enemy', position.x, position.y, position.z, {
 				name: player,
@@ -663,6 +677,14 @@ export class Multiplayer {
 			// forces this mirror's coll.type to IGNORE until the deadline so the local
 			// player can't overlap it. Expires by time — no explicit cleanup needed.
 			(entity as any)._mpNoCollUntil = Date.now() + 1000;
+			// ROUND 82: fade the fresh door-transition mirror in from transparent;
+			// netSync.updateRemoteMirrorFade advances the alpha each frame.
+			if (wantFadeIn) {
+				(entity as any)._mpFadeInStart = Date.now();
+				(entity as any)._mpFadeInDur = 500;
+				try { entity.animState.alpha = 0; } catch (_) { /* ignore */ }
+				try { delete this.pendingFadeIn[player]; } catch (_) { /* ignore */ }
+			}
 			this.players[player] = { name: player,
 				position: { x: position.x, y: position.y, z: position.z },
 				entity } as IPlayer;

@@ -28,6 +28,14 @@ export class OnPlayerChangeMapListener {
 		map: string,
 		marker: string | null): void {
 		if (enters) {
+			// ROUND 82 (door transition visuals): if the same player's mirror is still
+			// mid-leave-fade (quick door round-trip), finish it NOW so the fresh entry
+			// spawns cleanly instead of leaving two mirrors.
+			const prev = this.main.players[player];
+			if (prev && prev.entity && (prev.entity as any)._mpFadeOutUntil) {
+				try { (prev.entity as any).kill(true); } catch (_) { /* ignore */ }
+				try { delete this.main.players[player]; } catch (_) { /* ignore */ }
+			}
 			// Main-city refactor: a town instance spans a whole AREA, so an entering
 			// player may be on a DIFFERENT sub-map. Track their sub-map and only treat
 			// them as "on this map" (and mirror them) when it matches OUR map.
@@ -55,6 +63,8 @@ export class OnPlayerChangeMapListener {
 			if (ig.game.isTeleporting() || ig.game.entities.length === 0) {
 				this.pendingSpawn[player] = { position, map: map || '' };
 				this.ensurePlayerRecord(player, position);
+				// ROUND 82: the load-complete spawn is a door/teleport arrival — fade it in.
+				this.main.pendingFadeIn[player] = true;
 				return;
 			}
 			// Idle: a sameMap decision is reliable (a town instance spans a whole area).
@@ -69,7 +79,17 @@ export class OnPlayerChangeMapListener {
 				this.despawnMirror(player);
 				return;
 			}
-			this.spawnMirror(player, position);
+			// ROUND 82: DON'T spawn at the relayed position — it is the SENDER'S OLD-MAP
+			// position (the spot in front of the door they are leaving), not their real
+			// destination. Record the player and let the first playerState from the new
+			// map spawn the mirror at the REAL marker position (applyPlayerState's
+			// no-mirror self-heal), with a fade-in so it doesn't pop.
+			this.ensurePlayerRecord(player, position);
+			const rec: any = this.main.players[player];
+			if (rec && !rec.entity) {
+				rec._mpWaitForStateUntil = Date.now() + 2500;
+				this.main.pendingFadeIn[player] = true;
+			}
 		} else {
 			// Round 15: drop them from the on-this-map roster (see enters branch).
 			if (this.main.playersOnThisMap) delete this.main.playersOnThisMap[player];
@@ -109,15 +129,40 @@ export class OnPlayerChangeMapListener {
 	}
 
 	private despawnMirror(player: string): void {
+		try { delete this.main.pendingFadeIn[player]; } catch (_) { /* ignore */ }
 		const mirror = this.main.players[player];
 		if (mirror && mirror.entity) {
-			try { mirror.entity.kill(); } catch (_) { /* ignore */ }
+			const e: any = mirror.entity;
+			// ROUND 82 (door transition visuals): fade the mirror out at the door for
+			// ~450ms before killing it — an instant kill reads as a teleport. The record
+			// stays in this.main.players during the fade so netSync's per-frame fade pass
+			// still drives the alpha; the timeout then removes the entity + record.
+			if (!e._mpFadeOutUntil) {
+				e._mpFadeOutUntil = Date.now() + 450;
+				e._mpFadeOutDur = 450;
+				// A faded-out mirror must not keep drawing its under-feet HP bar.
+				try { if (e.statusGui && e.statusGui.hook) e.statusGui.hook._visible = false; } catch (_) { /* ignore */ }
+				setTimeout(() => {
+					try {
+						const cur = this.main.players[player];
+						if (cur && cur.entity === e) {
+							try { e.kill(true); } catch (_) { /* ignore */ }
+							this.main.players[player] = undefined;
+							delete this.main.players[player];
+						} else if (e && !e._killed) {
+							try { e.kill(true); } catch (_) { /* ignore */ }
+						}
+						try { if (this.main.netSync) this.main.netSync.forgetMirrorFade(e); } catch (_) { /* ignore */ }
+					} catch (_) { /* ignore */ }
+				}, 500);
+			}
+		} else {
+			this.main.players[player] = undefined;
+			delete this.main.players[player];
 		}
 		// Round 22: drop the cached name tag when a teammate leaves the map so it can't
 		// linger at the last projected position (the per-frame loop only hides, never clears).
 		try { dropNameTag(player); } catch (_) { /* ignore */ }
-		this.main.players[player] = undefined;
-		delete this.main.players[player];
 	}
 
 	private registerLoadCompleteHandler(): void {
