@@ -128,11 +128,15 @@ everything goes through `CCMultiplayerServer`.
 
 ## Main-city (shared town) mechanics
 
-Two areas act as **main cities** (open matchmaking hubs) where players meet
+Six areas act as **main cities** (open matchmaking hubs) where players meet
 without needing to form a party:
 
 - **Rookie Harbor** (`rookie-harbor`, 新手港)
 - **Rhombus Square** (`rhombus-sqr`, 罗姆斯广场, incl. 迎新桥)
+- **Bergen Village** (`bergen`, 俾尔根村)
+- **Ba'kii Kum** (`ba-ki-kum`, 巴基库姆)
+- **Basin Keep** (`basin-keep`, 巴辛堡)
+- **Homestedt** (`homestedt`, 家园)
 
 Behaviour:
 

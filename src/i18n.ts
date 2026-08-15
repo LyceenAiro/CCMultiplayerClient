@@ -159,6 +159,7 @@ const enDict: { [key: string]: string } = {
     // ROUND 93 — MMO-style chat channels (chatBox.ts)
     chatWorld: 'World',
     chatParty: 'Party',
+    chatPrivate: 'Private',
     chatPrivatePh: 'Message {name}, Enter to send…',
     chatClosePrivate: 'Close private chat',
     chatNotConnected: 'Not connected to the server',
@@ -356,6 +357,7 @@ const zhDict: { [key: string]: string } = {
     // ROUND 93 — MMO式聊天频道 (chatBox.ts)
     chatWorld: '世界',
     chatParty: '小队',
+    chatPrivate: '私聊',
     chatPrivatePh: '私聊 {name}，回车发送…',
     chatClosePrivate: '关闭私聊',
     chatNotConnected: '未连接到服务器',

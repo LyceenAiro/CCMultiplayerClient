@@ -68,8 +68,8 @@ async function startMultiplayer(): Promise<void> {
 		// connected (vanilla save menu when not connected). Same lazy getMain pattern.
 		installSaveButtons(() => multiplayer);
 
-		// ROUND 93: MMO-style bottom-left chat panel (世界/小队/私聊 tabs, Enter to
-		// type). Same lazy getMain pattern.
+		// ROUND 93/94: channel chat — popup bubbles with [世界]/[小队]/[私聊]
+		// prefixes while closed; Enter opens the full bottom-left tab panel.
 		installChatBox(() => multiplayer);
 
 		// Round 23 wave 5: network-quality diamond badges on the party-HUD portraits

@@ -73,9 +73,14 @@ export function areaTypeOfMap(mapName: string): number {
 /**
  * Areas that are *shared* towns (open matchmaking where remote players meet and
  * walk through each other). Kept in sync with the server's SHARED_TOWNS list —
- * Rookie Harbor (新手港) and Rhombus Square (罗姆布斯广场, incl. 迎新桥).
+ * Rookie Harbor (新手港), Rhombus Square (罗姆布斯广场, incl. 迎新桥), Bergen
+ * Village (俾尔根村), Ba'kii Kum (巴基库姆), Basin Keep (巴辛堡) and Homestedt
+ * (家园).
  */
-export const SHARED_TOWNS = ['rookie-harbor', 'rhombus-sqr'];
+export const SHARED_TOWNS = [
+    'rookie-harbor', 'rhombus-sqr',
+    'bergen', 'ba-ki-kum', 'basin-keep', 'homestedt',
+];
 
 /** True when the player is currently standing in a shared town. */
 export function isSharedTownNow(): boolean {

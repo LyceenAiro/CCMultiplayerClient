@@ -2,20 +2,22 @@ import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 
 /**
- * ROUND 93 — MMO-STYLE CHAT CHANNELS (replaces the round-23 party-only popup).
+ * ROUND 93/94 — MMO-STYLE CHANNEL CHAT (world / party / private).
  *
- * The chat lives in a fixed DOM panel at the BOTTOM-LEFT of the game screen:
- *   - channel tabs/cards along the top (世界 / 小队 / one card per private chat),
- *   - a message list under them, auto-scrolled to the newest row,
- *   - an input strip that appears when Enter is pressed and stays open after
- *     sending (Enter with an empty box closes it, Escape cancels).
+ * TWO presentation modes, driven by whether the chat INPUT is open:
  *
- * Three channel kinds, routed server-side:
- *   world   — global server broadcast (1/s per player).
- *   party   — every party member, regardless of map/instance.
- *   private — one named player; tabs are created by the 联系 buttons (quick-menu
- *             friend row + social-menu option) and by incoming private messages.
- *             Private tabs are closable; world/party tabs are permanent.
+ *  CLOSED (normal play)
+ *    Nothing is docked on the screen. Incoming messages render as transient
+ *    POPUP bubbles anchored to the BOTTOM-LEFT. Every bubble carries a channel
+ *    prefix — [世界] white, [小队] blue, [私聊] pink. The stack grows from the
+ *    BOTTOM upward (newest at the bottom; older bubbles are pushed up and fade
+ *    out after ~8s), so the first message never appears at the top of a box.
+ *
+ *  OPEN (Enter pressed)
+ *    A full MMO panel appears at the bottom-left with the channel tabs/cards
+ *    (世界 / 小队 / closable private tabs), the message list (newest pinned to
+ *    the bottom) and the input strip. Popups are hidden while the panel is open;
+ *    incoming messages land in their channel tab (unread badge when inactive).
  *
  * The Enter hook is a CAPTURE-phase window keydown listener (never a rebind of
  * ig.KEY.ENTER / sc.control). While the input is open it consumes every key not
@@ -63,13 +65,17 @@ let getMain: () => Multiplayer | undefined = () => undefined;
 let installed = false;                       // once-per-process keydown capture guard
 let captureKeydown: ((e: KeyboardEvent) => void) | null = null;
 
-let chatOpen = false;                        // input strip currently visible
-let panel: HTMLElement | null = null;        // fixed bottom-left panel
+let chatOpen = false;                        // input strip (and the full panel) visible
+let panel: HTMLElement | null = null;        // the channel panel (hidden unless .open)
 let tabsEl: HTMLElement | null = null;
 let msgsEl: HTMLElement | null = null;
 let inputRowEl: HTMLElement | null = null;
 let inputEl: HTMLInputElement | null = null;
 let chatFocusListener: (() => void) | null = null;
+
+let popupHost: HTMLElement | null = null;    // transient bubble stack (chat closed)
+interface IPop { el: HTMLElement, timer: number }
+let pops: IPop[] = [];
 
 let channels: ChatChannel[] = [];
 let activeId = 'world';
@@ -88,6 +94,8 @@ const PRIVATE_PREFIX = 'pm:';
 const MAX_MESSAGES = 80;        // live rows kept per channel
 const PERSIST_MAX = 50;         // persisted rows kept per channel
 const PERSIST_PREFIX = 'mpChatChannelsV2:';
+const MAX_POPS = 5;             // transient bubbles kept at once
+const POP_TTL_MS = 8000;        // each bubble lives ~8s
 
 /** True when the keydown event target is a text-entry element — the chat hook
  * must never hijack keys while the player is typing somewhere else. */
@@ -153,15 +161,6 @@ export function installChatBox(gm: () => Multiplayer | undefined): void {
             if (e.isComposing || code === 229) return;
 
             // X1: while the chat input is open, game key bindings must never fire.
-            // The engine routes DOM keys through ig.input.keydown (a window bubble
-            // listener bound at input init), gated by hasFocusLost + a.target.type —
-            // but the mod forces ig.system.hasFocusLost to ()=>false (disableFocus in
-            // multiplayer.ts), which defeats the engine's text-input gate for any key
-            // whose target ISN'T a text element. So we suppress here, in the capture
-            // phase (which runs BEFORE the engine's bubble-phase window listener):
-            // swallow every key not aimed at a text-entry element while the chat is
-            // open. Typing in the chat input itself (target = the text input) still
-            // passes through untouched, so the input element handles it normally.
             if (chatOpen) {
                 if (code === 27) { // Escape cancels — consume in every case
                     e.preventDefault();
@@ -295,8 +294,8 @@ function ensureChannel(id: string, kind: ChatKind, target?: string): ChatChannel
 }
 
 /** Seed the two permanent tabs plus every private tab found in persisted history. */
-function seedChannels(): void {
-    channels = [];
+function ensureChannels(): void {
+    if (channels.length) return;
     ensureChannel(WORLD_ID, 'world');
     ensureChannel(PARTY_ID, 'party');
     const saved = loadPersisted();
@@ -309,31 +308,32 @@ function seedChannels(): void {
     }
 }
 
-// ---- panel DOM ----
+// ---- CSS ----
 
 function ensureChatStyle(): void {
     if (document.getElementById('mpChatStyle')) return;
     const style = document.createElement('style');
     style.id = 'mpChatStyle';
     style.textContent = `
+/* Full channel panel — only rendered while the input is open (.open). */
 .mpChatBox {
+    display: none;
     position: fixed; left: 12px; bottom: 12px;
-    width: 360px; max-width: calc(100vw - 24px);
+    width: 380px; max-width: calc(100vw - 24px);
     z-index: 9000;
     color: #eaf7ff;
     font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
-    pointer-events: none;
     user-select: none;
 }
+.mpChatBox.open { display: block; }
 .mpChatTabs {
     display: flex; align-items: stretch; gap: 3px;
     overflow-x: auto; overflow-y: hidden;
     padding: 4px 4px 0 4px;
-    background: rgba(6, 18, 30, 0.9);
+    background: rgba(6, 18, 30, 0.94);
     border: 1px solid rgba(111, 199, 255, 0.55);
     border-bottom: none;
     border-radius: 7px 7px 0 0;
-    pointer-events: auto;
 }
 .mpChatTab {
     flex: 0 0 auto;
@@ -369,12 +369,10 @@ function ensureChatStyle(): void {
     height: 132px;
     overflow-y: auto;
     padding: 4px 6px;
-    background: rgba(4, 12, 20, 0.62);
+    background: rgba(4, 12, 20, 0.72);
     border: 1px solid rgba(111, 199, 255, 0.55);
     border-top: none;
-    pointer-events: none;
 }
-.mpChatBox.open .mpChatMsgs { pointer-events: auto; }
 .mpChatRow {
     display: flex; align-items: flex-start;
     padding: 1px 2px;
@@ -386,15 +384,13 @@ function ensureChatStyle(): void {
 .mpChatSysRow { padding: 1px 2px; font-size: 12px; line-height: 16px;
     color: #8fd6ff; font-style: italic; opacity: 0.9; word-break: break-word; }
 .mpChatInputRow {
-    display: none;
+    display: flex;
     align-items: center; gap: 7px;
     padding: 6px;
     background: rgba(6, 18, 30, 0.94);
     border: 1px solid rgba(111, 199, 255, 0.55); border-top: none;
     border-radius: 0 0 7px 7px;
-    pointer-events: auto;
 }
-.mpChatBox.open .mpChatInputRow { display: flex; }
 .mpChatInput {
     flex: 1 1 auto; min-width: 0; box-sizing: border-box;
     padding: 7px 9px;
@@ -411,16 +407,51 @@ function ensureChatStyle(): void {
     font-size: 12.5px; font-family: inherit; letter-spacing: 2px;
 }
 .mpChatSend:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 8px rgba(125,255,168,0.6); }
+
+/* Transient popup bubbles — the ONLY thing visible while the input is closed. */
+.mpChatPops {
+    position: fixed; left: 12px; bottom: 12px;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    align-items: flex-start; gap: 6px;
+    width: 440px; max-width: calc(100vw - 24px);
+    z-index: 8999; pointer-events: none;
+    font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
+}
+.mpChatPop {
+    max-width: 100%;
+    display: flex; align-items: flex-start;
+    padding: 5px 9px;
+    font-size: 12.5px; line-height: 17px;
+    color: #eaf7ff;
+    background: rgba(6, 18, 30, 0.82);
+    border: 1px solid rgba(111, 199, 255, 0.4);
+    border-radius: 5px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    word-break: break-word;
+    animation: mpChatPopIn 0.16s ease-out;
+}
+@keyframes mpChatPopIn { from { opacity: 0; transform: translateY(8px); }
+                        to   { opacity: 1; transform: translateY(0); } }
+.mpChatPop.mpPopWorld { border-left: 3px solid #ffffff; }
+.mpChatPop.mpPopParty { border-left: 3px solid #6fc7ff; }
+.mpChatPop.mpPopPrivate { border-left: 3px solid #ff9dd6; }
+.mpPopTag { flex: 0 0 auto; margin-right: 6px; }
+.mpChatPop.mpPopWorld .mpPopTag { color: #ffffff; }
+.mpChatPop.mpPopParty .mpPopTag { color: #6fc7ff; }
+.mpChatPop.mpPopPrivate .mpPopTag { color: #ff9dd6; }
+.mpPopName { color: #9fe6b0; flex: 0 0 auto; margin-right: 5px; }
+.mpPopText { flex: 1 1 auto; white-space: pre-wrap; }
+.mpChatPop.mpPopSys .mpPopText { color: #8fd6ff; font-style: italic; }
 `;
     document.head.appendChild(style);
 }
 
-/** Build the fixed bottom-left panel once (kept across map loads; removed only by
- * clearChat on logout/server loss). Seeding channels happens before any render. */
+// ---- panel DOM (hidden until the input opens) ----
+
 function ensurePanel(): HTMLElement {
     if (panel) return panel;
     ensureChatStyle();
-    if (!channels.length) seedChannels();
+    ensureChannels();
 
     const root = document.createElement('div');
     root.className = 'mpChatBox';
@@ -553,6 +584,7 @@ function renderMessages(): void {
         row.appendChild(text);
         msgsEl.appendChild(row);
     }
+    // Newest row always sits at the BOTTOM; older rows scroll away upward.
     msgsEl.scrollTop = msgsEl.scrollHeight;
 }
 
@@ -563,14 +595,82 @@ function setActiveChannel(id: string, focus: boolean): void {
     if (!ch) return;
     activeId = id;
     ch.unread = 0;
-    renderTabs();
-    renderMessages();
-    updatePlaceholder();
+    if (panel) {
+        renderTabs();
+        renderMessages();
+        updatePlaceholder();
+    }
     if (focus) openInput();
     else if (chatOpen && inputEl) inputEl.focus();
 }
 
-// ---- input strip ----
+// ---- transient popup bubbles (chat closed) ----
+
+function channelTag(kind: ChatKind): string {
+    return kind === 'party' ? t('chatParty') : kind === 'private' ? t('chatPrivate') : t('chatWorld');
+}
+
+function ensurePopupHost(): HTMLElement {
+    if (popupHost) return popupHost;
+    ensureChatStyle();
+    const host = document.createElement('div');
+    host.className = 'mpChatPops';
+    document.body.appendChild(host);
+    popupHost = host;
+    return host;
+}
+
+function removePop(p: IPop): void {
+    const idx = pops.indexOf(p);
+    if (idx !== -1) pops.splice(idx, 1);
+    try { if (p.timer) window.clearTimeout(p.timer); } catch (_) { /* ignore */ }
+    try { if (p.el && p.el.parentNode) p.el.parentNode.removeChild(p.el); } catch (_) { /* ignore */ }
+}
+
+function clearPops(): void {
+    for (const p of pops.slice()) removePop(p);
+    pops = [];
+    try { if (popupHost) popupHost.style.display = 'none'; } catch (_) { /* ignore */ }
+}
+
+/** Render one transient bottom-left bubble with its colored [世界]/[小队]/[私聊]
+ * prefix. `from` empty => system line. The host is a bottom-anchored flex column:
+ * appending the newest bubble keeps it at the BOTTOM and pushes older ones UP. */
+function showPopup(kind: ChatKind, from: string, text: string): void {
+    try {
+        if (chatOpen) return; // the full panel is showing — no popups while it is
+        const clean = sanitizeChatText(text);
+        if (!clean) return;
+        const host = ensurePopupHost();
+        host.style.display = 'flex';
+        const pop = document.createElement('div');
+        pop.className = 'mpChatPop mpPop' + (kind === 'world' ? 'World' : kind === 'party' ? 'Party' : 'Private');
+        if (!from) pop.className += ' mpPopSys';
+
+        const tag = document.createElement('span');
+        tag.className = 'mpPopTag';
+        tag.textContent = '[' + channelTag(kind) + ']';
+        pop.appendChild(tag);
+        if (from) {
+            const name = document.createElement('span');
+            name.className = 'mpPopName';
+            name.textContent = sanitizeChatText(from) + ':';
+            pop.appendChild(name);
+        }
+        const body = document.createElement('span');
+        body.className = 'mpPopText';
+        body.textContent = clean;
+        pop.appendChild(body);
+
+        host.appendChild(pop);
+        const p: IPop = { el: pop, timer: 0 };
+        pops.push(p);
+        while (pops.length > MAX_POPS) removePop(pops[0]);
+        p.timer = window.setTimeout(() => removePop(p), POP_TTL_MS);
+    } catch (_) { /* a popup must never break the frame */ }
+}
+
+// ---- input strip (the only time the full panel is visible) ----
 
 function updatePlaceholder(): void {
     if (!inputEl) return;
@@ -582,10 +682,10 @@ function updatePlaceholder(): void {
     }
 }
 
-/** Open the bottom-left chat input. Suppresses game key handling via
- * ig.system.setFocusLost() (the login-panel pattern); the focus listener re-applies
- * it while the focus stays inside the chat panel and closes the input if focus
- * escapes the panel entirely (e.g. the player clicked into the world). */
+/** Open the full panel + input. Popups are hidden (the panel replaces them).
+ * Suppresses game key handling via ig.system.setFocusLost() (the login-panel
+ * pattern); the focus listener keeps it while focus stays inside the panel and
+ * closes the input if focus escapes the panel entirely. */
 function openInput(): void {
     try {
         ensurePanel();
@@ -595,9 +695,11 @@ function openInput(): void {
             inputEl.focus();
             return;
         }
+        clearPops(); // panel replaces transient bubbles
         panel.classList.add('open');
-        inputRowEl.style.display = 'flex';
         updatePlaceholder();
+        renderTabs();
+        renderMessages();
 
         const onFocus = (): void => {
             if (!chatOpen) return;
@@ -621,9 +723,9 @@ function openInput(): void {
     } catch (_) { /* an open must never break the frame */ }
 }
 
-/** Close only the input strip (the panel + tabs stay visible). Restores game focus
- * exactly like showLogin — regainFocus + a block delay so the closing key/click
- * can't hit a game button. */
+/** Close the input and hide the full panel again — back to popup-only mode.
+ * Restores game focus exactly like showLogin — regainFocus + a block delay so
+ * the closing key/click can't hit a game button. */
 function closeInput(): void {
     if (!chatOpen) return;
     chatOpen = false;
@@ -631,7 +733,6 @@ function closeInput(): void {
         if (chatFocusListener) { (ig as any).system.removeFocusListener(chatFocusListener); chatFocusListener = null; }
     } catch (_) { /* ignore */ }
     try { if (panel) panel.classList.remove('open'); } catch (_) { /* ignore */ }
-    try { if (inputRowEl) inputRowEl.style.display = 'none'; } catch (_) { /* ignore */ }
     try { if (inputEl) inputEl.blur(); } catch (_) { /* ignore */ }
     try { (ig as any).system.regainFocus(); } catch (_) { /* ignore */ }
     try { (ig as any).interact.setBlockDelay(0.2); } catch (_) { /* ignore */ }
@@ -679,8 +780,9 @@ function addMessage(ch: ChatChannel, from: string, text: string, system: boolean
     ch.messages.push({ from: from || '', text: String(text || ''), ts: Date.now() });
     while (ch.messages.length > MAX_MESSAGES) ch.messages.shift();
     if (!system) savePersisted();
-    if (panel && activeId === ch.id) renderMessages();
-    else if (panel) renderTabs();
+    if (chatOpen && panel && activeId === ch.id) renderMessages();
+    else if (chatOpen && panel) renderTabs();
+    else if (!chatOpen) showPopup(ch.kind, from || '', text);
 }
 
 function closeChannel(id: string): void {
@@ -691,9 +793,11 @@ function closeChannel(id: string): void {
     channels.splice(idx, 1);
     removePersisted(id);
     if (activeId === id) activeId = WORLD_ID;
-    renderTabs();
-    renderMessages();
-    updatePlaceholder();
+    if (panel) {
+        renderTabs();
+        renderMessages();
+        updatePlaceholder();
+    }
     if (chatOpen && inputEl) inputEl.focus();
 }
 
@@ -705,7 +809,7 @@ export function openPrivateChannel(name: string, openInputNow = true): void {
     try {
         const clean = String(name || '').trim();
         if (!clean) return;
-        ensurePanel();
+        ensureChannels();
         const main = getMain();
         if (main && main.name === clean) {
             addMessage(activeChannel(), '', t('chatSelf'), true);
@@ -717,8 +821,9 @@ export function openPrivateChannel(name: string, openInputNow = true): void {
     } catch (_) { /* a channel open must never break the frame */ }
 }
 
-/** An incoming server-relayed chat message. Routes to the correct channel tab and
- * creates a private tab on demand when a new person messages us. */
+/** An incoming server-relayed chat message. While the panel is closed it becomes
+ * a colored popup bubble; while open it lands in the matching channel tab (and
+ * creates a private tab on demand when a new person messages us). */
 export function receiveChat(msg: IChatMessage): void {
     try {
         if (!msg || typeof msg.text !== 'string' || !msg.text) return;
@@ -726,7 +831,7 @@ export function receiveChat(msg: IChatMessage): void {
         if (msg.from === (main && main.name)) return; // server never echoes; belt-and-braces
         const kind: ChatKind = msg.channel === 'world' || msg.channel === 'party' || msg.channel === 'private'
             ? msg.channel : 'party';
-        ensurePanel();
+        ensureChannels();
         let id: string;
         let target: string | undefined;
         if (kind === 'private') {
@@ -740,11 +845,11 @@ export function receiveChat(msg: IChatMessage): void {
         const isActive = activeId === id;
         if (!isActive) ch.unread++;
         addMessage(ch, msg.from, msg.text, false);
-        if (!isActive) renderTabs();
+        if (panel && !isActive) renderTabs();
     } catch (_) { /* a message must never break the socket */ }
 }
 
-/** Server rejection of an outgoing message -> a system line in the right channel. */
+/** Server rejection of an outgoing message -> a system line (popup or tab). */
 export function receiveChatError(err: IChatError): void {
     try {
         let text = t('chatSendFailed');
@@ -754,7 +859,7 @@ export function receiveChatError(err: IChatError): void {
         else if (err && err.reason === 'invalidTarget') text = t('chatInvalidTarget');
         let id = (err && err.channel) || activeId;
         if (id === 'private') id = (err && err.target) ? privateId(err.target) : activeId;
-        ensurePanel();
+        ensureChannels();
         let ch = getChannel(id);
         if (!ch && id.indexOf(PRIVATE_PREFIX) === 0) {
             ch = ensureChannel(id, 'private', id.slice(PRIVATE_PREFIX.length));
@@ -765,34 +870,39 @@ export function receiveChatError(err: IChatError): void {
     } catch (_) { /* an error must never break the socket */ }
 }
 
-/** Compatibility + internal system-line helper: show a message in the active tab.
- * `from` empty => system line (never persisted). */
+/** Compatibility + internal system-line helper: show a message in the active tab
+ * (or as a popup when the panel is closed). `from` empty => system line. */
 export function displayChat(from: string, text: string): void {
     try {
         if (!text) return;
-        ensurePanel();
+        ensureChannels();
         addMessage(activeChannel(), from || '', text, !from);
     } catch (_) { /* a message must never break the frame */ }
 }
 
 /** Party disbanded/kicked — keep world/private history intact; just annotate the
- * (permanent) party tab with a system line. No-op when the panel was never built,
- * so a roster event can't pop the chat UI up for someone who doesn't use chat. */
+ * (permanent) party tab with a system line (popup when the panel is closed). A
+ * player who has never used chat never sees this — the panel/popups only come
+ * into existence after their first message. */
 export function chatPartyDisbanded(): void {
     try {
-        if (!panel) return;
+        if (!channels.length && !panel && !popupHost) return; // chat never used
+        ensureChannels();
         const ch = getChannel(PARTY_ID) || ensureChannel(PARTY_ID, 'party');
         addMessage(ch, '', t('chatPartyDisbanded'), true);
     } catch (_) { /* ignore */ }
 }
 
 /** Full session reset (logout / server loss): close the input, remove the DOM
- * panel and drop every in-memory channel. Persisted per-account history survives
- * for the next login of the same account. */
+ * panel + popup stack and drop every in-memory channel. Persisted per-account
+ * history survives for the next login of the same account. */
 export function clearChat(): void {
     try { closeInput(); } catch (_) { /* ignore */ }
+    clearPops();
     try { if (panel && panel.parentNode) panel.parentNode.removeChild(panel); } catch (_) { /* ignore */ }
+    try { if (popupHost && popupHost.parentNode) popupHost.parentNode.removeChild(popupHost); } catch (_) { /* ignore */ }
     panel = null;
+    popupHost = null;
     tabsEl = null;
     msgsEl = null;
     inputRowEl = null;

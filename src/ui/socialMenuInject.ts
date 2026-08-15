@@ -1171,7 +1171,21 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             // follower bot was deleted then, emptying the friend tab. isEngineOwnedContact
             // covers PARTY_OPTIONS names outright, plus direct currentParty
             // membership and the engine's isPartyMember.
-            if (isEngineOwnedContact(name)) continue;
+            // ROUND 94: an INJECTED mp player still in our network party is also in
+            // sc.party.currentParty (applyPartyRoster adds them for the HUD), so the
+            // generic engine-ownership exemption above kept a JUST-REMOVED friend
+            // stamped FRIEND forever — the 删除好友 confirm looked like a no-op while
+            // teaming. Keep their contact alive for the party box but downgrade it
+            // out of the friends tab (CONTACT = teammate, not friend).
+            const model = party.models[name];
+            const isMpInjected = !!(c && c._mp && model && model._mpName);
+            if (isEngineOwnedContact(name) || (isMpInjected && c._mpInParty)) {
+                if (isMpInjected && (c._mpInParty || party.currentParty.indexOf(name) !== -1)) {
+                    c.status = PARTY_MEMBER_TYPE.CONTACT;
+                    c.online = true;
+                }
+                continue;
+            }
             if (state.roomPlayers.indexOf(name) !== -1) {
                 // Still present in the room: downgrade, don't delete.
                 c.status = PARTY_MEMBER_TYPE_MP;

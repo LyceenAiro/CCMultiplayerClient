@@ -675,11 +675,13 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] addExperience wrap failed', e); }
-			// NO-PAUSE WHILE PARTIED (round 10, user: 关闭所有时间暂停功能). Every
-			// user-triggerable gameplay pause (ESC pause menu, main menu / bag / inventory,
-			// SHIFT quick menu, skip-confirm dialog, teleport-info dialog) funnels through
-			// ig.Game.setPaused(true) — the engine has exactly this one pause API. While in
-			// a party with other online players we swallow the PAUSE (never the unpause):
+			// NO-PAUSE WHILE PARTIED / IN A SHARED TOWN (round 10, user: 关闭所有时间暂停功能;
+			// ROUND 94: main cities keep time flowing while connected even SOLO — same
+			// behaviour as a party). Every user-triggerable gameplay pause (ESC pause menu,
+			// main menu / bag / inventory, SHIFT quick menu, skip-confirm dialog,
+			// teleport-info dialog) funnels through ig.Game.setPaused(true) — the engine
+			// has exactly this one pause API. While in a party with other online players,
+			// or while standing in a shared town, we swallow the PAUSE (never the unpause):
 			// the GUIs involved are all pauseGui=true elements, so they still open, render
 			// and take input — only the world keeps simulating behind them, which is what a
 			// shared-world session needs. Charge time-stop is a DIFFERENT mechanism
@@ -695,8 +697,9 @@ export class NetSync {
 								const m = (window as any).__mpMain;
 								const connOk = !!(m && m.connection && m.connection.isOpen && m.connection.isOpen());
 								const partied = !!(m && m.partyMembers && m.partyMembers.length > 1);
-								if (connOk && partied) {
-									console.log('[netsync] pause suppressed while partied');
+								const inTown = connOk && isSharedTownNow();
+								if (connOk && (partied || inTown)) {
+									console.log('[netsync] pause suppressed (' + (inTown ? 'shared town' : 'partied') + ')');
 									return;
 								}
 							}

@@ -102,10 +102,14 @@ CrossCode 是一款单机游戏,因此这里的"多人"实质上是**状态镜�
 
 ## 主城(共享城镇)机制
 
-两个大区域被设为**主城**(开放匹配的汇合点),玩家无需组队即可在此相遇:
+六个大区域被设为**主城**(开放匹配的汇合点),玩家无需组队即可在此相遇:
 
 - **新手港**(`rookie-harbor`, Rookie Harbor)
 - **罗姆斯广场**(`rhombus-sqr`, Rhombus Square,含迎新桥)
+- **俾尔根村**(`bergen`, Bergen Village)
+- **巴基库姆**(`ba-ki-kum`, Ba'kii Kum)
+- **巴辛堡**(`basin-keep`, Basin Keep)
+- **家园**(`homestedt`, Homestedt)
 
 行为规则:
 
