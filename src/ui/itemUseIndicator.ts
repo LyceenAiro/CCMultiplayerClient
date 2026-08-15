@@ -1,115 +1,99 @@
 import { Multiplayer } from '../multiplayer';
 
 /**
- * ROUND 95 — ITEM-USE INDICATOR.
+ * ROUND 95/97 — ITEM-USE INDICATOR.
  *
  * When the LOCAL player uses a consumable (sc.PlayerModel.useItem returns true)
  * we emit `itemUse` to the server, which relays it to every other player in the
- * same map instance. Each receiver pops a real in-game item icon
- * (sc.ItemContent) above that player's head for ~2.5s, positioned via the same
- * map->screen projection the name tags use.
+ * same map instance.
  *
- * The indicators are normal ig.gui children, so they render inside the game
- * canvas exactly like the native item HUD icons; no DOM overlay is involved.
+ * Receivers spawn the SAME entity the single-player item animation uses:
+ * sc.FoodIconEntity (the "吃东西" icon above the player's head — HOLD -> BUBBLE
+ * -> DONE pop sequence). It is a real game entity attached to the remote
+ * player's mirror, so it tracks their head exactly and needs no DOM/GUI overlay
+ * or per-frame projection. The item's `foodSprite` drives the icon index, with
+ * the vanilla "SANDWICH" fallback — identical to sc.ItemConsumption.getAction.
  */
 
 let getMain: () => Multiplayer | undefined = () => undefined;
 
 interface IIcon {
     player: string;
-    item: string | number;
-    el: any;         // sc.ItemContent (an ig.GuiElementBase)
-    until: number;
+    entity: any;      // spawned sc.FoodIconEntity
 }
 
 let installed = false;
-let container: any = null;      // persistent ig.gui parent for all icons
-let icons: IIcon[] = [];
-const INDICATOR_MS = 2500;      // icon lifetime
-const HEAD_OFFSET = 30;         // px above the projected head point
+let live: IIcon[] = [];
 
-function ensureContainer(): any {
-    if (container) return container;
-    try {
-        container = new (ig as any).GuiElementBase();
-        try { container.hook.zIndex = 6; } catch (_) { /* ignore */ }
-        try { container.hook._visible = true; } catch (_) { /* ignore */ }
-        (ig as any).gui.addGuiElement(container);
-    } catch (_) { container = null; }
-    return container;
+function killIcon(ic: IIcon): void {
+    const idx = live.indexOf(ic);
+    if (idx !== -1) live.splice(idx, 1);
+    try { if (ic.entity && !ic.entity._killed) ic.entity.kill(); } catch (_) { /* ignore */ }
 }
 
-function positionIcon(ic: IIcon, scr: { x: number, y: number }): void {
-    try {
-        const size = ic.el.hook && ic.el.hook.size;
-        const w = (size && size.x) || 32;
-        const h = (size && size.y) || 32;
-        ic.el.setPos(Math.round(scr.x - w / 2), Math.round(scr.y - h - HEAD_OFFSET));
-        try { ic.el.hook._visible = true; } catch (_) { /* ignore */ }
-    } catch (_) { /* never break the frame */ }
-}
-
-function removeIcon(ic: IIcon): void {
-    const idx = icons.indexOf(ic);
-    if (idx !== -1) icons.splice(idx, 1);
-    try { if (container && ic.el) container.removeChildGui(ic.el); } catch (_) { /* ignore */ }
-}
-
-/** Project one remote player's head and position their icon there. */
-function updateIcon(ic: IIcon): void {
-    try {
-        const main = getMain();
-        if (!main) return;
-        const p = main.players[ic.player];
-        const ent = p && p.entity;
-        const coll = ent && ent.coll;
-        if (!coll) return;
-        const cx = coll.pos.x + coll.size.x / 2;
-        const cy = coll.pos.y - coll.pos.z - coll.size.z + coll.size.y / 2;
-        const scr: { x: number, y: number } = { x: 0, y: 0 };
-        (ig as any).system.getScreenFromMapPos(scr, Math.round(cx), Math.round(cy));
-        positionIcon(ic, scr);
-    } catch (_) { /* ignore */ }
-}
-
-/** A remote player used an item — replace any icon we already show for them and
- * pop a fresh one above their head. */
+/** A remote player used an item — pop the exact single-player food icon above
+ * their head (replaces any icon we already show for that player). */
 export function showItemUse(player: string, item: string | number): void {
     try {
         if (!player || item === undefined || item === null) return;
         const main = getMain();
         if (!main || player === main.name) return; // our own use is already visible locally
-        const parent = ensureContainer();
-        if (!parent) return;
-        // One icon per player at a time.
-        for (const old of icons.slice()) {
-            if (old.player === player) removeIcon(old);
+        const p = main.players[player];
+        const ent = p && p.entity;
+        if (!ent || !ent.coll || ent._killed) return;
+        // FoodIconEntity attaches itself to the target's action-attached list, so
+        // the target must be an actor entity (player mirrors / enemies are).
+        if (typeof ent.addActionAttached !== 'function') return;
+
+        const FoodIcon: any = (sc as any).FoodIconEntity;
+        if (!FoodIcon) return;
+
+        // Icon index comes from the item's foodSprite, exactly like the native
+        // consume action (sc.ItemConsumption.getAction).
+        let foodName = 'SANDWICH';
+        try {
+            const inv: any = (sc as any).inventory;
+            if (inv && typeof inv.getItem === 'function') {
+                const def = inv.getItem(item);
+                foodName = (def && def.foodSprite) || 'SANDWICH';
+            }
+        } catch (_) { /* fall back to the default sandwich sprite */ }
+        const table: any = (sc as any).FOOD_SPRITE;
+        const icon = table && typeof table[foodName] === 'number' ? table[foodName] : 0;
+
+        // One icon per player at a time (rapid item spam replaces, never stacks).
+        for (const old of live.slice()) {
+            if (old.player === player) killIcon(old);
         }
-        const ItemContent: any = (sc as any).ItemContent;
-        if (!ItemContent) return;
-        const el = new ItemContent(item, 1);
-        // We only want the ICON, not the "x1" amount text.
-        try { if (el.amountGui && el.amountGui.hook) el.amountGui.hook._visible = false; } catch (_) { /* ignore */ }
-        try { el.hook._visible = false; } catch (_) { /* ignore */ }
-        parent.addChildGui(el);
-        const ic: IIcon = { player, item, el, until: Date.now() + INDICATOR_MS };
-        icons.push(ic);
-        updateIcon(ic);
+
+        const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: ent });
+        if (!fx) return;
+        const ic: IIcon = { player, entity: fx };
+        live.push(ic);
+
+        const states: any = (sc as any).FOOD_ICON_STATE || { HOLD: 0, BUBBLE: 1, DONE: 2 };
+        // Mirror the native consume action timing: hold briefly, pop into the
+        // bubble, then finish (FoodIconEntity kills itself after DONE).
+        window.setTimeout(() => {
+            try { if (fx && !fx._killed) fx.setState(states.BUBBLE); } catch (_) { /* ignore */ }
+        }, 220);
+        window.setTimeout(() => {
+            try { if (fx && !fx._killed) fx.setState(states.DONE); } catch (_) { /* ignore */ }
+        }, 900);
+        window.setTimeout(() => killIcon(ic), 1500);
     } catch (_) { /* an indicator must never break the frame */ }
 }
 
 /** Drop every live indicator (logout / server loss / map cleanup). */
 export function clearItemUseIndicators(): void {
-    for (const ic of icons.slice()) removeIcon(ic);
-    icons = [];
-    try { if (container && (ig as any).gui && typeof (ig as any).gui.removeGuiElement === 'function') (ig as any).gui.removeGuiElement(container); } catch (_) { /* ignore */ }
-    container = null;
+    for (const ic of live.slice()) killIcon(ic);
+    live = [];
 }
 
 /**
  * Install once per process: wraps sc.PlayerModel.useItem so a SUCCESSFUL local
- * item use is announced to the instance, and starts the per-frame position loop
- * that keeps remote indicators glued to their player's head.
+ * item use is announced to the instance. The remote visual is driven entirely by
+ * the spawned FoodIconEntity, so no per-frame update loop is needed here.
  */
 export function installItemUseIndicators(gm: () => Multiplayer | undefined): void {
     getMain = gm;
@@ -137,21 +121,4 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
             };
         }
     } catch (_) { /* the hook must never break the model */ }
-
-    try {
-        const s: any = (window as any).simplify;
-        if (s && typeof s.registerUpdate === 'function') {
-            s.registerUpdate(() => {
-                if (!icons.length) return;
-                const now = Date.now();
-                for (let i = icons.length - 1; i >= 0; i--) {
-                    if (now >= icons[i].until) {
-                        removeIcon(icons[i]);
-                    } else {
-                        updateIcon(icons[i]);
-                    }
-                }
-            });
-        }
-    } catch (_) { /* ignore */ }
 }
