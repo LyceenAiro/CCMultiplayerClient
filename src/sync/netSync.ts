@@ -2,6 +2,7 @@ import { Multiplayer } from '../multiplayer';
 import { ILootDrop } from '../connection';
 import { t } from '../i18n';
 import { isSharedTownNow } from '../util/areaUtil';
+import { showItemUse } from '../ui/itemUseIndicator';
 
 /**
  * New sync system — whole-state broadcast, replacing the original mod's per-entity
@@ -527,6 +528,8 @@ export class NetSync {
 		// ROUND 39 (item 1): a remote player RELEASED a sustained sound (the skill charge-up)
 		// — cut the looped handle we started for it so the charge doesn't ring out past release.
 		conn.onSoundStop((player) => this.applySoundStop(player));
+		// ROUND 95: a remote player used an item — pop the item icon above their head.
+		if (typeof conn.onItemUse === 'function') conn.onItemUse((player, item) => showItemUse(player, item));
 		// ROUND 74 (plant destruct sync): a same-instance player destroyed a plant — destroy
 		// our own copy at the same mapId (vanilla chain, idempotent). Guarded like
 		// onSkillSound so a mixed client/server pair never crashes.

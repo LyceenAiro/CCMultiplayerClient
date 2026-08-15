@@ -5,6 +5,7 @@ import { installMpOptionsTab, startNameTagLoop, startNetHudLoop } from './ui/mpO
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
 import { installChatBox } from './ui/chatBox';
+import { installItemUseIndicators } from './ui/itemUseIndicator';
 import { installVersionDisplay } from './ui/versionDisplay';
 
 /**
@@ -71,6 +72,10 @@ async function startMultiplayer(): Promise<void> {
 		// ROUND 93/94: channel chat — popup bubbles with [世界]/[小队]/[私聊]
 		// prefixes while closed; Enter opens the full bottom-left tab panel.
 		installChatBox(() => multiplayer);
+
+		// ROUND 95: item-use indicators — other players see the item icon pop above
+		// our head when we use a consumable (and vice versa).
+		installItemUseIndicators(() => multiplayer);
 
 		// Round 23 wave 5: network-quality diamond badges on the party-HUD portraits
 		// and the element-mode indicator, with hover tooltips (ping/loss, name+level).

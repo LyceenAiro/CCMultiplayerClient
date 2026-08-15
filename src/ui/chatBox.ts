@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
+import { showMpToast } from './toasts';
 
 /**
  * ROUND 93/94 — MMO-STYLE CHANNEL CHAT (world / party / private).
@@ -76,6 +77,9 @@ let chatFocusListener: (() => void) | null = null;
 let popupHost: HTMLElement | null = null;    // transient bubble stack (chat closed)
 interface IPop { el: HTMLElement, timer: number }
 let pops: IPop[] = [];
+
+let nameMenu: HTMLElement | null = null;      // click-a-name action menu
+let nameMenuDown: ((e: MouseEvent) => void) | null = null;
 
 let channels: ChatChannel[] = [];
 let activeId = 'world';
@@ -329,12 +333,16 @@ function ensureChatStyle(): void {
 .mpChatTabs {
     display: flex; align-items: stretch; gap: 3px;
     overflow-x: auto; overflow-y: hidden;
-    padding: 4px 4px 0 4px;
-    background: rgba(6, 18, 30, 0.94);
-    border: 1px solid rgba(111, 199, 255, 0.55);
-    border-bottom: none;
-    border-radius: 7px 7px 0 0;
+    padding: 4px 0 0 0;
+    background: transparent;
+    border: none;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(111, 199, 255, 0.4) transparent;
 }
+.mpChatTabs::-webkit-scrollbar { height: 5px; }
+.mpChatTabs::-webkit-scrollbar-track { background: rgba(8, 26, 44, 0.4); border-radius: 3px; }
+.mpChatTabs::-webkit-scrollbar-thumb { background: rgba(111, 199, 255, 0.4); border-radius: 3px; }
+.mpChatTabs::-webkit-scrollbar-thumb:hover { background: rgba(111, 199, 255, 0.7); }
 .mpChatTab {
     flex: 0 0 auto;
     display: inline-flex; align-items: center;
@@ -372,7 +380,13 @@ function ensureChatStyle(): void {
     background: rgba(4, 12, 20, 0.72);
     border: 1px solid rgba(111, 199, 255, 0.55);
     border-top: none;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(111, 199, 255, 0.45) rgba(8, 26, 44, 0.45);
 }
+.mpChatMsgs::-webkit-scrollbar { width: 6px; }
+.mpChatMsgs::-webkit-scrollbar-track { background: rgba(8, 26, 44, 0.45); border-radius: 3px; }
+.mpChatMsgs::-webkit-scrollbar-thumb { background: rgba(111, 199, 255, 0.45); border-radius: 3px; }
+.mpChatMsgs::-webkit-scrollbar-thumb:hover { background: rgba(111, 199, 255, 0.75); }
 .mpChatRow {
     display: flex; align-items: flex-start;
     padding: 1px 2px;
@@ -380,30 +394,73 @@ function ensureChatStyle(): void {
     word-break: break-word;
 }
 .mpChatName { color: #7dffa0; flex: 0 0 auto; margin-right: 5px; }
+.mpChatNameLink { cursor: pointer; text-decoration: underline dotted rgba(125,255,160,0.5); }
+.mpChatNameLink:hover { color: #b8ffcb; text-decoration-color: #b8ffcb; }
 .mpChatText { color: #eaf7ff; flex: 1 1 auto; white-space: pre-wrap; }
 .mpChatSysRow { padding: 1px 2px; font-size: 12px; line-height: 16px;
     color: #8fd6ff; font-style: italic; opacity: 0.9; word-break: break-word; }
+
+/* Player-name action menu (click a name in the open chat panel). */
+.mpChatNameMenu {
+    position: fixed; z-index: 9100;
+    min-width: 168px; max-width: 240px;
+    padding: 5px;
+    background: rgba(6, 18, 30, 0.97);
+    border: 1px solid #6fc7ff; border-radius: 6px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55), 0 0 14px rgba(111, 199, 255, 0.25);
+    font-family: 'Noto Sans SC', 'Segoe UI', sans-serif;
+}
+.mpChatNameMenu .mpChatMenuName {
+    padding: 5px 8px 7px 8px;
+    font-size: 13px; color: #dff3ff;
+    border-bottom: 1px solid rgba(111, 199, 255, 0.3);
+    margin-bottom: 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mpChatNameMenu button {
+    display: block; width: 100%;
+    box-sizing: border-box;
+    margin: 2px 0; padding: 7px 9px;
+    background: rgba(18, 50, 72, 0.9); color: #dff3ff;
+    border: 1px solid rgba(111, 199, 255, 0.4); border-radius: 4px;
+    font-size: 12.5px; font-family: inherit; text-align: left;
+    cursor: pointer;
+}
+.mpChatNameMenu button:hover { background: rgba(46, 104, 142, 0.95); }
+.mpChatNameMenu button:disabled { opacity: 0.5; cursor: default; }
+.mpChatNameMenu button.mpChatMenuPrimary {
+    background: rgba(31, 111, 74, 0.9);
+    border-color: #7dffa8; color: #eafff2;
+}
+.mpChatNameMenu button.mpChatMenuPrimary:hover { background: rgba(41, 148, 99, 0.95); }
 .mpChatInputRow {
     display: flex;
-    align-items: center; gap: 7px;
-    padding: 6px;
+    align-items: stretch; gap: 0;
+    padding: 0;
     background: rgba(6, 18, 30, 0.94);
     border: 1px solid rgba(111, 199, 255, 0.55); border-top: none;
     border-radius: 0 0 7px 7px;
+    overflow: hidden;
+}
+.mpChatForm {
+    flex: 1 1 auto;
+    display: flex; align-items: stretch;
+    min-width: 0;
 }
 .mpChatInput {
     flex: 1 1 auto; min-width: 0; box-sizing: border-box;
-    padding: 7px 9px;
+    padding: 9px 11px;
     background: rgba(8, 26, 44, 0.9); color: #eaf7ff;
-    border: 1px solid #6fc7ff; border-radius: 4px;
+    border: none; border-radius: 0;
     font-size: 13px; font-family: inherit; outline: none;
     user-select: text;
 }
-.mpChatInput:focus { box-shadow: 0 0 8px rgba(111,199,255,0.6); }
+.mpChatInput:focus { box-shadow: inset 0 0 0 1px rgba(111,199,255,0.55); }
 .mpChatSend {
-    flex: 0 0 auto; padding: 7px 13px; cursor: pointer;
+    flex: 0 0 auto; padding: 9px 16px; cursor: pointer;
     background: rgba(31, 111, 74, 0.9); color: #eafff2;
-    border: 1px solid #7dffa8; border-radius: 4px;
+    border: none; border-left: 1px solid rgba(111, 199, 255, 0.35);
+    border-radius: 0;
     font-size: 12.5px; font-family: inherit; letter-spacing: 2px;
 }
 .mpChatSend:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 8px rgba(125,255,168,0.6); }
@@ -575,8 +632,13 @@ function renderMessages(): void {
         const row = document.createElement('div');
         row.className = 'mpChatRow';
         const name = document.createElement('span');
-        name.className = 'mpChatName';
+        name.className = 'mpChatName mpChatNameLink';
+        name.title = t('chatNameClick');
         name.textContent = sanitizeChatText(m.from) + ':';
+        name.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openNameMenu(m.from, name);
+        });
         const text = document.createElement('span');
         text.className = 'mpChatText';
         text.textContent = sanitizeChatText(m.text);
@@ -631,6 +693,89 @@ function clearPops(): void {
     for (const p of pops.slice()) removePop(p);
     pops = [];
     try { if (popupHost) popupHost.style.display = 'none'; } catch (_) { /* ignore */ }
+}
+
+// ---- click-a-name action menu (open chat panel only) ----
+
+function isFriendName(name: string): boolean {
+    try {
+        const party: any = (sc as any).party;
+        if (party && typeof party.isFriend === 'function') return !!party.isFriend(name);
+    } catch (_) { /* ignore */ }
+    return false;
+}
+
+function closeNameMenu(): void {
+    if (nameMenuDown) {
+        try { document.removeEventListener('mousedown', nameMenuDown, true); } catch (_) { /* ignore */ }
+        nameMenuDown = null;
+    }
+    try { if (nameMenu && nameMenu.parentNode) nameMenu.parentNode.removeChild(nameMenu); } catch (_) { /* ignore */ }
+    nameMenu = null;
+}
+
+/** Pop a small action list under the clicked player name: 私聊 + 发送好友申请
+ * (the latter is disabled once they are already a friend). */
+function openNameMenu(name: string, anchor: HTMLElement): void {
+    try {
+        closeNameMenu();
+        const main = getMain();
+        if (!main || !name || name === main.name) return;
+        const menu = document.createElement('div');
+        menu.className = 'mpChatNameMenu';
+
+        const head = document.createElement('div');
+        head.className = 'mpChatMenuName';
+        head.textContent = name;
+        menu.appendChild(head);
+
+        const pm = document.createElement('button');
+        pm.textContent = t('chatPrivate');
+        pm.addEventListener('click', () => {
+            closeNameMenu();
+            openPrivateChannel(name, true);
+        });
+        menu.appendChild(pm);
+
+        const friend = isFriendName(name);
+        const add = document.createElement('button');
+        add.className = 'mpChatMenuPrimary';
+        add.textContent = friend ? t('alreadyFriends') : t('friendAddBtn');
+        add.disabled = friend;
+        if (!friend) {
+            add.addEventListener('click', () => {
+                const conn: any = main.connection;
+                closeNameMenu();
+                if (conn && typeof conn.friendAdd === 'function') {
+                    try { conn.friendAdd(name); } catch (_) { /* ignore */ }
+                    showMpToast({ title: t('friendRequestSentToast') });
+                }
+                if (chatOpen && inputEl) inputEl.focus();
+            });
+        }
+        menu.appendChild(add);
+
+        document.body.appendChild(menu);
+        nameMenu = menu;
+        const r = anchor.getBoundingClientRect();
+        const mw = menu.offsetWidth || 180;
+        const mh = menu.offsetHeight || 90;
+        let left = Math.min(r.left, window.innerWidth - mw - 8);
+        let top = r.bottom + 4;
+        if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
+        menu.style.left = Math.max(8, left) + 'px';
+        menu.style.top = top + 'px';
+
+        // Close on any click outside the menu (capture phase; clicks INSIDE the
+        // menu still reach their button because the listener only removes on
+        // outside targets). Also close when the input closes.
+        nameMenuDown = (e: MouseEvent) => {
+            try {
+                if (nameMenu && e.target instanceof Node && !nameMenu.contains(e.target)) closeNameMenu();
+            } catch (_) { /* ignore */ }
+        };
+        document.addEventListener('mousedown', nameMenuDown, true);
+    } catch (_) { /* ignore */ }
 }
 
 /** Render one transient bottom-left bubble with its colored [世界]/[小队]/[私聊]
@@ -729,6 +874,7 @@ function openInput(): void {
 function closeInput(): void {
     if (!chatOpen) return;
     chatOpen = false;
+    closeNameMenu();
     try {
         if (chatFocusListener) { (ig as any).system.removeFocusListener(chatFocusListener); chatFocusListener = null; }
     } catch (_) { /* ignore */ }
@@ -898,6 +1044,7 @@ export function chatPartyDisbanded(): void {
  * history survives for the next login of the same account. */
 export function clearChat(): void {
     try { closeInput(); } catch (_) { /* ignore */ }
+    closeNameMenu();
     clearPops();
     try { if (panel && panel.parentNode) panel.parentNode.removeChild(panel); } catch (_) { /* ignore */ }
     try { if (popupHost && popupHost.parentNode) popupHost.parentNode.removeChild(popupHost); } catch (_) { /* ignore */ }

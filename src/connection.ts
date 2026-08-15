@@ -331,6 +331,12 @@ export interface IConnection {
     /** ROUND 39 (item 1): a same-instance player released a sustained sound (see
      * emitSoundStop) — cut the looped handle we started for them. */
     onSoundStop(callback: (player: string) => void): void;
+    /** ROUND 95: the local player used a consumable — tell the instance so every
+     * other player can show the item icon above our head (itemUse indicator). */
+    itemUse(item: string | number): void;
+    /** ROUND 95: a same-instance player used an item (server-relayed, sender
+     * excluded). Show the item icon above that player's head. */
+    onItemUse(callback: (player: string, item: string | number) => void): void;
     /** ROUND 74 (plant destruct sync): a same-instance player destroyed a plant (see
      * plantBreak) — destroy OUR copy at the same mapId if it is still intact (vanilla
      * chain: dropped anim + FX + our own drop rolls + propsDestroyed count + respawn
@@ -377,6 +383,10 @@ export interface IConnection {
      * `{name, reason}` with reason 'left'|'kicked'|'disconnected' — so a departed
      * member's removal can be toasted with the correct manner. Absent -> 'left'. */
     onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[], lastLeft?: { name: string, reason: string } } | null) => void): void;
+    /** ROUND 95: a party member departed via a DISBAND path (2-person party), which
+     * partyUpdate null alone cannot express. `{name, reason}` matches lastLeft
+     * ('left' | 'kicked' | 'disconnected'); toast it like a normal roster change. */
+    onPartyMemberLeft(callback: (info: { name: string, reason?: string }) => void): void;
     onPartyInvite(callback: (from: string, partyId: string) => void): void;
     onPartyMove(callback: (data: { leader?: string, map?: string, pos?: Vec3 }) => void): void;
     // Server nudge to re-assert our current instance (e.g. after someone joined

@@ -906,6 +906,12 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('soundStop', {});
 	}
 
+	// ROUND 95: any client -> its instance — the local player used an item; every other
+	// same-instance client pops the item icon above the user's head.
+	public itemUse(item: string | number): void {
+		this.syncEmit('itemUse', { item });
+	}
+
 	// ROUND 74 (plant destruct sync): any client -> its instance — the local player just
 	// destroyed a map destructible; every other same-instance client destroys its own copy
 	// at the same mapId (see NetSync.applyPlantBreak). syncEmit: solo-instance skip.
@@ -1139,6 +1145,15 @@ export class SocketIoConnector implements IConnection {
 	public onSoundStop(callback: (player: string) => void): void {
 		this.socket.on('soundStop', (data: any) => {
 			if (data && typeof data.player === 'string') callback(data.player);
+		});
+	}
+	/** ROUND 95: a same-instance player used an item — show its icon above their head. */
+	public onItemUse(callback: (player: string, item: string | number) => void): void {
+		this.socket.on('itemUse', (data: any) => {
+			if (data && typeof data.player === 'string'
+				&& (typeof data.item === 'string' || typeof data.item === 'number')) {
+				callback(data.player, data.item);
+			}
 		});
 	}
 	/** ROUND 74 (plant destruct sync): a same-instance player destroyed a plant — destroy
@@ -1377,6 +1392,14 @@ export class SocketIoConnector implements IConnection {
 	}
 	public onPartyUpdate(callback: (party: { partyId: string, leader: string, members: string[], lastLeft?: { name: string, reason: string } } | null) => void): void {
 		this.socket.on('partyUpdate', (data: any) => callback(data));
+	}
+	/** ROUND 95: disband-path departure toast (see protocol.js pushPartyMemberLeft). */
+	public onPartyMemberLeft(callback: (info: { name: string, reason?: string }) => void): void {
+		this.socket.on('partyMemberLeft', (data: any) => {
+			if (data && typeof data.name === 'string') {
+				callback({ name: data.name, reason: typeof data.reason === 'string' ? data.reason : undefined });
+			}
+		});
 	}
 	public onPartyInvite(callback: (from: string, partyId: string) => void): void {
 		this.socket.on('partyInvite', (data: any) => callback(data.from, data.partyId));

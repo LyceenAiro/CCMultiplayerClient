@@ -42,6 +42,7 @@ import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
+import { clearItemUseIndicators } from './ui/itemUseIndicator';
 import { t } from './i18n';
 import { showServerList } from './ui/serverList';
 
@@ -52,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.23';
+export const MP_VERSION = '1.70.24';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1197,6 +1198,22 @@ export class Multiplayer {
 			this.syncBotStream();
 		});
 
+		// ROUND 95: disband-path departure notifications. A 2-person party collapse
+		// sends partyUpdate null (no roster diff to derive the departed member from),
+		// so the server also emits partyMemberLeft {name, reason} to the survivor.
+		// Toast it exactly like the roster-diff path in notifyPartyRosterChange.
+		if (typeof (conn as any).onPartyMemberLeft === 'function') {
+			safeWire((conn as any).onPartyMemberLeft.bind(conn), (info: { name: string, reason?: string }) => {
+				try {
+					if (!info || !info.name || info.name === this.name) return;
+					const key = info.reason === 'kicked' ? 'partyMemberKicked'
+						: info.reason === 'disconnected' ? 'partyMemberDisconnected'
+						: 'partyMemberLeft';
+					showMpToast({ title: t(key).replace('{name}', info.name) });
+				} catch (_) { /* ignore */ }
+			});
+		}
+
 		// ROUND 93: WORLD / PARTY / PRIVATE CHAT — an incoming message routes into
 		// the matching bottom-left channel tab (private tabs are created on demand).
 		// The server never echoes to the sender, but the self-check is belt-and-braces.
@@ -2115,7 +2132,12 @@ export class Multiplayer {
 			if (g && typeof g.isTeleporting === 'function' && g.isTeleporting()) return; // don't adopt mid-load
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
-			if (party.currentParty.indexOf(name) !== -1) return; // idempotent
+			if (party.currentParty.indexOf(name) !== -1) {
+				// ROUND 95: a story bot already present locally (see applyBotState) must
+				// still become a leader-driven puppet — membership is not a skip signal.
+				if (!this.isPartyLeader) this.markPuppetBot(name);
+				return; // idempotent
+			}
 			if (!party.models[name]) { try { this.ensureMpModel(name); } catch (_) { /* ignore */ } }
 			if (!party.models[name]) return; // official bot whose model is missing -> skip
 			try { party.addPartyMember(name, null, false, true); } catch (_) { /* ignore */ }
@@ -2242,6 +2264,7 @@ export class Multiplayer {
 				return;
 			}
 			this._mpLeaderMap = data.map;
+			const roster = this.partyMembers || [];
 			const newNames: string[] = [];
 			for (const b of data.bots) {
 				if (!b || typeof b.n !== 'string' || !b.n) continue;
@@ -2256,6 +2279,15 @@ export class Multiplayer {
 					// b.n so the vanish-cull below won't immediately remove it.
 					this.adoptBot(b.n);
 					continue;
+				}
+				// ROUND 95: story bots (剧情自动入队的 Emilie/...) already exist in
+				// every member's local party BEFORE the network party forms, so
+				// adoptBot's "already in currentParty" idempotence never puppeted them
+				// and each client kept running its own AI. The leader's ungated
+				// botState stream names them — freeze any existing non-roster bot as a
+				// leader-driven puppet right here, even when it was never (re)adopted.
+				if (!this.isPartyLeader && roster.indexOf(b.n) === -1 && !e._mpPuppet) {
+					this.markPuppetBot(b.n);
 				}
 				if (typeof b.x === 'number' && typeof b.y === 'number' && typeof b.z === 'number') {
 					e._mpBotToX = b.x; e._mpBotToY = b.y; e._mpBotToZ = b.z;
@@ -3742,6 +3774,9 @@ export class Multiplayer {
 		// and close the input on logout/server-loss so no chat residue leaks into
 		// the title screen or the next session.
 		try { clearChat(); } catch (_) { /* ignore */ }
+		// ROUND 95: item-use indicators are session-scoped too — drop any live icon
+		// so it can't linger over the title screen or the next session.
+		try { clearItemUseIndicators(); } catch (_) { /* ignore */ }
 		// Round 27: drop the blocking download overlay if a logout/server-loss runs
 		// while it's up — it must never survive into the title screen or the next
 		// session (and its full-screen scrim would block all input).
