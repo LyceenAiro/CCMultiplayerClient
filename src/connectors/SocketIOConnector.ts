@@ -34,6 +34,10 @@ export class SocketIoConnector implements IConnection {
 	private map?: string;
 	private marker?: string | null;
 	private setHost?: (isHost: boolean) => void;
+	/** ROUND 86: true once a handshake came back with a DIFFERENT server version.
+	 * The reconnect handler consults it so the styled "server updated" popup is not
+	 * followed by the generic disconnect popup, and we stop socket.io reconnects. */
+	private _mpVersionMismatch = false;
 
 	// ---- Round 16: client-side latency probe ----
 	// The server echoes our `mpPing {t: Date.now()}` payload back verbatim
@@ -271,6 +275,13 @@ export class SocketIoConnector implements IConnection {
 				try {
 					result = await this.identify(this.username);
 				} catch (e) {
+					// ROUND 86: a version-mismatch rejection was already handled by
+					// main.onServerVersionMismatch (popup + socket close) — do NOT also
+					// open the generic disconnect popup for the same event.
+					if (this._mpVersionMismatch) {
+						console.warn('[multiplayer] reconnect aborted: server version mismatch');
+						return;
+					}
 					// Re-identify failed (server bounced mid-handshake, or rejected us
 					// because our old session was still online). Without this we'd stay
 					// in-game but offline on the server with no fallback — treat it as a
@@ -281,6 +292,9 @@ export class SocketIoConnector implements IConnection {
 				}
 				if (result && result.success) {
 					this.setHost(result.host);
+					// ROUND 86: cancel any pending/visible disconnect popup — we are
+					// fully re-identified and the session is live again.
+					try { this.main.onConnectionRestored(); } catch (_) { /* ignore */ }
 
 					// Re-join our map instance even when there's no marker: a position
 					// teleport (or any teleport whose marker didn't resolve) leaves
@@ -372,6 +386,9 @@ export class SocketIoConnector implements IConnection {
                 // Round 17: version-mismatch rejections carry the human-readable
                 // reason in `message` (the older rejections use `failed`).
                 message?: string,
+                // ROUND 86: version-mismatch rejections also carry the server's
+                // version string so the client can show the "server updated" popup.
+                version?: string,
                 hpScale?: number,
             }) => {
 				this.username = username;
@@ -387,6 +404,20 @@ export class SocketIoConnector implements IConnection {
 					// disconnect).
 					this.startNetProbe();
 				} else {
+					// ROUND 86: distinguish "server updated" from every other login
+					// rejection. Show the styled popup ONCE, close the socket so
+					// socket.io stops auto-reconnecting forever, and reject with a
+					// marker the connect() error path recognizes.
+					const serverVersion = typeof data.version === 'string' ? data.version : undefined;
+					if (serverVersion && serverVersion !== MP_VERSION) {
+						this._mpVersionMismatch = true;
+						try { this.main.onServerVersionMismatch(serverVersion); } catch (_) { /* ignore */ }
+						try { this.socket.close(); } catch (_) { /* ignore */ }
+						const verr: any = new Error('[multiplayer] Server updated: server=' + serverVersion + ' client=' + MP_VERSION);
+						verr._mpVersionMismatch = true;
+						reject(verr);
+						return;
+					}
 					// The server rejects with {failed: "..."} (older style) or
 					// {message: "..."} (round-17 version mismatches) — no `success`.
 					reject(new Error('[multiplayer] Login rejected: ' + (data.failed || data.message || 'unknown reason')));

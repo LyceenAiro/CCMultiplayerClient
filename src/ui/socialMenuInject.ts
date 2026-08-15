@@ -193,12 +193,21 @@ let _requestsTabBtn: any = null;
 // its friend-remove through the same confirm window used here.
 let _mpWindowTeardown: (() => void) | null = null;
 let _confirmRemoveRef: ((name: string, onConfirm: () => void) => void) | null = null;
+let _showMpWindowRef: ((opts: { title: string, content: string, buttons: Array<{ label: string, style?: string, cb: () => void }> }) => (() => void) | null) | null = null;
 
 /** Close every open social-menu mp window (accept/decline, withdraw, friend-remove
  * confirm) + the add-friend box. Safe to call any time (no-ops when nothing is
  * open). Wired for logout/server-loss cleanup. */
 export function closeMpWindows(): void {
     if (_mpWindowTeardown) { try { _mpWindowTeardown(); } catch (_) { /* ignore */ } }
+}
+
+/** ROUND 86: open a system dialog (disconnect / server updated) in the SAME
+ * login-panel mpWin style as the social confirm windows. Wired at install time;
+ * returns its close handle so the caller can dismiss it when the socket recovers. */
+export function showMpWindow(opts: { title: string, content: string, buttons: Array<{ label: string, style?: string, cb: () => void }> }): (() => void) | null {
+    if (_showMpWindowRef) { try { return _showMpWindowRef(opts); } catch (_) { /* ignore */ } }
+    return null;
 }
 
 /** Route a friend-removal through the same confirm window the social menu uses.
@@ -363,6 +372,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         closeMpModals();
     };
     _confirmRemoveRef = (name, onConfirm) => confirmRemoveFriend(name, onConfirm);
+    _showMpWindowRef = showMpWindow;
 
     // ---------------------------------------------------------------- helpers
 
@@ -530,7 +540,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
      * window and the friend-remove confirm. Single-active-window: a new mp window
      * EXPLICITLY replaces any open one (closeMpModals first), so a confirm window
      * is never closed by an unrelated focus event. */
-    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }> }): void {
+    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }> }): (() => void) | null {
         closeMpModals(); // deliberate replacement: only a new window closes the old one
         ensureMpWindowStyle();
         const box = $('<div class="mpWin"></div>');
@@ -579,6 +589,22 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         ig.system.addFocusListener(onFocus);
         document.addEventListener('mousedown', onMousedown, true);
         activeMpWindow = { box, done };
+        return done;
+    }
+
+    /**
+     * ROUND 86: public single-content-string wrapper around openMpWindow, so the
+     * multiplayer core can show system dialogs (connection lost / server updated)
+     * in the SAME style as the social confirm windows. Returns the close handle so
+     * a reconnected socket can dismiss the dialog again.
+     */
+    function showMpWindow(opts: { title: string, content: string, buttons: Array<{ label: string, style?: string, cb: () => void }> }): (() => void) | null {
+        try {
+            const content = $('<div class="mpWinMsg"></div>').text(opts.content);
+            return openMpWindow({ title: opts.title, content, buttons: opts.buttons });
+        } catch (_) {
+            return null;
+        }
     }
 
     /** Best-known level for a username (profile stream wins, injected model falls back). */

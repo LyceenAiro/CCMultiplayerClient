@@ -35,7 +35,7 @@ import { IChangeMapResult } from './connection';
 import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, isSharedTownNow } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
-import { closeMpWindows } from './ui/socialMenuInject';
+import { closeMpWindows, showMpWindow } from './ui/socialMenuInject';
 import { NetSync } from './sync/netSync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.14';
+export const MP_VERSION = '1.70.15';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -360,6 +360,9 @@ export class Multiplayer {
 		this.name = username;
 		(this as any)._loggedOut = false;
 		(this as any)._disconnectHandled = false;
+		this._mpServerUpdatedHandled = false;
+		this._mpDisconnectTimer = null;
+		this._mpDisconnectPopupClose = null;
 		this.installExitHooks();
 
 		// Prime the social caches immediately so the menu shows real values on first
@@ -3101,6 +3104,9 @@ export class Multiplayer {
 				// CCLoader overrides console.error to also draw an on-screen red toast, so
 				// logging it here was what showed the little "cancelled" box top-right.
 				if (err === 'cancelled') return;
+				// ROUND 86: a version-mismatch rejection already showed the styled
+				// "server updated" popup — don't stack the old native connect-error alert.
+				if (err && err._mpVersionMismatch) return;
 				console.error(err);
 				this.reportConnectError(err);
 			});
@@ -3476,6 +3482,17 @@ export class Multiplayer {
 	 * uploaded by the dialog-tracked flush() (no double upload). Consumed once. */
 	private _mpSuppressNextExitUpload = false;
 
+	// ---- ROUND 86: disconnect / server-updated system popups ----
+	/** Timer for the short "is the socket really gone?" grace before the styled
+	 * disconnect popup. Kept as a field so a reconnect or version-mismatch path can
+	 * cancel it (the old anonymous 12s timeout could not be cancelled). */
+	private _mpDisconnectTimer: any = null;
+	/** Close handle of the currently-open system popup (null when none). */
+	private _mpDisconnectPopupClose: (() => void) | null = null;
+	/** One-shot guard for the server-updated popup (repeated handshakes must not
+	 * stack a second window). */
+	private _mpServerUpdatedHandled = false;
+
 	/**
 	 * Called when the socket drops (server closed / network lost). socket.io keeps
 	 * trying to reconnect in the background, so we allow a short grace period (in
@@ -3493,35 +3510,117 @@ export class Multiplayer {
 		// download (launchGame's overlay is up), the stream can never complete on a
 		// dead socket — unblock with a clear message and fall back to starting
 		// locally, so a connection drop can't soft-lock the title screen. The grace
-		// timer below still runs: if the server stays down it drops to title as usual.
+		// timer below still runs: if the server stays down it shows the popup.
 		if (this._mpSaveBlocked) {
 			console.warn('[multiplayer] connection lost while the cloud save was downloading; starting without restore');
 			this.unblockSaveBlock(true);
 		}
 
-		const GRACE_MS = 12000;
-		setTimeout(() => {
+		// ROUND 86: the old anonymous 12s grace made the disconnect popup feel
+		// endless. Give socket.io ~2.5s to transparently recover (a blip / server
+		// restart), then show the styled popup. The timer is stored so
+		// onConnectionRestored / onServerVersionMismatch can cancel it.
+		if (this._mpDisconnectTimer) { try { clearTimeout(this._mpDisconnectTimer); } catch (_) { /* ignore */ } }
+		this._mpDisconnectTimer = setTimeout(() => {
+			this._mpDisconnectTimer = null;
 			if (this.connection && this.connection.isOpen()) {
 				// Server came back within the grace period — stay in game.
 				console.log('[multiplayer] reconnected; staying in game');
 				self._disconnectHandled = false;
 				return;
 			}
-			this.dropToTitleOnServerDown();
-		}, GRACE_MS);
+			this.showDisconnectPopup();
+		}, 2500);
 	}
 
-	/** Save + return to title because the server is unreachable. */
+	/** ROUND 86: show the styled "connection lost" popup (same mpWin style as the
+	 * social confirm windows). Its single button drops back to the title screen. */
+	private showDisconnectPopup(): void {
+		try {
+			if (this._mpDisconnectPopupClose) return;
+			this._mpDisconnectPopupClose = showMpWindow({
+				title: t('connLostTitle'),
+				content: t('connLostMsg'),
+				buttons: [{
+					label: t('returnTitle'),
+					style: 'mpPrimary',
+					cb: () => { this.dropToTitleOnServerDown(); },
+				}],
+			});
+			// The mpWin bridge is installed at boot; if it is somehow unavailable,
+			// don't leave the player stranded in a dead session.
+			if (!this._mpDisconnectPopupClose) this.dropToTitleOnServerDown();
+		} catch (_) {
+			this.dropToTitleOnServerDown();
+		}
+	}
+
+	/** ROUND 86: the connector re-identified successfully after a disconnect —
+	 * cancel the pending disconnect popup/timer and, if the popup is already up,
+	 * dismiss it so the player stays in-game. */
+	public onConnectionRestored(): void {
+		try {
+			const self = this as any;
+			self._disconnectHandled = false;
+			if (this._mpDisconnectTimer) {
+				try { clearTimeout(this._mpDisconnectTimer); } catch (_) { /* ignore */ }
+				this._mpDisconnectTimer = null;
+			}
+			if (this._mpDisconnectPopupClose) {
+				try { this._mpDisconnectPopupClose(); } catch (_) { /* ignore */ }
+				this._mpDisconnectPopupClose = null;
+			}
+			console.log('[multiplayer] connection restored');
+		} catch (_) { /* never break the socket */ }
+	}
+
+	/** ROUND 86: the server rejected our handshake because ITS mod version differs
+	 * from ours (server was updated while we were connected / reconnecting). Stop
+	 * socket.io's infinite reconnects, show the styled "server updated" popup, and
+	 * return to the title screen when the player confirms. */
+	public onServerVersionMismatch(serverVersion: string): void {
+		try {
+			if (this._mpServerUpdatedHandled) return;
+			this._mpServerUpdatedHandled = true;
+			(this as any)._disconnectHandled = true;
+			if (this._mpDisconnectTimer) {
+				try { clearTimeout(this._mpDisconnectTimer); } catch (_) { /* ignore */ }
+				this._mpDisconnectTimer = null;
+			}
+			if (this._mpDisconnectPopupClose) {
+				try { this._mpDisconnectPopupClose(); } catch (_) { /* ignore */ }
+				this._mpDisconnectPopupClose = null;
+			}
+			console.warn('[multiplayer] server version mismatch: server=' + (serverVersion || '?') + ' client=' + MP_VERSION);
+			this._mpDisconnectPopupClose = showMpWindow({
+				title: t('serverUpdatedTitle'),
+				content: t('serverUpdatedMsg').replace('{v}', serverVersion || '?'),
+				buttons: [{
+					label: t('returnTitle'),
+					style: 'mpPrimary',
+					cb: () => { this.dropToTitleOnServerDown(); },
+				}],
+			});
+			if (!this._mpDisconnectPopupClose) this.dropToTitleOnServerDown();
+		} catch (_) { /* never break the handshake */ }
+	}
+
+	/** Save + return to title because the server is unreachable / updated. */
 	private dropToTitleOnServerDown(): void {
 		try {
-			// Best-effort save (the upload won't reach a dead server, but the local
-			// autoslot persists; checkpoint-safe — see saveWithoutMovingCheckpoint).
+			// Best-effort save (the upload won't reach a dead/mismatched server, but
+			// the local autoslot persists; checkpoint-safe — see saveWithoutMovingCheckpoint).
 			// Round 23: stamped 'other' so the upload bypasses the area-save anti-spam gate.
 			this.setSaveReason('other');
 			this.saveWithoutMovingCheckpoint();
 		} catch (e) { /* ignore */ }
 
-		try { alert(t('connLost')); } catch (_) { /* ignore */ }
+		try {
+			if (this._mpDisconnectPopupClose) {
+				try { this._mpDisconnectPopupClose(); } catch (_) { /* ignore */ }
+				this._mpDisconnectPopupClose = null;
+			}
+		} catch (_) { /* ignore */ }
 
 		try {
 			// Close the socket so socket.io stops reconnecting in the background.
@@ -3537,13 +3636,20 @@ export class Multiplayer {
 		try { (ig.game as any).gotoTitle(); } catch (e) {
 			console.error('[multiplayer] gotoTitle failed', e);
 		}
-		console.log('[multiplayer] returned to title (server unreachable)');
+		console.log('[multiplayer] returned to title (server unreachable/updated)');
 	}
 
 	/** Despawn all remote mirrors and drop party/social state (on logout / server
 	 * loss), so a stale mirror or roster doesn't leak into the title screen or the
 	 * next session. */
 	private clearMultiplayerState(): void {
+		// ROUND 86: cancel any pending disconnect popup/timer (explicit logout or
+		// title-drop) so it can't fire into the next session.
+		if (this._mpDisconnectTimer) {
+			try { clearTimeout(this._mpDisconnectTimer); } catch (_) { /* ignore */ }
+			this._mpDisconnectTimer = null;
+		}
+		this._mpDisconnectPopupClose = null;
 		// Round 19: kill every cutscene puppet + drop cached mirror fade state and
 		// any stashed regroup (logout / server loss ends the session's world state).
 		try { if (this.netSync) this.netSync.clearCsPuppets(); } catch (e) { /* ignore */ }
