@@ -18,8 +18,9 @@ export interface IConnection {
      * second up/down, packet loss % over the last 10 probes, and all-time totals).
      * Round 22 (EXTRA 2): `tickRate` = the observed entityState block rate (blocks
      * per second — whichever direction is active: host sends, member receives).
-     * Item 3: `tickRateHostile`/`tickRateBase` = the two per-stream rates the HUD
-     * should display (the summed `tickRate` double-counts them). OPTIONAL so
+     * ROUND 81: `tickRateHostile`/`tickRateBase` = the MEASURED per-stream rates
+     * (engaged H stream vs idle B stream, via the block's relayed `st` tag) — the
+     * HUD shows the real tick instead of configured option values. OPTIONAL so
      * connectors that don't measure it need no implementation; the HUD
      * overlay guards the call with `conn.getNetStats?.()`. */
     getNetStats?(): { upBitsSec: number; downBitsSec: number; lossPct: number; upBitsTotal: number; downBitsTotal: number; tickRate: number; tickRateHostile?: number; tickRateBase?: number };
@@ -70,8 +71,10 @@ export interface IConnection {
      * `combat` = host's combat mode, so members enter/see the shared fight.
      * `full` = this block was force-full (f:1 on the wire) — the ~1s heartbeat that
      * tells members the host reported its FULL roster (so a missing map enemy is dead
-     * on the host). Omitted (falsy) for normal delta blocks. */
-    updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean): void;
+     * on the host). Omitted (falsy) for normal delta blocks. ROUND 81: `stream` tags
+     * the block 'base' (idle enemies, fixed 15Hz) or 'hostile' (engaged enemies,
+     * option-driven 30/60Hz) so receivers can measure the real per-stream tick. */
+    updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean, stream?: 'base' | 'hostile'): void;
     /** Round 19: a client's cutscene-spawned monsters (story enemies). The server
      * relays this to the instance as `cutsceneEntity` with the sender stamped as
      * `from`; receivers render them as csPuppets and reap them when the stream stops. */
@@ -347,7 +350,7 @@ export interface IConnection {
     onPlayerPing(callback: (name: string, ping: number, isHost?: boolean) => void): void;
     // ---- NEW sync system callbacks ----
     onPlayerState(callback: (player: string, state: any) => void): void;
-    onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean) => void): void;
+    onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean, stream?: 'base' | 'hostile') => void): void;
     /** Round 19: a client's cutscene-spawned monsters arrived. `from` = the stream
      * owner's username (server-stamped); receivers ignore their own echo and reap
      * the owner's csPuppets when its stream stops. */

@@ -75,10 +75,20 @@ export class SocketIoConnector implements IConnection {
 	/** Round 22 (EXTRA 2): entityState block counts for the observed server tick rate
 	 * (blocks/sec — whichever direction is active: the host sends, the member receives).
 	 * Folded into `tickRate` by the same 1s window as the bit rates, zeroed on
-	 * disconnect. Read by the network-debug HUD overlay via getNetStats(). */
-	private upBlockAccum = 0;
-	private downBlockAccum = 0;
+	 * disconnect. Read by the network-debug HUD overlay via getNetStats().
+	 * ROUND 81: blocks are now counted PER STREAM (the fixed 15Hz BASE stream for
+	 * idle enemies + the option-driven HOSTILE stream for engaged enemies) using the
+	 * `st` tag the sender puts on the block and the server relays, so the HUD shows
+	 * the real measured H/B rates instead of the configured option values. */
+	private upBaseBlockAccum = 0;
+	private upHostileBlockAccum = 0;
+	private downBaseBlockAccum = 0;
+	private downHostileBlockAccum = 0;
+	/** Old/foreign blocks without a stream tag (kept so the total stays truthful). */
+	private downUnclassifiedBlockAccum = 0;
 	private tickRate = 0;
+	private tickRateHostile = 0;
+	private tickRateBase = 0;
 	/** ROUND 75 (net diagnostics): per-event upload breakdown — bytes/count per event
 	 * name, tallied by the raw-emit wrapper installed in open(). Read by the
 	 * __mpNet() console command (getUploadEventStats) so a traffic question can be
@@ -90,18 +100,6 @@ export class SocketIoConnector implements IConnection {
 	private upEventStatsAt = 0;
 	private downEventStats: { [event: string]: { bytes: number, count: number, total: number } } = Object.create(null);
 	private downEventStatsAt = 0;
-	// ITEM 3: the host streams TWO entityState cadences (a fixed 15Hz BASE stream for
-	// idle enemies + the option-driven HOSTILE stream). The connector can't tell which
-	// stream a block belongs to, so instead of summing them (which double-counts) we
-	// expose the CONFIGURED hostile cadence directly and report the 15Hz base stream
-	// separately — the HUD then shows the real per-stream rates, never 60+15=75.
-	private hostileTickRate = 0;
-	private readonly BASE_TICK_HZ = 15;
-	/** Item 3: netSync calls this with the option's hostile block cadence (Hz) so the
-	 * HUD can display the true hostile tick instead of a double-counted sum. */
-	public setHostileTickHz(hz: number): void {
-		this.hostileTickRate = (isFinite(hz) && hz > 0) ? hz : 0;
-	}
 	/** Solo-instance optimization (see Multiplayer.isSoloInstance): every INSTANCE-
 	 * scoped sync broadcast is pure upload waste while we are the only member of our
 	 * instance (the server relays to every OTHER member, and there are none). Emit
@@ -515,15 +513,19 @@ export class SocketIoConnector implements IConnection {
 				// Round 22 (EXTRA 2): fold the entityState block counts into the observed
 				// server tick rate (blocks/sec). Host side sends, member side receives —
 				// the inactive direction simply contributes 0.
-				// ITEM 3 FIX: the old combined `tickRate` double-counted the two streams
-				// the host now sends (the fixed 15Hz BASE stream + the option-driven
-				// HOSTILE stream), so at a 60Hz hostile setting it read ~75 (60+15) — a
-				// display artifact, not an over-send. We now keep the combined count as an
-				// internal total, but the HUD derives the per-stream rates from
-				// hostileTickRate (the option) + BASE_TICK_HZ (fixed 15) instead.
-				this.tickRate = this.upBlockAccum + this.downBlockAccum;
-				this.upBlockAccum = 0;
-				this.downBlockAccum = 0;
+				// ROUND 81 (item tick fix): count the two host streams SEPARATELY via the
+				// block's `st` tag (B = fixed 15Hz base, H = option-driven hostile), so
+				// the HUD can show the REAL measured per-stream tick instead of the
+				// configured option. Unclassified blocks (old protocol) still land in the
+				// total, never in either per-stream rate.
+				this.tickRateHostile = this.upHostileBlockAccum + this.downHostileBlockAccum;
+				this.tickRateBase = this.upBaseBlockAccum + this.downBaseBlockAccum;
+				this.tickRate = this.tickRateHostile + this.tickRateBase + this.downUnclassifiedBlockAccum;
+				this.upBaseBlockAccum = 0;
+				this.upHostileBlockAccum = 0;
+				this.downBaseBlockAccum = 0;
+				this.downHostileBlockAccum = 0;
+				this.downUnclassifiedBlockAccum = 0;
 			} catch (_) { /* ignore */ }
 		}, 1000);
 	}
@@ -538,17 +540,22 @@ export class SocketIoConnector implements IConnection {
 		this.upBitsSec = 0; this.downBitsSec = 0;
 		this.upBitsTotal = 0; this.downBitsTotal = 0;
 		this.probeWindow = [];
-		this.upBlockAccum = 0; this.downBlockAccum = 0;
+		this.upBaseBlockAccum = 0;
+		this.upHostileBlockAccum = 0;
+		this.downBaseBlockAccum = 0;
+		this.downHostileBlockAccum = 0;
+		this.downUnclassifiedBlockAccum = 0;
 		this.tickRate = 0;
-		this.hostileTickRate = 0;
+		this.tickRateHostile = 0;
+		this.tickRateBase = 0;
 	}
 
 	/** Round 21: current network debug stats for the HUD overlay. Loss % is over the
 	 * last 10 mpPing probes (0 when none sent yet). Round 22 (EXTRA 2): `tickRate` is
 	 * the observed entityState block rate (blocks/sec; host sends, member receives).
-	 * ITEM 3: `tickRateHostile` = the option's configured hostile cadence (Hz) so the
-	 * HUD reports the REAL active tick, and `tickRateBase` = the fixed 15Hz idle stream.
-	 * Displaying the summed `tickRate` would double-count both streams (60+15=75). */
+	 * ROUND 81: `tickRateHostile`/`tickRateBase` are now MEASURED per-stream rates
+	 * (H = engaged enemies, B = idle enemies), stream-tagged by the host and relayed
+	 * by the server — not the configured option values. */
 	public getNetStats(): { upBitsSec: number; downBitsSec: number; lossPct: number; upBitsTotal: number; downBitsTotal: number; tickRate: number; tickRateHostile: number; tickRateBase: number } {
 		const w = this.probeWindow;
 		let lossPct = 0;
@@ -564,8 +571,8 @@ export class SocketIoConnector implements IConnection {
 			upBitsTotal: this.upBitsTotal,
 			downBitsTotal: this.downBitsTotal,
 			tickRate: this.tickRate,
-			tickRateHostile: this.hostileTickRate,
-			tickRateBase: this.BASE_TICK_HZ,
+			tickRateHostile: this.tickRateHostile,
+			tickRateBase: this.tickRateBase,
 		};
 	}
 
@@ -884,15 +891,17 @@ export class SocketIoConnector implements IConnection {
 	public updatePlayerPosition(pos: Vec3): void {
 		this.socket.emit('playerState', { pos });
 	}
-	public updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean): void {
+	public updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean, stream?: 'base' | 'hostile'): void {
 		// Solo-instance optimization: no one else is in our instance, so the block is pure
 		// upload waste — skip it (and its stats count).
 		if (this.main.isSoloInstance()) return;
 		// Round 22 (EXTRA 2): count host->member enemy blocks for the observed tick rate.
-		this.upBlockAccum++;
+		// ROUND 81: count per stream so the HUD can show the real H/B tick.
+		if (stream === 'base') this.upBaseBlockAccum++;
+		else this.upHostileBlockAccum++;
 		// Round 24: a force-full block ships f:1 (the ~1s heartbeat). Normal blocks omit
 		// it so the member's full-block counter only counts genuine full-roster reports.
-		const payload: any = { map, e: entities, cb: !!combat };
+		const payload: any = { map, e: entities, cb: !!combat, st: stream === 'base' ? 'B' : 'H' };
 		if (full) payload.f = 1;
 		this.socket.emit('entityState', payload);
 	}
@@ -910,11 +919,16 @@ export class SocketIoConnector implements IConnection {
 	public onPlayerState(callback: (player: string, state: any) => void): void {
 		this.socket.on('playerState', (data: any) => callback(data.player, data));
 	}
-	public onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean) => void): void {
+	public onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean, stream?: 'base' | 'hostile') => void): void {
 		this.socket.on('entityState', (data: any) => {
 			// Round 22 (EXTRA 2): count member-received enemy blocks for the tick rate.
-			this.downBlockAccum++;
-			callback(data.map, data.e, !!data.cb, data.f === 1);
+			// ROUND 81: per-stream counters from the relayed `st` tag; untagged blocks
+			// (pre-tag protocol) only contribute to the combined total.
+			if (data.st === 'B') this.downBaseBlockAccum++;
+			else if (data.st === 'H') this.downHostileBlockAccum++;
+			else this.downUnclassifiedBlockAccum++;
+			const stream: 'base' | 'hostile' | undefined = data.st === 'B' ? 'base' : (data.st === 'H' ? 'hostile' : undefined);
+			callback(data.map, data.e, !!data.cb, data.f === 1, stream);
 		});
 	}
 	public onCutsceneEntity(callback: (from: string, data: { map: string, list: any[] }) => void): void {

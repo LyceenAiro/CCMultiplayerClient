@@ -5546,13 +5546,9 @@ export class NetSync {
 			// until the previous timer expires (or indefinitely, if the timer was
 			// armed before the latch).
 			this._mpProjSendTimer = 0;
-			// Item 3: tell the connector the real hostile cadence so the net-debug HUD
-			// shows the true active tick (e.g. 60(H)/s) instead of the double-counted
-			// hostile+base sum. 1/sec = Hz; guard with optional-call for old connectors.
-			try {
-				const conn: any = this.main && this.main.connection;
-				if (conn && typeof conn.setHostileTickHz === 'function') conn.setHostileTickHz(1 / sec);
-			} catch (_) { /* HUD stat only — never break the cadence change */ }
+			// ROUND 81 (item tick fix): the net-debug HUD no longer needs the
+			// configured cadence — the connector now measures the real H/B tick from
+			// the stream-tagged blocks (updateEntityStateBlock's 5th arg).
 		}
 	}
 
@@ -5734,7 +5730,7 @@ export class NetSync {
 		const cb = this.hostInCombat();
 		if (out.length === 0 && !forceFull && cb === this._mpLastBaseCb) return;
 		this._mpLastBaseCb = cb;
-		this.main.connection.updateEntityStateBlock(this.mapName, out, cb, forceFull);
+		this.main.connection.updateEntityStateBlock(this.mapName, out, cb, forceFull, 'base');
 	}
 
 	/** Round 23: the fast entityState stream — every live host enemy WITH a current
@@ -5779,7 +5775,7 @@ export class NetSync {
 		const cb = this.hostInCombat();
 		if (out.length === 0 && !forceFull && cb === this._mpLastHostileCb) return;
 		this._mpLastHostileCb = cb;
-		this.main.connection.updateEntityStateBlock(this.mapName, out, cb, forceFull);
+		this.main.connection.updateEntityStateBlock(this.mapName, out, cb, forceFull, 'hostile');
 	}
 
 	/** Round 22 (opt 2) / Round 23: encode one live host enemy into `out` and its

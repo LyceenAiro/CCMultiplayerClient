@@ -831,6 +831,13 @@ let netHudBox: any = null;
 let netHudText: any = null;
 let netHudTimer = 0;
 let netHudLast = '';
+/** ROUND 81 (FPS readout): frames + wall-clock window for the real render FPS shown
+ * in the SIMPLE network debug overlay. Counted in the same pump that renders it and
+ * folded every time that pump's 1s game-time window elapses (FPS = frames / real
+ * elapsed seconds, so a hitch lowers the value and a paused game resets the window). */
+let netHudFrames = 0;
+let netHudFpsAt = 0;
+let netHudFps = 0;
 
 /** Lazily build the bottom-right debug overlay: one dark-backed GuiElementBase
  * holding a single tiny-font text element — the same container + hook mechanics the
@@ -878,17 +885,20 @@ function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
             // Round 22: arrow glyphs for up/down (user-requested; ↑ ↓ render in the game
             // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us.
             // ROUND 80: all rates/totals are bytes (B/kB/MB), not bits.
-            str = '↑ ' + formatBytes(s.upBitsSec / 8) + '/s  ↓ ' + formatBytes(s.downBitsSec / 8) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
+            // ROUND 81: the simple tool also shows the real render FPS, averaged over
+            // the same ~1s window as the rates.
+            const fps = Math.max(0, Math.min(999, Math.round(netHudFps)));
+            str = 'FPS ' + fps + '  ↑ ' + formatBytes(s.upBitsSec / 8) + '/s  ↓ ' + formatBytes(s.downBitsSec / 8) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
             if (getMpOption('showNetDebugCumulative')) {
                 str += '\n↑ ' + formatBytes(s.upBitsTotal / 8) + '  ↓ ' + formatBytes(s.downBitsTotal / 8);
-                // Item 3: display the two per-stream entityState rates separately. The old
-                // "TICK n/s" summed the fixed 15Hz BASE stream + the option's HOSTILE stream,
-                // reading ~75 in combat at a 60Hz setting (a display artifact, not an
-                // over-send). Prefer the split fields the connector now reports; fall back
-                // to the combined count only when they're absent (older connector).
+                // ROUND 81 (item tick fix): H/B are now the MEASURED per-stream
+                // entityState rates (the host tags every block with its stream and the
+                // server relays the tag), so the number is the REAL active tick — not
+                // the option setting. Fall back to the combined measured count only for
+                // older connectors without per-stream fields.
                 const sa: any = s as any;
-                if (typeof sa.tickRateHostile === 'number') {
-                    str += '  TICK ' + Math.round(sa.tickRateHostile) + '(H)/s ' + Math.round(sa.tickRateBase || 0) + '(B)/s';
+                if (typeof sa.tickRateHostile === 'number' && typeof sa.tickRateBase === 'number') {
+                    str += '  TICK ' + Math.round(sa.tickRateHostile) + '(H)/s ' + Math.round(sa.tickRateBase) + '(B)/s';
                 } else {
                     str += '  TICK ' + Math.round(sa.tickRate || 0) + '/s';
                 }
@@ -975,9 +985,26 @@ export function startNetHudLoop(getMain: () => Multiplayer | undefined): void {
     (s as any)._mpNetHudLoop = true;
     s.registerUpdate(() => {
         try {
+            // ROUND 81: count every rendered frame for the FPS readout. While the game
+            // is paused (ig.system.tick === 0) the window is reset continuously so a
+            // long pause is never averaged into the next displayed FPS value.
+            const nowMs = Date.now();
+            if (!netHudFpsAt) netHudFpsAt = nowMs;
+            netHudFrames++;
+            if (!(ig.system.tick > 0)) {
+                netHudFrames = 0;
+                netHudFpsAt = nowMs;
+                return;
+            }
             netHudTimer += ig.system.tick;
             if (netHudTimer < 1) return;
             netHudTimer = 0;
+            const fpsElapsed = nowMs - netHudFpsAt;
+            if (fpsElapsed >= 250) {
+                netHudFps = netHudFrames * 1000 / fpsElapsed;
+                netHudFrames = 0;
+                netHudFpsAt = nowMs;
+            }
             // ROUND 76: the advanced network tool renders inside applyNetHudNow's
             // bottom-right window, so it shares this one pump.
             applyNetHudNow(getMain);
