@@ -3755,14 +3755,18 @@ export class NetSync {
 					mirrorAny._mpForcedDef = (typeof hit.def === 'number' && isFinite(hit.def) && hit.def > 0 && hit.def <= 10)
 						? hit.def : null;
 					mirrorAny._mpForcedWeak = hit.weak === true;
-					// getElement() reads tackle.attackInfo.element — neutral passes
-					// element shields/filters that would otherwise swallow the hit.
+					// The fabricated AttackInfo must look like the REAL attack to the
+					// enemy's reaction system. In particular the meerkat's CHARGE_WEAK
+					// (red-flash break) reaction checks attacker.attackInfo.hasHint
+					// ("CHARGED") via the mirror's tackle.attackInfo, so the mirror's
+					// fake tackle points at this info (with the real CHARGED hint),
+					// never at the old bare {element:0} object.
 					// The fake tackle MUST be restored synchronously: left in place,
 					// the mirror's own Combatant.update consumes it via checkTackle
 					// next frame and onDamage crashes on the bare object (no
 					// damageFactor/limiter — the round-12 host crash).
 					const prevTackle = mirrorAny.tackle;
-					mirrorAny.tackle = { attackInfo: { element: 0 } };
+					const prevMirrorIsBall = mirrorAny.isBall;
 					// ROUND 34 (item 1/2): steer the NATIVE knockback instead of a second
 					// manual doDamageMovement. getHitVel (engine ~2487444) reads the
 					// ATTACKER's coll.vel for the knockback direction; the mirror is
@@ -3779,13 +3783,25 @@ export class NetSync {
 							mirrorAny.coll.vel.x = awayDir.x;
 							mirrorAny.coll.vel.y = awayDir.y;
 						}
-						const info = new (sc as any).AttackInfo(mirrorAny.params, {
-							type: flyStr, element: 0, hitInvincible: true,
-						});
+						// ROUND 80 (charged-break fix): rebuild the real attack shape.
+						// `hints: ['CHARGED']` is what BALL_CHARGE / CHARGE_WEAK checks;
+						// the 3rd AttackInfo ctor arg (true for balls) sets ballDamage so
+						// every ball-only damage branch sees the true attack kind.
+						const infoOptions: any = {
+							type: flyStr, element: atkEl, hitInvincible: true,
+						};
+						if (isBall && hit.charged === true) infoOptions.hints = ['CHARGED'];
+						const info = new (sc as any).AttackInfo(mirrorAny.params, infoOptions, isBall);
 						// ROUND 32 (item 3c): mark the fabricated AttackInfo as a ball when the
 						// real attack was one, so the engine's ball-vs-melee branches (fly level,
 						// KNOCKBACK modifier, doDamageMovement) see the true attack kind.
 						try { (info as any).isBall = isBall; } catch (_) { /* cosmetic */ }
+						// The attacker ENTITY also advertises the real shape for reaction
+						// conditions that read damagingEntity.isBall (BALL_SMALL etc.).
+						try { mirrorAny.isBall = isBall; } catch (_) { /* cosmetic */ }
+						// getElement() reads tackle.attackInfo.element; reaction conditions
+						// read tackle.attackInfo.hasHint — point the fake tackle at the real info.
+						mirrorAny.tackle = { attackInfo: info };
 						// Round 20 (fix 2): a member's forwarded hit must land even when the
 						// monster has no target yet or sits far from the host's screen.
 						// Combatant.damage (game.compiled.js ~byte 2492349) rejects ENEMY-party
@@ -3849,6 +3865,7 @@ export class NetSync {
 						try { (this as any)._mpLastAedForced = ((mirror as any)._mpForcedDamage != null); } catch (_) { (this as any)._mpLastAedForced = true; }
 					} finally {
 						mirrorAny.tackle = prevTackle;
+						mirrorAny.isBall = prevMirrorIsBall;
 						if (mirrorAny.coll && mirrorAny.coll.vel) {
 							mirrorAny.coll.vel.x = prevVelX;
 							mirrorAny.coll.vel.y = prevVelY;
@@ -6362,6 +6379,25 @@ export class NetSync {
 		try { if (e) e._mpCollDirty = true; } catch (_) { /* ignore */ }
 	}
 
+	/** ROUND 80 (body-push fix, persistent): the engine can restore a combatant's
+	 * configured coll weight via defaultConfig.apply (stun end / RESET_ACTOR /
+	 * state changes), which would re-enable body-pushing for a puppet or mirror.
+	 * Re-assert weight 0 every rendered frame so network telepresences stay
+	 * hittable but can never shove the player or an attacking enemy. */
+	private _mpZeroNetworkWeights(): void {
+		try {
+			for (const uidStr in this.puppets) {
+				const e: any = this.puppets[uidStr];
+				if (e && !e._killed && e.coll && e.coll.weight !== 0) e.coll.weight = 0;
+			}
+			for (const pName in this.main.players) {
+				const pm = this.main.players[pName];
+				const e: any = pm && pm.entity;
+				if (e && !e._killed && e.coll && e.coll.weight !== 0) e.coll.weight = 0;
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
 	/** ROUND 80: re-bucket every network entity that was marked dirty (direct
 	 * position snaps + per-frame interpolation targets). */
 	private _mpReindexDirtyColls(): void {
@@ -6440,6 +6476,9 @@ export class NetSync {
 		// ROUND 80: re-bucket any collision entries whose locked position changed
 		// (direct snaps marked by the block/playerState applies + the lerp above).
 		this._mpReindexDirtyColls();
+		// ROUND 80: keep the no-body-push weight override alive against the
+		// engine's own defaultConfig.apply resets.
+		this._mpZeroNetworkWeights();
 	// ROUND 32 (item 7): resolve the synced entities' floor height every frame via
 	// the engine's own `updateGroundEntity`, not `updateBaseZPos` alone. Three
 	// rounds keyed on `updateBaseZPos` left the shadow pinned to the map-entry
@@ -8612,8 +8651,13 @@ export class NetSync {
 			// the coll hittable (ball/melee touch still register) while making it
 			// immovable for the impact push solver, so the meerkat's underground
 			// charge can't push the member away from the spot where the host's
-			// attack will land.
-			try { if (e.coll) e.coll.weight = 0; } catch (_) { /* ignore */ }
+			// attack will land. Also overwrite its ActorConfig weight: the engine's
+			// cancelStun/defaultConfig.apply would otherwise restore the original
+			// weight right after the puppet's first local flinch.
+			try {
+				if (e.coll) e.coll.weight = 0;
+				if (e.defaultConfig && typeof e.defaultConfig.overwrite === 'function') e.defaultConfig.overwrite('weight', 0);
+			} catch (_) { /* ignore */ }
 			// Puppets must NOT run the enemy AI attack pick — the host streams
 			// animations (mpAnim pins), and a self-picked REAL attack action's
 			// DIRECT_HIT step (selectType TARGET) can damage the local player with NO
