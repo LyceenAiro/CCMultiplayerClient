@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.15';
+export const MP_VERSION = '1.70.16';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3100,14 +3100,14 @@ export class Multiplayer {
 			})
 			.catch((err: any) => {
 				// A user-initiated cancel (server list / login panel) rejects with the
-				// string 'cancelled' — it is NOT a failure. Skip console.error entirely:
-				// CCLoader overrides console.error to also draw an on-screen red toast, so
-				// logging it here was what showed the little "cancelled" box top-right.
+				// string 'cancelled' — it is NOT a failure. Skip it entirely.
 				if (err === 'cancelled') return;
 				// ROUND 86: a version-mismatch rejection already showed the styled
-				// "server updated" popup — don't stack the old native connect-error alert.
+				// "server updated" popup — don't stack a second window.
 				if (err && err._mpVersionMismatch) return;
-				console.error(err);
+				// ROUND 87: report through the styled popup ONLY. The old console.error
+				// call here is what produced the tiny "[object Event]" red toast in the
+				// top-right corner (CCLoader hooks console.error for on-screen errors).
 				this.reportConnectError(err);
 			});
 	}
@@ -3712,21 +3712,30 @@ export class Multiplayer {
 		try { this.removeSaveBlock(); } catch (_) { /* ignore */ }
 	}
 
-	/**
-	 * Surface connection failures where the player can actually see them. The
-	 * default `console.error` only reaches the hidden DevTools console, so a
-	 * failed connect looked like "nothing happened". Log to the CCLoader log AND
-	 * show an in-game dialog.
-	 */
+	/** ROUND 87: surface connection failures in the SAME styled mpWin popup as the
+	 * disconnect / server-updated dialogs, with the underlying reason as the body.
+	 * console.error is deliberately avoided — CCLoader turns it into a tiny red
+	 * on-screen toast, which is where the "[object Event]" box came from. */
 	private reportConnectError(err: any): void {
 		// Round 16: a user-initiated cancel of the login panel is not a connection
 		// failure — return silently so no error dialog pops for it.
 		if (err === 'cancelled') return;
-		const message = (err && err.message) ? err.message : String(err);
-		// A plain alert always works in NW.js and is impossible to miss. This is
-		// the reliable path — console.error only reaches the hidden DevTools.
+		const raw = (err && err.message) ? err.message : String(err);
+		const message = raw.replace(/^\[multiplayer\]\s*/, '');
+		console.warn('[multiplayer] connect failed: ' + message);
 		try {
-			alert(t('connFailed') + ':\n\n' + message);
+			const close = showMpWindow({
+				title: t('connFailed'),
+				content: message,
+				buttons: [{
+					label: t('confirmOk'),
+					style: 'mpPrimary',
+					cb: () => { /* acknowledge only */ },
+				}],
+			});
+			// Only if the mpWin bridge is somehow unavailable (it is installed at
+			// boot) fall back to the browser alert so the reason is never silent.
+			if (!close) alert(t('connFailed') + ':\n\n' + message);
 		} catch (_) { /* ignore */ }
 	}
 
