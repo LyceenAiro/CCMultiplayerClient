@@ -252,11 +252,26 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
         } catch (_) { return false; }
     }
 
+    /** ROUND 91: best-known LEVEL for an online player (profile first, injected
+     * party model fallback). Used by the head-level plate, NOT by the info box. */
+    function playerLevel(name: string): number | null {
+        try {
+            const m = getMain();
+            const prof = m && m.playerProfiles ? m.playerProfiles[name] : undefined;
+            if (prof && typeof prof.level === 'number') return prof.level;
+            const mdl = scAny.party && scAny.party.models && scAny.party.models[name];
+            if (mdl && mdl._mpName && typeof mdl.level === 'number') return mdl.level;
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
     // Anchor type: green ring + username name tag (same pattern as the native
     // NPC type, which parents its QuickArrowBox into the focus screen).
     scAny.QUICK_MENU_TYPES.OnlinePlayer = scAny.QuickMenuTypesBase.extend({
         color: scAny.ANALYSIS_COLORS ? scAny.ANALYSIS_COLORS.GREEN : 2,
         nameGui: null,
+        level: null,
+        _mpLevel: -1,
         init(this: any, a: string, b: any, c: any) {
             this.parent(a, b, c);
             this.setIconColor(this.color);
@@ -270,6 +285,18 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 };
                 this.nameGui.doStateTransition('HIDDEN', true);
                 this.screen.addSubGui(this.nameGui);
+                // ROUND 91: level plate above the head, exactly like the enemy
+                // anchor — but permanently WHITE (never orange/red by level gap).
+                const lvl = playerLevel(name);
+                if (lvl !== null && scAny.QuickBorderArrowLevelBox) {
+                    this.level = new scAny.QuickBorderArrowLevelBox('__mp_player__', { level: { override: lvl } });
+                    this.level.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_CENTER);
+                    this.level.displayColor = scAny.GUI_NUMBER_COLOR ? scAny.GUI_NUMBER_COLOR.WHITE : 0;
+                    try { this.level.levelNumber.setColor(scAny.GUI_NUMBER_COLOR.WHITE); } catch (_) { /* ignore */ }
+                    this.level.getLevelColor = () => (scAny.GUI_NUMBER_COLOR ? scAny.GUI_NUMBER_COLOR.WHITE : 0);
+                    this.addChildGui(this.level);
+                    this._mpLevel = lvl;
+                }
             } catch (e) { this.focusable = false; }
         },
         onAnalysisEnter(this: any) {
@@ -285,17 +312,33 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
         alignGuiPosition(this: any) {
             this.parent();
             if (this.nameGui) this.nameGui.setPosition(this.hook, this.entity);
+            if (this.level && this.entity && this.entity.coll) {
+                try {
+                    const e = this.entity;
+                    let off = e.coll.size.z / 2 + e.coll.size.y / 2;
+                    off = e.dmgZFocus ? off - e.dmgZFocus
+                        : (e.cameraZFocus ? off - (e.cameraZFocus + 48) : off - (e.coll.size.z + e.coll.size.y + 8));
+                    // Keep the level plate ABOVE the QuickArrowBox name tag.
+                    this.level.setPos(0, off - 12);
+                    // Profile may land AFTER the quick menu opened — keep the plate live.
+                    const lvl = playerLevel(e.name);
+                    if (lvl !== null && lvl !== this._mpLevel) {
+                        this._mpLevel = lvl;
+                        try { this.level.levelNumber.setNumber(lvl); } catch (_) { /* ignore */ }
+                    }
+                } catch (_) { /* ignore */ }
+            }
         },
     });
 
-    // Info box: username title, real profile stats (level/exp/hp/atk/def/foc — the
-    // same fields a monster inspect shows), and ONE context action button:
-    //   - same party + I am leader   -> 踢出队伍
-    //   - friend, not in party, in a shared town -> 邀请组队
-    //   - not a friend               -> 添加好友
-    // A confirmed friend NEVER sees add/remove-friend buttons (ROUND 90), and the
-    // level line is a plain TextGui — it never recolors by level difference like
-    // the native enemy label does.
+    // Info box: enemy-box layout — title, HP/ATK/DEF/FOC icon lines, element
+    // resistances, then TWO independent action rows below:
+    //   - friend row: 添加好友 (only while NOT a friend; confirmed friends never
+    //     see add/remove-friend buttons)
+    //   - party row:  踢出队伍 (I am the leader), 退出队伍 (I am a member), or
+    //     邀请组队 (friend, not in party, shared town)
+    // ROUND 91: the level is NOT in the box — it lives on the head plate above
+    // the anchor, always white (never orange/red by level difference).
     scAny.QUICK_INFO_BOXES.OnlinePlayer = (ig as any).BoxGui.extend({
         ninepatch: new (ig as any).NinePatch('media/gui/menu.png', {
             width: 8, height: 8, left: 8, top: 8, right: 8, bottom: 8,
@@ -306,57 +349,53 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
             DEFAULT: { state: {}, time: 0.2, timeFunction: KEY_SPLINES.EASE },
         },
         title: null,
-        levelLine: null,
-        expLine: null,
-        hpLine: null,
-        atkLine: null,
-        defLine: null,
-        focLine: null,
+        baseHp: null,
+        baseAttack: null,
+        baseDefense: null,
+        baseFocus: null,
+        resistance: null,
         friendBtn: null,
+        partyBtn: null,
         active: false,
         _mpUsername: '',
-        _mpAction: '',
+        _mpFriendAction: '',
+        _mpPartyAction: '',
         init(this: any) {
-            this.parent(127, 148);
+            this.parent(127, 164);
             // Mouse record: keeps box.hook.screenCoords fresh every frame so the
             // sticky isMouseOver (section 1b) treats hovering THIS box as hovering
             // the anchor — without it the box dies as soon as the cursor leaves the
-            // 16x16 anchor and the action button would be unreachable.
+            // 16x16 anchor and the action buttons would be unreachable.
             try { this.hook.setMouseRecord(true); } catch (_) { /* ignore */ }
             this.title = new sc.TextGui('', { font: sc.fontsystem.smallFont });
             this.title.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
             this.title.setPos(0, 2);
             this.addChildGui(this.title);
-            this.levelLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.levelLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.levelLine.setPos(0, 20);
-            this.addChildGui(this.levelLine);
-            this.expLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.expLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.expLine.setPos(0, 36);
-            this.addChildGui(this.expLine);
-            this.hpLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.hpLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.hpLine.setPos(0, 52);
-            this.addChildGui(this.hpLine);
-            this.atkLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.atkLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.atkLine.setPos(0, 68);
-            this.addChildGui(this.atkLine);
-            this.defLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.defLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.defLine.setPos(0, 84);
-            this.addChildGui(this.defLine);
-            this.focLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.focLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.focLine.setPos(0, 100);
-            this.addChildGui(this.focLine);
+            let y = 21;
+            this.baseHp = this.createStatusLine('maxhp', 0, 4, y); y += 14;
+            this.baseAttack = this.createStatusLine('atk', 1, 4, y); y += 14;
+            this.baseDefense = this.createStatusLine('def', 2, 4, y); y += 14;
+            this.baseFocus = this.createStatusLine('foc', 3, 4, y); y += 18;
+            this.resistance = new scAny.EnemyResistence();
+            this.resistance.setPos(4, y);
+            this.addChildGui(this.resistance);
             this.friendBtn = new sc.ButtonGui(t('addFriend'), 100, true, sc.BUTTON_TYPE.SMALL);
             this.friendBtn.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.friendBtn.setPos(0, 118);
+            this.friendBtn.setPos(0, 120);
             this.friendBtn.onButtonPress = () => this._mpFriendPress();
             this.addChildGui(this.friendBtn);
+            this.partyBtn = new sc.ButtonGui(t('inviteParty'), 100, true, sc.BUTTON_TYPE.SMALL);
+            this.partyBtn.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
+            this.partyBtn.setPos(0, 140);
+            this.partyBtn.onButtonPress = () => this._mpPartyPress();
+            this.addChildGui(this.partyBtn);
             this.doStateTransition('HIDDEN', true);
+        },
+        createStatusLine(this: any, key: string, icon: number, x: number, y: number) {
+            const line = new scAny.EnemyBaseParamLine(ig.lang.get('sc.gui.menu.equip.' + key), icon);
+            line.setPos(x, y);
+            this.addChildGui(line);
+            return line;
         },
         updateDrawables(this: any, a: any) {
             this.parent(a);
@@ -373,7 +412,7 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 const snap = d.currentState && d.currentState.alpha === 0;
                 const ax = a.pos.x + Math.floor(a.size.x / 2);
                 const rawY = a.pos.y + Math.floor(a.size.y / 2) - 70;
-                const cy = Math.max(10, Math.min((ig as any).system.height - 170, rawY));
+                const cy = Math.max(10, Math.min((ig as any).system.height - 180, rawY));
                 const w = (d.size && d.size.x) || 127;
                 if (ax + w + 60 < (ig as any).system.width) {
                     this.currentTileOffset = 'default';
@@ -391,28 +430,29 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
             this.setData(anchor.entity);
             this.doStateTransition('DEFAULT');
             this.active = true;
-            // The action button is a BoxGui child, so it has no buttonGroup and was
-            // never hovered/clicked (FocusGui.onMouseInteract needs a buttonInteract
-            // to route through). Register it as a global button on the quick menu's
-            // ButtonInteractEntry while shown: the mouse path (setMouseOverGui +
-            // getGuiClick in buttonInteract.update) then works. The check returns
-            // false so the keyboard/hotkey loop never fires it — mouse-only, exactly
-            // like the Social menu's 加好友 chip. clearAllButtons() on menu exit is
-            // the safety net; hide() removes it eagerly.
+            // The action buttons are BoxGui children, so they have no buttonGroup
+            // and would never be hovered/clicked. Register both as global buttons on
+            // the quick menu's ButtonInteractEntry while shown; the checks return
+            // false so keyboard/hotkey never fires them — mouse-only, exactly like
+            // the Social menu's 加好友 chip. clearAllButtons() is the safety net;
+            // hide() removes them eagerly.
             try {
                 const bi = scAny.quickmodel && scAny.quickmodel.buttonInteract;
-                if (bi && bi.globalButtons && this.friendBtn && bi.globalButtons.indexOf(this.friendBtn) === -1) {
-                    bi.addGlobalButton(this.friendBtn, () => false, false);
+                if (bi && bi.globalButtons) {
+                    for (const btn of [this.friendBtn, this.partyBtn]) {
+                        if (btn && bi.globalButtons.indexOf(btn) === -1) bi.addGlobalButton(btn, () => false, false);
+                    }
                 }
             } catch (_) { /* ignore */ }
         },
         hide(this: any, instant?: boolean) {
-            // Deregister the global button so it can't keep firing / leaking focus
-            // once the box is hidden (the quick menu's clearAllButtons() would also
-            // catch it, but this runs even when the menu teardown path differs).
             try {
                 const bi = scAny.quickmodel && scAny.quickmodel.buttonInteract;
-                if (bi && bi.removeGlobalButton && this.friendBtn) bi.removeGlobalButton(this.friendBtn);
+                if (bi && bi.removeGlobalButton) {
+                    for (const btn of [this.friendBtn, this.partyBtn]) {
+                        if (btn) bi.removeGlobalButton(btn);
+                    }
+                }
             } catch (_) { /* ignore */ }
             this.doStateTransition('HIDDEN', instant);
             this.active = false;
@@ -425,57 +465,62 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
                 this.title.setText(username);
                 const m = getMain();
                 const prof = m && m.playerProfiles ? m.playerProfiles[username] : undefined;
-                // Profile wins when present; fall back to the injected party model
-                // (stamped _mpName only — never a native single-party character) so
-                // the level line shows a real number even before the profile stream lands.
-                let level: any = prof && typeof prof.level === 'number' ? prof.level : null;
-                if (level === null) {
-                    try {
-                        const mdl = scAny.party && scAny.party.models && scAny.party.models[username];
-                        if (mdl && mdl._mpName && typeof mdl.level === 'number') level = mdl.level;
-                    } catch (_) { /* ignore */ }
-                }
-                this.levelLine.setText(t('levelLabel') + (level === null ? '?' : String(level)));
-                const num = (v: any) => (typeof v === 'number' && isFinite(v) ? String(Math.round(v)) : '?');
-                this.expLine.setText(t('expLabel') + (prof ? num(prof.exp) : '?'));
-                const curHp = prof && typeof prof.currentHp === 'number' ? Math.max(0, Math.round(prof.currentHp)) : null;
-                this.hpLine.setText(t('hpLabel') + (curHp == null ? '?' : String(curHp)) + ' / ' + (prof ? num(prof.hp) : '?'));
-                this.atkLine.setText(t('atkLabel') + (prof ? num(prof.attack) : '?'));
-                this.defLine.setText(t('defLabel') + (prof ? num(prof.defense) : '?'));
-                this.focLine.setText(t('focLabel') + (prof ? num(prof.focus) : '?'));
+                const stat = (v: any) => (typeof v === 'number' && isFinite(v) ? Math.round(v) : 0);
+                this.baseHp.setNumber(stat(prof && prof.hp), true);
+                this.baseAttack.setNumber(stat(prof && prof.attack), true);
+                this.baseDefense.setNumber(stat(prof && prof.defense), true);
+                this.baseFocus.setNumber(stat(prof && prof.focus), true);
+                this.resistance.setResistance(prof && Array.isArray(prof.elemFactor) ? prof.elemFactor : null, true);
 
-                // ROUND 90 context action: kick (leader + same party) > invite
-                // (friend in a shared town, not in our party) > add friend (stranger).
                 const inParty = !!(m && Array.isArray(m.partyMembers) && m.partyMembers.indexOf(username) !== -1);
                 const isLeader = !!(m && m.partyLeader && m.name && m.partyLeader === m.name);
                 const friend = isFriend(username);
-                let action = '';
-                let label = '';
-                if (inParty && isLeader) { action = 'kick'; label = t('kickParty'); }
-                else if (!inParty && friend && isSharedTownNow()) { action = 'invite'; label = t('inviteParty'); }
-                else if (!inParty && !friend) { action = 'friend'; label = t('addFriend'); }
-                this._mpAction = action;
-                this.friendBtn.setText(action ? label : '', true);
-                try { this.friendBtn.hook._visible = !!action; } catch (_) { /* ignore */ }
+                // Friend row: ONLY for non-friends. Confirmed friends never see
+                // add-friend and never see remove-friend.
+                const friendAction = friend ? '' : 'friend';
+                this._mpFriendAction = friendAction;
+                this.friendBtn.setText(friendAction ? t('addFriend') : '', true);
+                try { this.friendBtn.hook._visible = !!friendAction; } catch (_) { /* ignore */ }
+                // Party row: kick when I lead this party, leave when I'm just a
+                // member inspecting another member, invite when we're friends in a
+                // shared town but not sharing a party.
+                let partyAction = '';
+                let partyLabel = '';
+                if (inParty) {
+                    partyAction = isLeader ? 'kick' : 'leave';
+                    partyLabel = isLeader ? t('kickParty') : t('leaveParty');
+                } else if (friend && isSharedTownNow()) {
+                    partyAction = 'invite';
+                    partyLabel = t('inviteParty');
+                }
+                this._mpPartyAction = partyAction;
+                this.partyBtn.setText(partyLabel, true);
+                try { this.partyBtn.hook._visible = !!partyAction; } catch (_) { /* ignore */ }
             } catch (_) { /* ignore */ }
         },
         _mpFriendPress(this: any) {
             try {
                 const m = getMain();
-                if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername || !this._mpAction) return;
-                if (this._mpAction === 'kick') {
+                if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername || this._mpFriendAction !== 'friend') return;
+                m.connection.friendAdd(this._mpUsername);
+                this.friendBtn.setText(t('friendReqSent'), true);
+                console.log('[multiplayer] quick-menu: friend request sent to ' + this._mpUsername);
+            } catch (_) { /* ignore */ }
+        },
+        _mpPartyPress(this: any) {
+            try {
+                const m = getMain();
+                if (!m || !m.connection || !m.connection.isOpen() || !this._mpUsername || !this._mpPartyAction) return;
+                if (this._mpPartyAction === 'kick') {
                     m.connection.partyKick(this._mpUsername);
                     console.log('[multiplayer] quick-menu: kicked ' + this._mpUsername);
-                } else if (this._mpAction === 'invite') {
+                } else if (this._mpPartyAction === 'leave') {
+                    m.connection.partyLeave();
+                    console.log('[multiplayer] quick-menu: left the party');
+                } else if (this._mpPartyAction === 'invite') {
                     m.connection.partyInvite(this._mpUsername);
-                    this.friendBtn.setText(t('partyInviteSent'), true);
+                    this.partyBtn.setText(t('partyInviteSent'), true);
                     console.log('[multiplayer] quick-menu: party invite sent to ' + this._mpUsername);
-                } else if (this._mpAction === 'friend') {
-                    // friendAdd sends a REQUEST (mutual only after the target accepts,
-                    // or instantly if they had already requested us) — reflect that.
-                    m.connection.friendAdd(this._mpUsername);
-                    this.friendBtn.setText(t('friendReqSent'), true);
-                    console.log('[multiplayer] quick-menu: friend request sent to ' + this._mpUsername);
                 }
             } catch (_) { /* ignore */ }
         },

@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.19';
+export const MP_VERSION = '1.70.20';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1536,6 +1536,20 @@ export class Multiplayer {
 				currentHp: p.params.currentHp,
 				currentSp: p.params.currentSp,
 				maxSp: p.params.maxSp,
+				// ROUND 91: ship the 4 non-neutral element factors for the quick-menu
+				// resistance readout (enemy-box style).
+				elemFactor: (function (): number[] | undefined {
+					try {
+						const ef = p.params.getStat('elemFactor');
+						if (!Array.isArray(ef)) return undefined;
+						const out: number[] = [];
+						for (let i = 0; i < 4; i++) {
+							const v = Number(ef[i]);
+							out.push(isFinite(v) ? v : 1);
+						}
+						return out;
+					} catch (_) { return undefined; }
+				})(),
 				equip: p.equip ? {
 					head: p.equip.head, leftArm: p.equip.leftArm, rightArm: p.equip.rightArm,
 					torso: p.equip.torso, feet: p.equip.feet,

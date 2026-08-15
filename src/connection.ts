@@ -451,6 +451,9 @@ export interface IPlayerProfile {
     currentHp?: number;
     currentSp?: number;
     maxSp?: number;
+    /** ROUND 91: the four non-neutral element factors (HEAT/COLD/SHOCK/WAVE) shown
+     * in the SHIFT quick-menu inspect box exactly like an enemy's resistances. */
+    elemFactor?: number[];
     equip?: { head?: number, leftArm?: number, rightArm?: number, torso?: number, feet?: number };
 }
 

@@ -52,6 +52,7 @@ const enDict: { [key: string]: string } = {
     focLabel: 'FOC ',
     inviteParty: 'Invite to Party',
     kickParty: 'Kick from Party',
+    leaveParty: 'Leave Party',
     partyInviteSent: 'Invite sent',
 
     // netBadge.ts — network-quality badge tooltips
@@ -236,6 +237,7 @@ const zhDict: { [key: string]: string } = {
     focLabel: '专注 ',
     inviteParty: '邀请组队',
     kickParty: '踢出队伍',
+    leaveParty: '退出队伍',
     partyInviteSent: '已发送邀请',
 
     // netBadge.ts — network-quality badge tooltips
