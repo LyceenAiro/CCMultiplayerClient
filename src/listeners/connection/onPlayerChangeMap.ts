@@ -199,6 +199,11 @@ export class OnPlayerChangeMapListener {
 				try {
 					const roster = instance.main.newInstanceMembers;
 					const keep = new Set<string>();
+					// ROUND 84: the best-known spawn position per kept name (roster's cached
+					// member pos or the relayed enter pos). Used to proactively spawn
+					// already-present members after reconcile instead of waiting for their
+					// next playerState (which could be dropped by a roster race).
+					const posByName: { [n: string]: Vec3 } = {};
 					const myMap = ig.game ? (ig.game as any).mapName : '';
 					const prevMap = (ig.game && (ig.game as any).previousMap) || '';
 					const realChange = typeof prevMap === 'string' && !!prevMap && prevMap !== myMap;
@@ -213,7 +218,10 @@ export class OnPlayerChangeMapListener {
 							if (!m || !m.name) continue;
 							const map = m.map || myMap;
 							pmap[m.name] = map;
-							if (map === myMap) keep.add(m.name);
+							if (map === myMap) {
+								keep.add(m.name);
+								if (m.pos) posByName[m.name] = m.pos;
+							}
 						}
 						for (const n in pending) {
 							const rec = pending[n];
@@ -226,7 +234,10 @@ export class OnPlayerChangeMapListener {
 							// are alone and collapse the whole sync to the ~1Hz solo beacon.
 							const pm = rec.map || myMap;
 							pmap[n] = pm;
-							if (pm === myMap) keep.add(n);
+							if (pm === myMap) {
+								keep.add(n);
+								posByName[n] = rec.position;
+							}
 						}
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
 						instance.main.newInstanceMembers = undefined;
@@ -244,10 +255,11 @@ export class OnPlayerChangeMapListener {
 							const known = prevPmap[n];
 							if (known && known === myMap) {
 								// Known on OUR target sub-map: keep the roster slot even when
-								// its entity was killed by clearMap — the first playerState is
-								// what respawns the mirror.
+								// its entity was killed by clearMap — the ensure-spawn below
+								// rebuilds the mirror without waiting for playerState.
 								keep.add(n);
 								pmap[n] = myMap;
+								posByName[n] = p.position;
 								continue;
 							}
 							if (p.entity && !(p.entity as any)._killed) {
@@ -266,7 +278,10 @@ export class OnPlayerChangeMapListener {
 							if (!rec) continue;
 							const pm = rec.map || myMap;
 							pmap[n] = pm;
-							if (pm === myMap) keep.add(n);
+							if (pm === myMap) {
+								keep.add(n);
+								posByName[n] = rec.position;
+							}
 						}
 					} else {
 						// No roster (same-map checkpoint reload): keep live mirrors.
@@ -282,6 +297,21 @@ export class OnPlayerChangeMapListener {
 					// ROUND 83: the roster decision is final now — until the NEXT map load,
 					// names not in playersOnThisMap are stale (even when the roster is empty).
 					instance.main.playersRosterReady = true;
+					// ROUND 84: proactively spawn every kept member that has no LIVE mirror.
+					// reconcile above may have deleted a kept record whose old entity was
+					// killed by clearMap; waiting for their next playerState caused the
+					// "later entrant can't see the earlier entrant" regression when that
+					// state was gated by a transient roster race.
+					for (const n in onMap) {
+						try {
+							const p = instance.main.players[n];
+							if (p && p.entity && !(p.entity as any)._killed) continue;
+							const pos = posByName[n];
+							if (!pos) continue;
+							instance.main.pendingFadeIn[n] = true;
+							instance.spawnMirror(n, pos);
+						} catch (_) { /* ignore */ }
+					}
 				} catch (_) { /* never break a map load */ }
 				// Round 16: old-map name tags must never survive into the new map.
 				// The reconcile block above killed stale mirrors + dropped their tags,

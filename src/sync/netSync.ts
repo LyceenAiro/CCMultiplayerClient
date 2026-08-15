@@ -8029,26 +8029,10 @@ export class NetSync {
 		// reconcile against the changeMapResponse roster). Fail-open when the
 		// roster is empty (first-load window / pre-reconcile) so we never
 		// block legitimate mirrors.
-		try {
-			const onMap: any = (this.main as any).playersOnThisMap;
-			if (onMap) {
-				// ROUND 83: before the first roster reconcile (playersRosterReady false)
-				// an empty roster fails open so unknown members can self-heal. Once the
-				// roster is settled, absence from playersOnThisMap is authoritative —
-				// even for an empty room — so a departed/fading mirror can never be
-				// resurrected by a stale playerState.
-				const ready = !!(this.main as any).playersRosterReady;
-				if (!onMap[player] && (ready || Object.keys(onMap).length > 0)) {
-					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
-					return;
-				}
-			}
-		} catch (_) { /* ignore */ }
-		// Main-city refactor: a town instance spans a whole AREA, so a member on a
-		// DIFFERENT sub-map also streams playerState to us (broadcastToInstance reaches
-		// every channel member). Drop those by the member's known sub-map BEFORE the
-		// playersOnThisMap fail-open above can let one slip through while we're alone
-		// on our sub-map. Unknown maps (pre-reconcile window) still fail open.
+		// ROUND 84: a member whose KNOWN sub-map equals ours is always accepted,
+		// even when the roster slot was transiently missing (the "later entrant
+		// can't see the earlier entrant" race).
+		let knownOnMap = false;
 		try {
 			const pmap: any = (this.main as any).playerMapByName;
 			if (pmap && pmap[player] !== undefined) {
@@ -8057,6 +8041,22 @@ export class NetSync {
 					// ROUND 83: the player moved to another sub-map — their relayed state is
 					// off-map, so also clear any stale name tag that a missed leave event
 					// would otherwise leave floating.
+					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
+					return;
+				}
+				knownOnMap = true;
+			}
+		} catch (_) { /* ignore */ }
+		try {
+			const onMap: any = (this.main as any).playersOnThisMap;
+			if (onMap && !onMap[player] && !knownOnMap) {
+				// ROUND 83: before the first roster reconcile (playersRosterReady false)
+				// an empty roster fails open so unknown members can self-heal. Once the
+				// roster is settled, absence from playersOnThisMap is authoritative —
+				// even for an empty room — so a departed/fading mirror can never be
+				// resurrected by a stale playerState.
+				const ready = !!(this.main as any).playersRosterReady;
+				if (ready || Object.keys(onMap).length > 0) {
 					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
 					return;
 				}

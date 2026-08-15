@@ -74,7 +74,15 @@ export class OnMapEnterListener {
 				// Main-city refactor: keep each member's SUB-MAP so the load-complete
 				// reconcile only mirrors the members actually on our map (a town instance
 				// spans a whole area).
-				this.main.newInstanceMembers = (result.members || []).map((mm: any) => ({ name: mm.name, map: mm.map }));
+				this.main.newInstanceMembers = (result.members || []).map((mm: any) => ({
+					name: mm.name,
+					map: mm.map,
+					// ROUND 84: keep the server's cached member position so loadingComplete
+					// can spawn already-present members without waiting for playerState.
+					pos: mm.pos && typeof mm.pos.x === 'number' && typeof mm.pos.y === 'number'
+						? { x: mm.pos.x, y: mm.pos.y, z: typeof mm.pos.z === 'number' ? mm.pos.z : 0 }
+						: undefined,
+				}));
 			}).catch(() => { /* keep current flag */ });
 		}
 	}

@@ -52,7 +52,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.12';
+export const MP_VERSION = '1.70.13';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -564,7 +564,11 @@ export class Multiplayer {
 			// ROUND 83: once the roster is settled, a record that is NOT in
 			// playersOnThisMap is stale — never safety-net-spawn it. (Fading-out
 			// mirrors keep their entity until the leave-fade timer removes them.)
-			if (this.playersRosterReady && this.playersOnThisMap && !this.playersOnThisMap[name]) {
+			// ROUND 84: a KNOWN same-map member overrides a transiently missing
+			// roster slot (later entrant vs earlier entrant race).
+			const knownHere = !!(this.playerMapByName && this.playerMapByName[name]
+				&& this.playerMapByName[name] === ((ig.game && (ig.game as any).mapName) || ''));
+			if (this.playersRosterReady && this.playersOnThisMap && !this.playersOnThisMap[name] && !knownHere) {
 				if (!player.entity) {
 					this.players[name] = undefined;
 					delete this.players[name];
@@ -593,9 +597,10 @@ export class Multiplayer {
 
 	/** Roster of the instance we most recently joined (from changeMapResponse
 	 *  `members`), round 15. Each entry now carries the member's SUB-MAP (a town
-	 *  instance spans a whole area) so the load-complete reconcile can keep only
-	 *  the members actually on our map. undefined = no changeMap for this load. */
-	public newInstanceMembers?: Array<{ name: string; map?: string }>;
+	 *  instance spans a whole area) and cached POSITION (ROUND 84: used to
+	 *  proactively spawn an already-present member's mirror when the later
+	 *  entrant's loadingComplete runs). undefined = no changeMap for this load. */
+	public newInstanceMembers?: Array<{ name: string; map?: string; pos?: { x: number; y: number; z: number } }>;
 
 	/** ROUND 82: players whose NEXT mirror spawn should fade in (door/teleport
 	 * arrivals). Independent of the players record so the flag survives the
@@ -633,11 +638,16 @@ export class Multiplayer {
 	 * changeMap listener and the per-frame safety net can use it). */
 	public spawnMirrorAt(player: string, position: Vec3): void {
 		if (!position) return;
-		// Idempotent: if this player already has a live mirror (e.g. the loadingComplete
+		// Idempotent: if this player already has a LIVE mirror (e.g. the loadingComplete
 		// flush and the per-frame safety net both fire), don't spawn a second one — the
-		// first would be orphaned as an uncontrollable ghost.
+		// first would be orphaned as an uncontrollable ghost. ROUND 84: a record still
+		// pointing at a KILLED old-map mirror must NOT block the fresh spawn.
 		const existing = this.players[player];
-		if (existing && existing.entity) return;
+		if (existing && existing.entity && !(existing.entity as any)._killed) return;
+		if (existing && existing.entity) {
+			delete this.players[player];
+			this.players[player] = undefined;
+		}
 		// Make sure the 'multiplayer' enemy type is loaded before spawning (the
 		// original mod did this via loadMpEntity() — without it the spawn can produce
 		// an invisible/broken mirror if the resource isn't resident yet).
@@ -646,10 +656,10 @@ export class Multiplayer {
 
 	/** Actually creates the mirror entity (called once the enemy type is loaded). */
 	private spawnMirrorNow(player: string, position: Vec3): void {
-		// Re-check idempotency: another path may have spawned the mirror while the
-		// enemy type was loading.
+		// Re-check idempotency: another path may have spawned a LIVE mirror while the
+		// enemy type was loading. ROUND 84: a killed old-map reference is not live.
 		const existing = this.players[player];
-		if (existing && existing.entity) return;
+		if (existing && existing.entity && !(existing.entity as any)._killed) return;
 		// ROUND 82 (door transition visuals): a map-enter record that waits for the
 		// first real playerState is marked for fade-in so the mirror materializes with
 		// a short fade instead of popping in at the destination door.

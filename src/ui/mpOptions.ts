@@ -726,12 +726,18 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                 // authoritative even when it's empty — a leaving/fading mirror's tag
                 // must not be re-added. Before the first reconcile, an empty roster
                 // still fails open so unknown members can self-heal.
-                const onMap = (m as any).playersOnThisMap;
-                if (onMap && !onMap[name] && ((m as any).playersRosterReady || Object.keys(onMap).length > 0)) continue;
-                // ROUND 83: a known sub-map that differs from ours also overrides the
-                // roster (missed enter/leave relay) so the old area's tag can't linger.
+                // ROUND 84: a known sub-map that equals ours overrides a transiently
+                // missing roster slot (the "later entrant can't see the earlier
+                // entrant" race); a known DIFFERENT sub-map always hides the tag.
+                const myMap = (ig.game ? (ig.game as any).mapName : '') as string;
                 const pmap = (m as any).playerMapByName;
-                if (pmap && pmap[name] !== undefined && pmap[name] !== (ig.game ? (ig.game as any).mapName : '')) continue;
+                let knownHere = false;
+                if (pmap && pmap[name] !== undefined) {
+                    if (pmap[name] !== myMap) continue;
+                    knownHere = true;
+                }
+                const onMap = (m as any).playersOnThisMap;
+                if (!knownHere && onMap && !onMap[name] && ((m as any).playersRosterReady || Object.keys(onMap).length > 0)) continue;
                 const pl = players[name];
                 const ent = pl && pl.entity;
                 // Round 20: hide the tag the very first frame the death flag arrives
