@@ -1,30 +1,40 @@
 import { Multiplayer } from '../multiplayer';
 
 /**
- * ROUND 95/97/98/99/101 — ITEM-USE INDICATOR (in-engine GUI).
+ * ROUND 95/97/98/99/101/102 — ITEM-USE INDICATOR (native FoodIconEntity).
  *
- * The DOM/canvas-entity attempts proved unreliable in the multiplayer-injected
- * game (the bubble never became visible for observers). This version renders
- * the EXACT single-player food/bubble sprites through ig.gui overlays — the
- * same rendering path the mod's name tags use, so it is visible wherever a name
- * tag is visible. `ig.ImageGui` draws the same two textures:
- *   food   — media/entity/player/item-hold.png  (tile from sc.FOOD_SPRITE)
- *   bubble — media/entity/map-gui/hit-numbers.png (src 0,288)
- * A persistent ig.GuiElementBase per pop is projected every frame via the
- * translate/zoom-aware getScreenFromMapPos, with HOLD -> BUBBLE -> DONE timing.
+ * The previous versions all fired too late or drove the visual manually. This
+ * version hooks ig.ENTITY.Player.prototype.useItem — the START of the native
+ * consume action (before SHOW_FOOD_ICON runs on the EATING client) — and emits
+ * `itemUse` immediately. Every observing client then spawns the OFFICIAL
+ * sc.FoodIconEntity attached to that player's mirror. Its own deferredUpdate
+ * follows the mirror's coll and its own timer/updateSprites produce the native
+ * grow-in animation, so the icon moves fluidly with the remote player's eating
+ * action instead of popping in after it ends.
+ *
+ * BUBBLE/DONE timing is driven by the mirror's actual animation stream:
+ *   - HOLD while the eater enters itemFetch/itemHold
+ *   - BUBBLE when the mirror reaches itemEatFast / itemEatSlow / itemEatFastest
+ *   - DONE when the mirror reaches itemEffect
+ * Wall-clock fallbacks (700ms / 1200ms) cover any missed animation edge.
+ *
+ * The one multiplayer-specific patch: for REMOTE icons we replace the spawned
+ * FoodIconEntity's own `onActionEndDetach` with a no-op. The mirror's
+ * `setAction` (used by the network animation sync) calls clearActionAttached(),
+ * which would otherwise kill the food icon as soon as the next animation sync
+ * arrived. Its self-cleanup at DONE is untouched (deferredUpdate calls kill()
+ * directly), so no leak.
  */
 
 let getMain: () => Multiplayer | undefined = () => undefined;
 
-interface IPop {
+interface ILiveIcon {
     player: string;
-    root: any;      // ig.GuiElementBase
-    food: any;      // ig.ImageGui (food sprite)
-    bubble: any;    // ig.ImageGui (speech bubble)
-    coll: any;      // target mirror's coll
-    until: number;
-    bubbleAt: number;
-    doneAt: number;
+    fx: any;          // spawned sc.FoodIconEntity
+    spawnedAt: number;
+    bubbleFallbackAt: number;
+    doneFallbackAt: number;
+    killAt: number;
 }
 
 interface IPending {
@@ -34,18 +44,15 @@ interface IPending {
 }
 
 let installed = false;
-let live: IPop[] = [];
+let live: ILiveIcon[] = [];
 let pending: IPending[] = [];
 let lastLogAt = 0;
 
-let foodImage: any = null;
-let bubbleImage: any = null;
-
-const POP_MS = 1400;
-const BUBBLE_AT = 200;
-const DONE_AT = 850;
-
-const scratch: { x: number, y: number } = { x: 0, y: 0 };
+const EAT_ANIMS: { [anim: string]: boolean } = {
+    itemEatFast: true,
+    itemEatSlow: true,
+    itemEatFastest: true,
+};
 
 function log(msg: string): void {
     try {
@@ -55,17 +62,6 @@ function log(msg: string): void {
             console.log('[multiplayer][itemUse] ' + msg);
         }
     } catch (_) { /* ignore */ }
-}
-
-function ensureImages(): void {
-    try {
-        if (!foodImage) {
-            foodImage = new (ig as any).Image('media/entity/player/item-hold.png');
-        }
-        if (!bubbleImage) {
-            bubbleImage = new (ig as any).Image('media/entity/map-gui/hit-numbers.png');
-        }
-    } catch (_) { /* an image failure must never break the frame */ }
 }
 
 function foodNameOf(item: string | number): string {
@@ -79,151 +75,103 @@ function foodNameOf(item: string | number): string {
     return 'SANDWICH';
 }
 
-function foodTile(icon: number): { x: number, y: number } {
-    try {
-        const C: any = (sc as any).FoodIconEntity;
-        const sheet = C && C.prototype && C.prototype.foodSheet;
-        if (sheet && typeof sheet.getTileSrc === 'function') {
-            const out: any = { x: 0, y: 0 };
-            sheet.getTileSrc(out, icon);
-            if (typeof out.x === 'number' && typeof out.y === 'number') return { x: out.x, y: out.y };
-        }
-    } catch (_) { /* fall through */ }
-    return { x: 0, y: 0 };
-}
-
-function findMirrorColl(player: string): any {
+function findMirrorEntity(player: string): any {
     const main = getMain();
     if (main) {
         const p = main.players[player];
         const ent = p && p.entity;
-        if (ent && ent.coll && !ent._killed) return ent.coll;
+        if (ent && ent.coll && !ent._killed) return ent;
     }
     try {
         const g: any = (ig as any).game;
         if (g && Array.isArray(g.entities)) {
             for (const e of g.entities) {
-                if (e && !e._killed && e.coll && e._mpMirror && e.name === player) return e.coll;
+                if (e && !e._killed && e.coll && e._mpMirror && e.name === player) return e;
             }
         }
     } catch (_) { /* ignore */ }
     return null;
 }
 
-function makeImageGui(image: any, ox: number, oy: number, w: number, h: number): any {
-    try {
-        const C: any = (ig as any).ImageGui;
-        if (!C) return null;
-        const gui = new C(image, ox, oy, w, h);
-        try {
-            gui.hook.pivotOverride = true;
-            gui.hook.pivot.x = 0;
-            gui.hook.pivot.y = 0;
-        } catch (_) { /* ignore */ }
-        return gui;
-    } catch (_) {
-        return null;
-    }
-}
-
-function removePop(pop: IPop): void {
-    const idx = live.indexOf(pop);
+function killIcon(ic: ILiveIcon): void {
+    const idx = live.indexOf(ic);
     if (idx !== -1) live.splice(idx, 1);
-    try { if (pop.root && (ig as any).gui && typeof (ig as any).gui.removeGuiElement === 'function') (ig as any).gui.removeGuiElement(pop.root); } catch (_) { /* ignore */ }
+    try { if (ic.fx && !ic.fx._killed) ic.fx.kill(); } catch (_) { /* ignore */ }
 }
 
+/** Spawn the OFFICIAL FoodIconEntity attached to the remote mirror. */
 function tryShowItemUse(player: string, item: string | number): boolean {
     const main = getMain();
     if (!player || item === undefined || item === null) return true;
     if (!main || player === main.name) return true;
 
-    const coll = findMirrorColl(player);
-    if (!coll) {
-        log('no mirror coll yet for ' + player + ' — queued');
+    const ent = findMirrorEntity(player);
+    if (!ent) {
+        log('no mirror yet for ' + player + ' — queued');
         return false;
     }
 
+    const FoodIcon: any = (sc as any).FoodIconEntity;
+    if (!FoodIcon) {
+        log('sc.FoodIconEntity missing');
+        return true;
+    }
     const foodName = foodNameOf(item);
     const table: any = (sc as any).FOOD_SPRITE;
     const icon = table && typeof table[foodName] === 'number' ? table[foodName] : 0;
-    const src = foodTile(icon);
-    ensureImages();
-    if (!foodImage || !bubbleImage) {
-        log('food/bubble images unavailable');
-        return true;
-    }
 
-    // One pop per player at a time.
+    // One native food icon per player at a time.
     for (const old of live.slice()) {
-        if (old.player === player) removePop(old);
+        if (old.player === player) killIcon(old);
     }
 
-    const root: any = new (ig as any).GuiElementBase();
-    try {
-        root.hook.zIndex = 10003;
-        root.hook._visible = true;
-        root.setSize(24, 64);
-    } catch (_) { /* ignore */ }
+    const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: ent });
+    if (!fx) {
+        log('spawn failed for ' + player);
+        return false;
+    }
 
-    const food = makeImageGui(foodImage, src.x, src.y, 16, 16);
-    const bubble = makeImageGui(bubbleImage, 0, 288, 24, 32);
-    if (!food || !bubble) return true;
-
-    // Children are top-left-anchored inside the 24x64 root.
-    food.setPos(4, 32);
-    bubble.setPos(0, 32);
-    root.addChildGui(bubble);
-    root.addChildGui(food);
-    try { (ig as any).gui.addGuiElement(root); } catch (e) { log('ig.gui add failed: ' + e); return true; }
+    // Network animation sync replaces the mirror's action frequently; for a
+    // LOCAL food icon that action is the consume action itself and the icon is
+    // allowed to die with it. For this REMOTE replay, clearActionAttached must
+    // not take the icon with it — its DONE state still kills it directly.
+    try { fx.onActionEndDetach = function (): void { /* remote replay: never die on action swaps */ }; } catch (_) { /* ignore */ }
 
     const now = Date.now();
-    const pop: IPop = {
-        player,
-        root,
-        food: food as any,
-        bubble: bubble as any,
-        coll,
-        until: now + POP_MS,
-        bubbleAt: now + BUBBLE_AT,
-        doneAt: now + DONE_AT,
-    };
-    live.push(pop);
-    log('created in-game food icon for ' + player + ' item=' + item + ' sprite=' + foodName);
+    live.push({ player, fx, spawnedAt: now, bubbleFallbackAt: now + 700, doneFallbackAt: now + 1200, killAt: now + 1800 });
+    log('spawned native FoodIconEntity for ' + player + ' item=' + item + ' sprite=' + foodName);
     return true;
 }
 
-function updatePops(now: number): void {
+function updateLive(now: number): void {
     for (let i = live.length - 1; i >= 0; i--) {
-        const pop = live[i];
-        if (!pop || now >= pop.until) {
-            if (pop) removePop(pop);
+        const ic = live[i];
+        if (!ic || !ic.fx || ic.fx._killed || now >= ic.killAt) {
+            killIcon(ic);
             continue;
         }
-
-        // Project the mirror's head to screen space (same math the name tags use).
         try {
-            const c = pop.coll;
-            if (c) {
-                const cx = c.pos.x + c.size.x / 2;
-                const cy = c.pos.y - c.pos.z - c.size.z + c.size.y / 2;
-                (ig as any).system.getScreenFromMapPos(scratch, Math.round(cx), Math.round(cy));
-                pop.root.setPos(Math.round(scratch.x - 12), Math.round(scratch.y - 60));
+            const fx = ic.fx;
+            const ent = fx.combatant;
+            const states: any = (sc as any).FOOD_ICON_STATE || { HOLD: 0, BUBBLE: 1, DONE: 2 };
+            if (ent && typeof ent.currentAnim === 'string') {
+                if (fx.state === states.HOLD && EAT_ANIMS[ent.currentAnim]) {
+                    fx.setState(states.BUBBLE);
+                } else if (fx.state === states.BUBBLE && ent.currentAnim === 'itemEffect') {
+                    fx.setState(states.DONE);
+                }
             }
-        } catch (_) { /* ignore */ }
-
-        try {
-            const showBubble = now >= pop.bubbleAt && now < pop.doneAt;
-            pop.bubble.hook._visible = showBubble;
-            pop.food.hook._visible = now < pop.doneAt;
-            // Native BUBBLE layout puts the food higher than the talking bubble.
-            pop.food.setPos(4, showBubble ? 0 : 32);
-            pop.bubble.setPos(0, 32);
+            // Wall-clock fallbacks for missed animation edges.
+            if (fx.state === states.HOLD && now >= ic.bubbleFallbackAt) {
+                fx.setState(states.BUBBLE);
+            } else if (fx.state === states.BUBBLE && now >= ic.doneFallbackAt) {
+                fx.setState(states.DONE);
+            }
         } catch (_) { /* ignore */ }
     }
 }
 
-/** A remote player used an item — pop the single-player food icon above their
- * head. Queues the spawn briefly when the mirror isn't there yet. */
+/** A remote player STARTED the consume action — pop their native food icon. */
 export function showItemUse(player: string, item: string | number): void {
     try {
         if (!tryShowItemUse(player, item)) {
@@ -234,15 +182,16 @@ export function showItemUse(player: string, item: string | number): void {
 
 /** Drop every live indicator + pending spawn (logout / server loss / map cleanup). */
 export function clearItemUseIndicators(): void {
-    for (const pop of live.slice()) removePop(pop);
+    for (const ic of live.slice()) killIcon(ic);
     live = [];
     pending = [];
 }
 
 /**
- * Install once per process: wraps sc.PlayerModel.useItem so a SUCCESSFUL local
- * item use is announced to the instance, and runs a per-frame pump that keeps
- * the in-game GUI icons glued to the remote player's head.
+ * Install once per process. We hook the START of the item-use action
+ * (ig.ENTITY.Player.prototype.useItem — the quick-menu / menu entry point)
+ * instead of the END (PlayerModel.useItem fires after the consume animation),
+ * which was why the previous builds popped the icon after eating finished.
  */
 export function installItemUseIndicators(gm: () => Multiplayer | undefined): void {
     getMain = gm;
@@ -250,29 +199,26 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
     installed = true;
 
     try {
-        const PM: any = (sc as any).PlayerModel;
-        if (PM && PM.prototype && typeof PM.prototype.useItem === 'function' && !PM.prototype._mpItemUseWrapped) {
-            PM.prototype._mpItemUseWrapped = true;
-            const orig = PM.prototype.useItem;
-            PM.prototype.useItem = function (this: any, id: number): boolean {
-                const ok = orig.apply(this, arguments);
+        const P: any = (ig as any).ENTITY && (ig as any).ENTITY.Player;
+        if (P && P.prototype && typeof P.prototype.useItem === 'function' && !P.prototype._mpUseItemWrapped) {
+            P.prototype._mpUseItemWrapped = true;
+            const orig = P.prototype.useItem;
+            P.prototype.useItem = function (this: any, itemId: any): void {
                 try {
-                    if (ok) {
+                    if (this === (ig as any).game.playerEntity) {
                         const m = getMain();
                         const conn = m && m.connection;
                         if (conn && typeof conn.isOpen === 'function' && conn.isOpen()
                             && typeof conn.itemUse === 'function') {
-                            conn.itemUse(id);
-                            log('emitted itemUse for local item ' + id);
-                        } else {
-                            log('itemUse NOT emitted (conn missing/closed/method absent)');
+                            conn.itemUse(itemId);
+                            log('emitted itemUse (action start) for local item ' + itemId);
                         }
                     }
                 } catch (_) { /* a sync failure must never break item use */ }
-                return ok;
+                return orig.apply(this, arguments as any);
             };
         }
-    } catch (_) { /* the hook must never break the model */ }
+    } catch (_) { /* the hook must never break the player */ }
 
     try {
         const s: any = (window as any).simplify;
@@ -283,7 +229,7 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
                     const p = pending[i];
                     if (now >= p.until || tryShowItemUse(p.player, p.item)) pending.splice(i, 1);
                 }
-                updatePops(now);
+                updateLive(now);
             });
         }
     } catch (_) { /* ignore */ }
