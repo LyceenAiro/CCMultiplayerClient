@@ -205,6 +205,11 @@ export class NetSync {
 	 * stale "already applied" entry and leave a mid-cutscene respawn at full alpha).
 	 * Reset on map change / disconnect / cutscene end. */
 	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number, status?: boolean }> = new Map();
+	/** ROUND 85 (door stuck fix): doors whose ignoreCollision we set for a remote
+	 * mirror walk. The per-frame pump restores the previous collision-ignore state
+	 * after a FIXED wall-clock grace — never after openTimer, which a body standing
+	 * in the doorway can pin at 1 indefinitely. */
+	private _mpDoorIgnoreRestores: Array<{ door: any, prev: boolean, until: number }> = [];
 	// ---- round 26: member-side local monster-hit detection (REMOVED in round 27) ----
 	// The round-26 purely-local collision-gated monster-hit model (_mpPendingAtk /
 	// _mpLastLocalHit / _mpLocalHitActive) is GONE: the host is now the single
@@ -4932,6 +4937,8 @@ export class NetSync {
 				// Round 19 (Part 3): a map change voids every cutscene puppet (they
 				// belong to the map we just left) + cached mirror fade state.
 				this.clearCsPuppets();
+				// ROUND 85: any door-ignore grace belongs to the old map's doors.
+				this._mpDoorIgnoreRestores = [];
 				// Round 62: a map change voids every visual projectile copy (they belong
 				// to the map we just left).
 				this.clearProjectiles();
@@ -5001,6 +5008,8 @@ export class NetSync {
 					this.reapStaleProjectiles();
 				}
 			}
+			// ROUND 85: restore remote door ignoreCollision flags whose grace expired.
+			this._mpUpdateDoorIgnores();
 			// Round 19 (Part 2): the single per-frame fade + collision pass for remote
 			// mirrors (cutscene fade, both directions + shared-town IGNORE).
 			this.updateRemoteMirrorFade();
@@ -6829,21 +6838,47 @@ export class NetSync {
 			}
 			if (!best || bestDist > 96 * 96) return;
 			try {
-				const prevIgnore = !!best.coll.ignoreCollision;
+				// ROUND 85 (door stuck fix): the door MUST pass remote mirrors while it
+				// is open, so set ignoreCollision temporarily. Restoring it must NOT depend
+				// on openTimer: a player standing in the doorway keeps getOverlappingEntities
+				// non-empty, which pins openTimer at 1 forever, and the old conditional
+				// restore then never fired — leaving ignoreCollision=true permanently and
+				// making the door unresponsive for everyone until the map reloaded. The
+				// per-frame pump (_mpUpdateDoorIgnores) now restores it after a fixed
+				// wall-clock grace; later remote opens extend the deadline.
+				let entry: any = null;
+				for (const r of this._mpDoorIgnoreRestores) {
+					if (r.door === best) { entry = r; break; }
+				}
+				const now = Date.now();
+				if (!entry) {
+					entry = { door: best, prev: !!best.coll.ignoreCollision, until: now + 2000 };
+					this._mpDoorIgnoreRestores.push(entry);
+				}
+				entry.until = Math.max(entry.until, now + 2000);
 				best.coll.ignoreCollision = true;
 				// open(false) plays the sound at the door (spatial) and auto-closes after
 				// the same preWait window the owner's door uses.
 				best.open(false);
-				const holdMs = Math.max(1200, ((best.doorType && best.doorType.preWait) || 0) * 1000 + 1200);
-				setTimeout(() => {
-					try {
-						// Only restore when nobody is currently mid-transition on this door
-						// (the local player may have used the same door in the meantime).
-						if (best && best.coll && !best._killed && !best.openTimer) best.coll.ignoreCollision = prevIgnore;
-					} catch (_) { /* ignore */ }
-				}, holdMs);
 			} catch (_) { /* ignore */ }
 		} catch (_) { /* cosmetic — never break the frame */ }
+	}
+
+	/** ROUND 85: restore door collision-ignore flags after their fixed grace. Runs
+	 * every frame from tick() — deliberately wall-clock based, NOT openTimer based,
+	 * because a body in the doorway can hold openTimer at 1 indefinitely. */
+	private _mpUpdateDoorIgnores(): void {
+		try {
+			if (!this._mpDoorIgnoreRestores.length) return;
+			const now = Date.now();
+			for (let i = this._mpDoorIgnoreRestores.length - 1; i >= 0; i--) {
+				const r = this._mpDoorIgnoreRestores[i];
+				const alive = !!(r.door && !r.door._killed && r.door.coll);
+				if (alive && now < r.until) continue;
+				if (alive) r.door.coll.ignoreCollision = r.prev;
+				this._mpDoorIgnoreRestores.splice(i, 1);
+			}
+		} catch (_) { /* cosmetic */ }
 	}
 
 	/** Round 19 (Part 2): drop cached per-mirror fade/collision state (map change /
