@@ -9,6 +9,17 @@ export class OnTeleportListener {
 	 * watchdog exists to clean up). */
 	private _teleportGen = 0;
 
+	/** ROUND 100 (teleport recovery rework): the 15s watchdog no longer trusts a
+	 * fixed timer alone — it only fires when the loader/map-request made NO
+	 * progress for the whole window (same pending signature). The first recovery
+	 * re-attempts the SAME map the player was already entering instead of yanking
+	 * them to Rhombus Square; only a second consecutive no-progress wedge on the
+	 * same map escalates to Rhombus Square. */
+	private _lastProgressSig = '';
+	private _lastProgressAt = 0;
+	private _recoveredMap = '';
+	private _sameMapRecoveries = 0;
+
 	constructor(
         private main: Multiplayer,
 	) { }
@@ -76,39 +87,81 @@ export class OnTeleportListener {
 					const mdl: any = (sc as any).model;
 					const held = !!(g.paused
 						|| (mdl && ((mdl.isMenu && mdl.isMenu()) || (mdl.isPaused && mdl.isPaused()))));
-					if (!held) stuckTimer += ig.system.tick;
-					if (stuckTimer > 15) {
-						stuckTimer = 0;
-						instance.recoverFromStuckTeleport();
+					if (!held) {
+						// ROUND 100: only count time during which the pending work made
+						// NO progress. A loader with 68 still-pending files that is slowly
+						// draining (or a map request that is still in flight) is a slow
+						// load — not a wedge — and must not be force-booted mid-load.
+						const sig = instance.teleportProgressSig();
+						if (sig !== instance._lastProgressSig) {
+							instance._lastProgressSig = sig;
+							instance._lastProgressAt = Date.now();
+						}
+						if (Date.now() - instance._lastProgressAt > 15000) {
+							instance._lastProgressSig = '';
+							instance._lastProgressAt = Date.now();
+							instance.recoverFromStuckTeleport();
+						}
 					}
 				} else {
 					stuckTimer = 0;
+					instance._lastProgressSig = '';
+					instance._lastProgressAt = 0;
 				}
 			} catch (e) { stuckTimer = 0; }
 		});
 	}
 
-	/** Force-clear a wedged teleport and send the player to a safe town. */
+	/** A single concise signature of the current teleport's pending work:
+	 * loader object -> {map, loadIndex, unloaded, ig.loading}; map-request
+	 * string -> {map, currentLoadingResource, ig.loading}. */
+	private teleportProgressSig(): string {
+		try {
+			const g: any = ig.game;
+			const res: any = g.currentLoadingResource;
+			if (res && typeof res === 'object') {
+				return g.mapName + '|L|' + res._loadIndex + '|' + (res._unloaded ? res._unloaded.length : -1) + '|' + ((ig as any).loading ? 1 : 0);
+			}
+			return g.mapName + '|R|' + String(res) + '|' + ((ig as any).loading ? 1 : 0);
+		} catch (_) {
+			return 'unknown|' + Date.now(); // never poison the progress latch
+		}
+	}
+
+	/** Force-clear a wedged teleport. FIRST re-attempt the SAME map (a transient
+	 * wedge often recovers immediately once the loader is unstuck); only a second
+	 * consecutive no-progress wedge on that same map escalates to Rhombus Square. */
 	private recoverFromStuckTeleport(): void {
 		try {
-			console.warn('[multiplayer] teleport stuck >15s; forcing recovery to Rhombus Square');
-			this.dumpLoaderState();
-			// Engine-verified wedge: a resource requested during loadLevel whose onload
-			// throws never finishes -> the map Loader's `_unloaded` never drains ->
-			// `ig.loading` stays true -> ig.Game.update is gated -> the teleport never
-			// completes AND no follow-up teleport's levelData is ever consumed. Unstick the
-			// loader FIRST (force its end() so ig.loading flips false), or the recovery
-			// teleport below would just queue its levelData behind the same stuck flag.
-			this.forceUnstickLoader();
 			const g: any = ig.game;
+			const target = (typeof g.mapName === 'string' && g.mapName) ? g.mapName : 'rhombus-sqr.central';
+			if (target === this._recoveredMap) this._sameMapRecoveries++;
+			else { this._recoveredMap = target; this._sameMapRecoveries = 1; }
+
+			console.warn('[multiplayer] teleport made no progress for 15s; map=' + target
+				+ ' sameMapRecoveries=' + this._sameMapRecoveries);
+			this.dumpLoaderState();
+			this.forceUnstickLoader();
+
+			const savedPosition = g.teleporting ? g.teleporting.position : null;
 			if (g.teleporting) {
 				g.teleporting.active = false;
 				g.teleporting.timer = 0;
 				g.teleporting.levelData = null;
 			}
 			ig.interact && (ig.interact as any).setBlockDelay && (ig.interact as any).setBlockDelay(0.1);
-			// A clean landmark teleport to a shared town re-boots the map pipeline.
-			g.teleport('rhombus-sqr.central');
+
+			if (this._sameMapRecoveries >= 2) {
+				console.warn('[multiplayer] second consecutive wedge on ' + target + '; falling back to Rhombus Square');
+				this._recoveredMap = '';
+				this._sameMapRecoveries = 0;
+				g.teleport('rhombus-sqr.central');
+				return;
+			}
+
+			// Retry the SAME landmark/position the player was already heading to.
+			console.warn('[multiplayer] retrying the same teleport target: ' + target);
+			g.teleport(target, savedPosition || null);
 		} catch (e) {
 			console.error('[multiplayer] teleport recovery failed', e);
 		}

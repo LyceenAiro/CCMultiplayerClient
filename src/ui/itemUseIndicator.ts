@@ -62,7 +62,7 @@ function ensureStyle(): void {
 .mpFoodIconPop {
     position: fixed; left: 0; top: 0;
     width: 24px; height: 48px;
-    z-index: 1200; pointer-events: none;
+    z-index: 10003; pointer-events: none;
     will-change: transform, opacity;
 }
 .mpFoodIconBubble {
