@@ -5,6 +5,7 @@ import { installMpOptionsTab, startNameTagLoop, startNetHudLoop } from './ui/mpO
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
 import { installChatBox } from './ui/chatBox';
+import { installVersionDisplay } from './ui/versionDisplay';
 
 /**
  * CCLoader v2 entry point.
@@ -74,6 +75,10 @@ async function startMultiplayer(): Promise<void> {
 		// Round 23 wave 5: network-quality diamond badges on the party-HUD portraits
 		// and the element-mode indicator, with hover tooltips (ping/loss, name+level).
 		installNetBadge(() => multiplayer);
+
+		// ROUND 79 (feature): "MP v{version}" line under the version/CCLoader text on
+		// the title screen and the pause screen.
+		installVersionDisplay();
 
 		multiplayer = new Multiplayer();
 

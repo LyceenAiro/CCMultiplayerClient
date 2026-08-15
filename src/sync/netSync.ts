@@ -836,12 +836,12 @@ export class NetSync {
 		//       then layered the correct guard sound on top in recomputeHostMonsterHit ->
 		//       two sounds at once. Here we detect the husk's plain-hit showHitEffect and
 		//       drop the NATIVE call (recompute still plays the single correct guard sound).
-		//   (3) Member REGULAR-guard double audio on the member. The host (item-2 PERFECT
-		//       fix) now mirrors the member's real guard FX on the husk via showHitEffect,
-		//       which would ALSO relay a hit-block playerSound to the guarding member —
-		//       stacking on the member's own applyCombatHit REGULAR sound. We suppress the
-		//       husk->owner relay for guard results (the member already plays its own
-		//       verdict sound); the same husk guard FX still relays to a THIRD spectator.
+		//   (3) ROUND 79: single-source guard audio. The husk's guard FX (host side) is
+		//       now VISUAL-ONLY (silent native call, NO relay) — the guarding member's own
+		//       client relays the one authoritative hit-block/counter-echo stamped with the
+		//       member's name, which the host + every spectator replay positionally at the
+		//       member's mirror. This kills the host-side double (husk-native + member relay)
+		//       and the 3rd-spectator duplicate pair (host relay + member relay).
 		// The hook is UNCONDITIONAL (host + member) so the member's own native guard also
 		// relays; a member has no _mpMirror husks, so the suppression branches are inert
 		// there. Replays set _mpReplayingFx, so our own replayed showHitEffect never
@@ -906,6 +906,22 @@ export class NetSync {
 							try {
 								const ovr: any = nsHook && nsHook._mpHitNumPosOverride;
 								if (ovr && typeof ovr.x === 'number') { a = ovr; ovrApplied = true; }
+							} catch (_) { /* ignore */ }
+							// ROUND 79 (hit-number style): the host's mirror-husk number spawns with the
+							// ENGINE's own judgment (q=NONE - the husk's dynamic shield is forced inactive
+							// - plus the husk's crit roll), so a member's GUARDED hit always showed the
+							// PLAIN style on the host instead of the silver shield / P the member sees.
+							// recomputeHostMonsterHit stashes its authoritative verdict style on the mirror
+							// before the engine's number tail runs; apply it here (dmg + shield result +
+							// the host-side crit roll) and consume the stash.
+							try {
+								const st: any = b && (b as any)._mpHitNumStyle;
+								if (st) {
+									if (typeof st.dmg === 'number') c = st.dmg;
+									if (typeof st.shield === 'number') f = st.shield;
+									g = !!st.crit;
+									(b as any)._mpHitNumStyle = undefined;
+								}
 							} catch (_) { /* ignore */ }
 							try {
 								const ns = nsHook;
@@ -2775,6 +2791,19 @@ export class NetSync {
 			// Any failure: forward the engine's own number (fail-open toward damage).
 			finalDamage = engineDamage; perfect = false; regular = false;
 		}
+		// ROUND 79 (hit-number style): the engine spawns the husk's damage number AFTER
+		// this hook returns, with the HUSK's own shield judgment (always NONE - the dynamic
+		// shield is forced inactive) and the husk's crit roll. Stash OUR authoritative
+		// verdict style on the mirror; the spawnHitNumber wrap applies it (and consumes it)
+		// so the host's screen shows the SAME styled number the member sees: silver-shield
+		// GUARD / P for guards, the host-side crit roll's color, and the real chip value.
+		try {
+			(mirror as any)._mpHitNumStyle = {
+				dmg: finalDamage,
+				shield: perfect ? 2 : (regular ? 1 : 0),
+				crit: crit,
+			};
+		} catch (_) { /* ignore */ }
 		// A PERFECT block deals 0 — still forward it (perfect:true) so the member plays
 		// the perfect-guard FX + counter window even though no HP is lost.
 		// ROUND 33 (item 1c): a REGULAR guard that fully absorbs the hit (chip computed to
@@ -3108,7 +3137,8 @@ export class NetSync {
 	}
 
 	private onShowHitEffect(origShowHit: any, self: any, target: any, pos: any, type: any, element: any, shieldResult: any, critical: any, a7: any, a8: any): any {
-		const D = (t: string, ...a: any[]) => { try { this._sfxLog('she.' + t, ...a); } catch (_) { /* ignore */ } };
+		// ROUND 79: raw (never-collapsed) so a capture of ONE guarded hit shows every call.
+		const D = (t: string, ...a: any[]) => { try { this._sfxLogRaw('she.' + t, ...a); } catch (_) { /* ignore */ } };
 		const SHIELD_NONE = 0, SHIELD_REGULAR = 1, SHIELD_PERFECT = 2;
 		const isGuardResult = (shieldResult === SHIELD_REGULAR || shieldResult === SHIELD_PERFECT);
 		const isPlayer = (a: any): boolean => {
@@ -3119,25 +3149,27 @@ export class NetSync {
 		D('fire', this._paeDescribe(null, target), 'type=' + type, 'shield=' + shieldResult, 'crit=' + (critical === true), 'silent=' + (a7 === true));
 		// (2)+(3): a member's mirror husk. `none` = the engine judged the husk's plain hit
 		// (forced-inactive shield) — suppress the NATIVE sound so only recompute's single
-		// correct guard sound plays on the host. `guard` = the host's mirrored verdict FX —
-		// run it natively (host must see the correct guard FX) but suppress relaying its
-		// sound back to the guarding member (they already play their own verdict sound).
+		// correct guard sound plays on the host. `guard` = the host's mirrored verdict FX.
+		// ROUND 79 (guard-sound dedupe): for a GUARD result the husk FX stays VISUAL-ONLY —
+		// silent native call, NO relay. The guarding member's own client is the single sound
+		// authority: applyCombatHit plays the hit-block/counter-echo natively and its
+		// showHitEffect wrap relays ONE playerSound stamped with the member's name, which the
+		// host + every spectator replay positionally at the member's mirror. The old behavior
+		// stacked hit-block TWICE on the host (husk-native + the member's relay) and sent a
+		// duplicate pair to any 3rd spectator (host's husk relay + member's relay) — the exact
+		// "two guard sounds" report.
 		if (target && target._mpMirror) {
 			if (shieldResult === SHIELD_NONE) return undefined;
-			if (isGuardResult && !this._mpReplayingFx) {
-				// ROUND 43 (Gap B, the mirror-husk guard double): applyCombatHit's spectator
-				// fall-through now ALSO replays the plain monster-hit FX on the victim's mirror
-				// under _mpReplayingFx (that suppression keeps it out of here), so this guard
-				// still only relays the HOST's own mirrored verdict FX — never the spectator
-				// replay. (The spectator branch itself suppresses _mpMirror guard shows, so
-				// only plain mirror-husk hits ever reach this replay.)
-				try { this.emitPlayerGuardSound(target.name, shieldResult, element); } catch (_) { /* ignore */ }
+			if (isGuardResult) {
+				// true = the engine's noSound flag: spawn the guard spark on the husk, skip the sound.
+				return origShowHit.call(self, target, pos, type, element, shieldResult, critical, true, a8);
 			}
 			return origShowHit.call(self, target, pos, type, element, shieldResult, critical, a7, a8);
 		}
 		// (1): the LOCAL player's own guard (host or member). Native plays the sound for us;
-		// relay it so the rest of the instance hears it too. Only the mirror-husk branch
-		// above emits for a REMOTE player's guard (their own client relays their native one).
+		// relay it (stamped with our name) so the rest of the instance hears it positionally
+		// at our mirror. The mirror-husk branch above is now silent + relay-free, so this
+		// single relay is the ONLY guard-sound source for a guarding player's event.
 		if (!this._mpReplayingFx && isGuardResult && isPlayer(target)) {
 			try { this.emitPlayerGuardSound(null, shieldResult, element); } catch (_) { /* ignore */ }
 		}
@@ -4193,6 +4225,7 @@ export class NetSync {
 						'dmg=' + dmg,
 						'bar=' + (typeof hit.shieldDmg === 'number' ? hit.shieldDmg : -1),
 						'full=' + (typeof hit.full === 'number' ? hit.full : -1),
+						'crit=' + (hit.critical ? 1 : 0),
 						'perfect=' + (perfect ? 1 : 0), 'regular=' + (regular ? 1 : 0),
 						'def=' + defC, 'gm=' + gmC, 'df=' + dfC, 'ef=' + efC, 'fc=' + fcC,
 						'guard=' + (typeof p.currentAnim === 'string' && p.currentAnim === 'guard' ? 1 : 0));
@@ -4223,6 +4256,7 @@ export class NetSync {
 							atkType, hit.element || 0, 2 /* SHIELD_RESULT.PERFECT */, false);
 					}
 				} catch (_) { /* ignore */ }
+				try { this._sfxLogRaw('ch.snd', 'perfect'); } catch (_) { /* diagnostic only */ }
 				// ROUND 31 (item 1a): a perfect guard must ALSO show the "P" number, exactly
 				// like the host's native perfect guard. The old code returned after only the
 				// FX, so no number ever appeared. The engine's spawnHitNumber renders
@@ -4263,6 +4297,7 @@ export class NetSync {
 					p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
 					try {
 						const scAny: any = sc as any;
+						try { this._sfxLogRaw('ch.snd', 'regular', 'dmg=' + dmg, 'crit=' + (hit.critical ? 1 : 0)); } catch (_) { /* diagnostic only */ }
 						if (scAny.combat && typeof scAny.combat.showHitEffect === 'function' && p.coll) {
 							const s = p.coll.size || { x: 0, y: 0, z: 0 };
 							scAny.combat.showHitEffect(p,
@@ -4566,7 +4601,8 @@ export class NetSync {
 		try {
 			const D = (t: string, ...a: any[]) => { try { this._sfxLog('ap.' + t, ...a); } catch (_) { /* ignore */ } };
 			if (!s || typeof s.player !== 'string' || !s.player) { D('badpkt'); return; }
-			D('recv', s.path, 'from=' + s.player, 'loop=' + (s.loop === true));
+			// ROUND 79: raw so every guard-sound packet is visible in one capture.
+			this._sfxLogRaw('ap.recv', s.path, 'from=' + s.player, 'loop=' + (s.loop === true));
 			if (s.player === this.main.name) { D('self'); return; }              // never replay our own sound back
 			if (typeof s.path !== 'string' || !s.path) { D('nopath'); return; }
 			if (this.inCutscene) { D('cutscene'); return; }

@@ -21,6 +21,33 @@ const DEFAULT_PORT = 15151;
 
 interface IProbeResult { ok: boolean; pingMs: number; }
 
+/** ROUND 79 (feature): probe a server's mod version via its /version endpoint
+ * (the SAME config.version the login handshake reports). Returns '' when the
+ * endpoint is missing / times out (an older server without the route). */
+function probeVersion(server: IServer): Promise<string> {
+	return new Promise((resolve) => {
+		const url = server.type + '://' + server.hostname + ':' + server.port + '/version?_=' + Date.now();
+		let settled = false;
+		const timer = setTimeout(() => { if (!settled) { settled = true; resolve(''); } }, PROBE_TIMEOUT_MS);
+		const done = (v: string): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(v);
+		};
+		try {
+			$.ajax({
+				url,
+				dataType: 'json',
+				timeout: PROBE_TIMEOUT_MS,
+				cache: false,
+				success: (data: any) => done((data && typeof data.version === 'string' && data.version) ? data.version : ''),
+				error: () => done(''),
+			});
+		} catch (_) { done(''); }
+	});
+}
+
 function serverName(server: IServer): string {
 	return (server.display && server.display.trim()) ? server.display.trim() : server.hostname;
 }
@@ -146,6 +173,8 @@ function ensureStyle(): void {
 .mpServerMeta { flex: 1 1 auto; min-width: 0; }
 .mpServerName { font-size: 14px; color: #eaf7ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mpServerAddr { font-size: 11px; color: #8fd6ff; margin-top: 3px; }
+/* ROUND 79 (feature): the server's mod version, probed via /version. */
+.mpServerVer { font-size: 11px; color: #b9c9d8; margin-top: 2px; }
 .mpServerStatus { flex: 0 0 auto; font-size: 12px; color: #8fd6ff; margin-left: 14px; }
 .mpServerStatus.online { color: #a9f7c0; }
 .mpServerStatus.offline { color: #ff9d9d; }
@@ -286,6 +315,8 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 				const meta = $('<div class="mpServerMeta"></div>');
 				meta.append($('<div class="mpServerName"></div>').text(serverName(server)));
 				meta.append($('<div class="mpServerAddr"></div>').text(serverAddress(server)));
+				// ROUND 79 (feature): version line - filled once the /version probe answers.
+				meta.append($('<div class="mpServerVer"></div>'));
 				row.append(meta);
 				row.append($('<div class="mpServerStatus checking"></div>').text(t('serverChecking')));
 				// Selecting a row only moves the highlight — it must NOT rebuild the list
@@ -302,10 +333,19 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 			const seq = probeSeq;
 			body.find('.mpServerDot').attr('class', 'mpServerDot checking');
 			body.find('.mpServerStatus').attr('class', 'mpServerStatus checking').text(t('serverChecking'));
+			body.find('.mpServerVer').text('');
 			config.servers.forEach((server, i) => {
 				probeServer(server).then((r) => {
 					if (seq !== probeSeq || settled) return;
 					applyStatus(i, r);
+				});
+				// ROUND 79 (feature): the version arrives independently of the socket.io
+				// script probe - fill the card's version line whenever it lands.
+				probeVersion(server).then((v) => {
+					if (seq !== probeSeq || settled) return;
+					const row = body.children('.mpServerRow').eq(i);
+					if (!row.length) return;
+					row.find('.mpServerVer').text(v ? 'MP v' + v : '');
 				});
 			});
 		};
