@@ -1,27 +1,27 @@
 import { Multiplayer } from '../multiplayer';
 
 /**
- * ROUND 95/97/98/99 — ITEM-USE INDICATOR (DOM overlay).
+ * ROUND 95/97/98/99/101 — ITEM-USE INDICATOR (in-engine GUI).
  *
- * When the LOCAL player uses a consumable we emit `itemUse`; every other client
- * shows the single-player "吃东西" visual above that player's head. The native
- * sc.FoodIconEntity proved unreliable inside the heavily-injected multiplayer
- * entity pipeline (it spawned, but its sprite scale/timer/render path never made
- * it visible). This module now draws the EXACT SAME two textures as a DOM
- * overlay — the food sprite sheet (`media/entity/player/item-hold.png`) and the
- * bubble sprite (`media/entity/map-gui/hit-numbers.png`, src 0,288) — positioned
- * every frame via the same map->screen projection the name tags use. HOLD ->
- * BUBBLE -> DONE timing mirrors the native consume action.
+ * The DOM/canvas-entity attempts proved unreliable in the multiplayer-injected
+ * game (the bubble never became visible for observers). This version renders
+ * the EXACT single-player food/bubble sprites through ig.gui overlays — the
+ * same rendering path the mod's name tags use, so it is visible wherever a name
+ * tag is visible. `ig.ImageGui` draws the same two textures:
+ *   food   — media/entity/player/item-hold.png  (tile from sc.FOOD_SPRITE)
+ *   bubble — media/entity/map-gui/hit-numbers.png (src 0,288)
+ * A persistent ig.GuiElementBase per pop is projected every frame via the
+ * translate/zoom-aware getScreenFromMapPos, with HOLD -> BUBBLE -> DONE timing.
  */
 
 let getMain: () => Multiplayer | undefined = () => undefined;
 
 interface IPop {
     player: string;
-    root: HTMLElement;
-    food: HTMLElement;
-    bubble: HTMLElement;
-    coll: any;          // target mirror's coll
+    root: any;      // ig.GuiElementBase
+    food: any;      // ig.ImageGui (food sprite)
+    bubble: any;    // ig.ImageGui (speech bubble)
+    coll: any;      // target mirror's coll
     until: number;
     bubbleAt: number;
     doneAt: number;
@@ -38,9 +38,12 @@ let live: IPop[] = [];
 let pending: IPending[] = [];
 let lastLogAt = 0;
 
-const POP_MS = 1400;    // total lifetime
-const BUBBLE_AT = 200;  // bubble pops in after 200ms
-const DONE_AT = 850;    // icon shrinks/fades out from 850ms
+let foodImage: any = null;
+let bubbleImage: any = null;
+
+const POP_MS = 1400;
+const BUBBLE_AT = 200;
+const DONE_AT = 850;
 
 const scratch: { x: number, y: number } = { x: 0, y: 0 };
 
@@ -51,51 +54,42 @@ function log(msg: string): void {
             lastLogAt = now;
             console.log('[multiplayer][itemUse] ' + msg);
         }
-    } catch (_) { /* never break from logging */ }
+    } catch (_) { /* ignore */ }
 }
 
-function ensureStyle(): void {
-    if (document.getElementById('mpFoodIconStyle')) return;
-    const style = document.createElement('style');
-    style.id = 'mpFoodIconStyle';
-    style.textContent = `
-.mpFoodIconPop {
-    position: fixed; left: 0; top: 0;
-    width: 24px; height: 48px;
-    z-index: 10003; pointer-events: none;
-    will-change: transform, opacity;
-}
-.mpFoodIconBubble {
-    position: absolute; left: 0; bottom: 0;
-    width: 24px; height: 32px;
-    background-image: url('media/entity/map-gui/hit-numbers.png');
-    background-repeat: no-repeat;
-    background-position: 0 -288px;
-    opacity: 0;
-    transform: scale(0);
-    transition: transform 0.12s ease-out, opacity 0.08s ease-out;
-}
-.mpFoodIconFood {
-    position: absolute; left: 4px; bottom: 14px;
-    width: 16px; height: 16px;
-    background-image: url('media/entity/player/item-hold.png');
-    background-repeat: no-repeat;
-    transform: scale(0);
-    transition: transform 0.12s ease-out, opacity 0.2s ease-out;
-}
-.mpFoodIconPop.show .mpFoodIconFood { transform: scale(1); }
-.mpFoodIconPop.bubble .mpFoodIconFood { bottom: 24px; }
-.mpFoodIconPop.bubble .mpFoodIconBubble { opacity: 0.8; transform: scale(1); }
-.mpFoodIconPop.done .mpFoodIconBubble { opacity: 0; transform: scale(0.6); }
-.mpFoodIconPop.done .mpFoodIconFood { opacity: 0; transform: scale(0.6); }
-`;
-    document.head.appendChild(style);
+function ensureImages(): void {
+    try {
+        if (!foodImage) {
+            foodImage = new (ig as any).Image('media/entity/player/item-hold.png');
+        }
+        if (!bubbleImage) {
+            bubbleImage = new (ig as any).Image('media/entity/map-gui/hit-numbers.png');
+        }
+    } catch (_) { /* an image failure must never break the frame */ }
 }
 
-function removePop(pop: IPop): void {
-    const idx = live.indexOf(pop);
-    if (idx !== -1) live.splice(idx, 1);
-    try { if (pop.root && pop.root.parentNode) pop.root.parentNode.removeChild(pop.root); } catch (_) { /* ignore */ }
+function foodNameOf(item: string | number): string {
+    try {
+        const inv: any = (sc as any).inventory;
+        if (inv && typeof inv.getItem === 'function') {
+            const def = inv.getItem(item);
+            return (def && def.foodSprite) || 'SANDWICH';
+        }
+    } catch (_) { /* fall through */ }
+    return 'SANDWICH';
+}
+
+function foodTile(icon: number): { x: number, y: number } {
+    try {
+        const C: any = (sc as any).FoodIconEntity;
+        const sheet = C && C.prototype && C.prototype.foodSheet;
+        if (sheet && typeof sheet.getTileSrc === 'function') {
+            const out: any = { x: 0, y: 0 };
+            sheet.getTileSrc(out, icon);
+            if (typeof out.x === 'number' && typeof out.y === 'number') return { x: out.x, y: out.y };
+        }
+    } catch (_) { /* fall through */ }
+    return { x: 0, y: 0 };
 }
 
 function findMirrorColl(player: string): any {
@@ -116,45 +110,28 @@ function findMirrorColl(player: string): any {
     return null;
 }
 
-function foodNameOf(item: string | number): string {
+function makeImageGui(image: any, ox: number, oy: number, w: number, h: number): any {
     try {
-        const inv: any = (sc as any).inventory;
-        if (inv && typeof inv.getItem === 'function') {
-            const def = inv.getItem(item);
-            return (def && def.foodSprite) || 'SANDWICH';
-        }
-    } catch (_) { /* fall through */ }
-    return 'SANDWICH';
+        const C: any = (ig as any).ImageGui;
+        if (!C) return null;
+        const gui = new C(image, ox, oy, w, h);
+        try {
+            gui.hook.pivotOverride = true;
+            gui.hook.pivot.x = 0;
+            gui.hook.pivot.y = 0;
+        } catch (_) { /* ignore */ }
+        return gui;
+    } catch (_) {
+        return null;
+    }
 }
 
-/** Returns the pixel src offset in the food sheet for the given FOOD_SPRITE icon. */
-function foodTile(icon: number): { x: number, y: number } {
-    try {
-        const C: any = (sc as any).FoodIconEntity;
-        const sheet = C && C.prototype && C.prototype.foodSheet;
-        if (sheet && typeof sheet.getTileSrc === 'function') {
-            const out: any = { x: 0, y: 0 };
-            sheet.getTileSrc(out, icon);
-            if (typeof out.x === 'number' && typeof out.y === 'number') return { x: out.x, y: out.y };
-        }
-    } catch (_) { /* fall through */ }
-    return { x: 0, y: 0 };
+function removePop(pop: IPop): void {
+    const idx = live.indexOf(pop);
+    if (idx !== -1) live.splice(idx, 1);
+    try { if (pop.root && (ig as any).gui && typeof (ig as any).gui.removeGuiElement === 'function') (ig as any).gui.removeGuiElement(pop.root); } catch (_) { /* ignore */ }
 }
 
-function positionPop(pop: IPop): void {
-    try {
-        const c = pop.coll;
-        if (!c) return;
-        const cx = c.pos.x + c.size.x / 2;
-        const cy = c.pos.y - c.pos.z - c.size.z + c.size.y / 2;
-        (ig as any).system.getScreenFromMapPos(scratch, Math.round(cx), Math.round(cy));
-        pop.root.style.left = Math.round(scratch.x - 12) + 'px';
-        pop.root.style.top = Math.round(scratch.y - 44) + 'px';
-    } catch (_) { /* ignore */ }
-}
-
-/** Spawn the DOM HOLD icon. Returns true when shown, false when the mirror isn't
- * available yet (the caller queues a short retry). */
 function tryShowItemUse(player: string, item: string | number): boolean {
     const main = getMain();
     if (!player || item === undefined || item === null) return true;
@@ -170,40 +147,48 @@ function tryShowItemUse(player: string, item: string | number): boolean {
     const table: any = (sc as any).FOOD_SPRITE;
     const icon = table && typeof table[foodName] === 'number' ? table[foodName] : 0;
     const src = foodTile(icon);
+    ensureImages();
+    if (!foodImage || !bubbleImage) {
+        log('food/bubble images unavailable');
+        return true;
+    }
 
     // One pop per player at a time.
     for (const old of live.slice()) {
         if (old.player === player) removePop(old);
     }
 
-    ensureStyle();
-    const root = document.createElement('div');
-    root.className = 'mpFoodIconPop show';
+    const root: any = new (ig as any).GuiElementBase();
+    try {
+        root.hook.zIndex = 10003;
+        root.hook._visible = true;
+        root.setSize(24, 64);
+    } catch (_) { /* ignore */ }
 
-    const bubble = document.createElement('div');
-    bubble.className = 'mpFoodIconBubble';
-    const food = document.createElement('div');
-    food.className = 'mpFoodIconFood';
-    food.style.backgroundPosition = (-src.x) + 'px ' + (-src.y) + 'px';
+    const food = makeImageGui(foodImage, src.x, src.y, 16, 16);
+    const bubble = makeImageGui(bubbleImage, 0, 288, 24, 32);
+    if (!food || !bubble) return true;
 
-    root.appendChild(bubble);
-    root.appendChild(food);
-    document.body.appendChild(root);
+    // Children are top-left-anchored inside the 24x64 root.
+    food.setPos(4, 32);
+    bubble.setPos(0, 32);
+    root.addChildGui(bubble);
+    root.addChildGui(food);
+    try { (ig as any).gui.addGuiElement(root); } catch (e) { log('ig.gui add failed: ' + e); return true; }
 
     const now = Date.now();
     const pop: IPop = {
         player,
         root,
-        food,
-        bubble,
+        food: food as any,
+        bubble: bubble as any,
         coll,
         until: now + POP_MS,
         bubbleAt: now + BUBBLE_AT,
         doneAt: now + DONE_AT,
     };
     live.push(pop);
-    positionPop(pop);
-    log('created DOM food icon for ' + player + ' item=' + item + ' sprite=' + foodName);
+    log('created in-game food icon for ' + player + ' item=' + item + ' sprite=' + foodName);
     return true;
 }
 
@@ -214,18 +199,31 @@ function updatePops(now: number): void {
             if (pop) removePop(pop);
             continue;
         }
-        if (!pop.bubble.classList.contains('bubble') && now >= pop.bubbleAt) {
-            pop.bubble.classList.add('bubble');
-        }
-        if (now >= pop.doneAt) {
-            pop.root.classList.add('done');
-        }
-        positionPop(pop);
+
+        // Project the mirror's head to screen space (same math the name tags use).
+        try {
+            const c = pop.coll;
+            if (c) {
+                const cx = c.pos.x + c.size.x / 2;
+                const cy = c.pos.y - c.pos.z - c.size.z + c.size.y / 2;
+                (ig as any).system.getScreenFromMapPos(scratch, Math.round(cx), Math.round(cy));
+                pop.root.setPos(Math.round(scratch.x - 12), Math.round(scratch.y - 60));
+            }
+        } catch (_) { /* ignore */ }
+
+        try {
+            const showBubble = now >= pop.bubbleAt && now < pop.doneAt;
+            pop.bubble.hook._visible = showBubble;
+            pop.food.hook._visible = now < pop.doneAt;
+            // Native BUBBLE layout puts the food higher than the talking bubble.
+            pop.food.setPos(4, showBubble ? 0 : 32);
+            pop.bubble.setPos(0, 32);
+        } catch (_) { /* ignore */ }
     }
 }
 
 /** A remote player used an item — pop the single-player food icon above their
- * head (DOM overlay with the SAME texture now). */
+ * head. Queues the spawn briefly when the mirror isn't there yet. */
 export function showItemUse(player: string, item: string | number): void {
     try {
         if (!tryShowItemUse(player, item)) {
@@ -243,8 +241,8 @@ export function clearItemUseIndicators(): void {
 
 /**
  * Install once per process: wraps sc.PlayerModel.useItem so a SUCCESSFUL local
- * item use is announced to the instance, and runs a tiny per-frame pump that
- * keeps the DOM icons glued to the remote player's head.
+ * item use is announced to the instance, and runs a per-frame pump that keeps
+ * the in-game GUI icons glued to the remote player's head.
  */
 export function installItemUseIndicators(gm: () => Multiplayer | undefined): void {
     getMain = gm;
@@ -281,12 +279,10 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
         if (s && typeof s.registerUpdate === 'function') {
             s.registerUpdate(() => {
                 const now = Date.now();
-
                 for (let i = pending.length - 1; i >= 0; i--) {
                     const p = pending[i];
                     if (now >= p.until || tryShowItemUse(p.player, p.item)) pending.splice(i, 1);
                 }
-
                 updatePops(now);
             });
         }
