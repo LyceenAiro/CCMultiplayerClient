@@ -46,6 +46,13 @@ const enDict: { [key: string]: string } = {
     levelLabel: 'Lv ',
     expLabel: 'EXP ',
     hpLabel: 'HP ',
+    // ROUND 90 — SHIFT quick-menu OnlinePlayer inspect stats + actions
+    atkLabel: 'ATK ',
+    defLabel: 'DEF ',
+    focLabel: 'FOC ',
+    inviteParty: 'Invite to Party',
+    kickParty: 'Kick from Party',
+    partyInviteSent: 'Invite sent',
 
     // netBadge.ts — network-quality badge tooltips
     netPingLabel: 'Ping',
@@ -223,6 +230,13 @@ const zhDict: { [key: string]: string } = {
     levelLabel: '等级 ',
     expLabel: '经验 ',
     hpLabel: 'HP ',
+    // ROUND 90 — SHIFT快捷菜单玩家查询的属性和动作
+    atkLabel: '攻击 ',
+    defLabel: '防御 ',
+    focLabel: '专注 ',
+    inviteParty: '邀请组队',
+    kickParty: '踢出队伍',
+    partyInviteSent: '已发送邀请',
 
     // netBadge.ts — network-quality badge tooltips
     netPingLabel: '延迟',
