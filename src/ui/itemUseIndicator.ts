@@ -1,7 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 
 /**
- * ROUND 95/97 — ITEM-USE INDICATOR.
+ * ROUND 95/97/98 — ITEM-USE INDICATOR.
  *
  * When the LOCAL player uses a consumable (sc.PlayerModel.useItem returns true)
  * we emit `itemUse` to the server, which relays it to every other player in the
@@ -10,9 +10,14 @@ import { Multiplayer } from '../multiplayer';
  * Receivers spawn the SAME entity the single-player item animation uses:
  * sc.FoodIconEntity (the "吃东西" icon above the player's head — HOLD -> BUBBLE
  * -> DONE pop sequence). It is a real game entity attached to the remote
- * player's mirror, so it tracks their head exactly and needs no DOM/GUI overlay
- * or per-frame projection. The item's `foodSprite` drives the icon index, with
- * the vanilla "SANDWICH" fallback — identical to sc.ItemConsumption.getAction.
+ * player's mirror, so it tracks their head exactly and needs no DOM/GUI overlay.
+ * The item's `foodSprite` drives the icon index, with the vanilla "SANDWICH"
+ * fallback — identical to sc.ItemConsumption.getAction.
+ *
+ * A small pending queue retries for 1.5s when the remote mirror hasn't been
+ * spawned yet at event time (item-come-in-while-entering race), and a throttled
+ * console log tells the session window when an indicator spawns/skips so the
+ * event path can be verified in the field.
  */
 
 let getMain: () => Multiplayer | undefined = () => undefined;
@@ -22,8 +27,16 @@ interface IIcon {
     entity: any;      // spawned sc.FoodIconEntity
 }
 
+interface IPending {
+    player: string;
+    item: string | number;
+    until: number;
+}
+
 let installed = false;
 let live: IIcon[] = [];
+let pending: IPending[] = [];
+let lastLogAt = 0;
 
 function killIcon(ic: IIcon): void {
     const idx = live.indexOf(ic);
@@ -31,69 +44,119 @@ function killIcon(ic: IIcon): void {
     try { if (ic.entity && !ic.entity._killed) ic.entity.kill(); } catch (_) { /* ignore */ }
 }
 
-/** A remote player used an item — pop the exact single-player food icon above
- * their head (replaces any icon we already show for that player). */
-export function showItemUse(player: string, item: string | number): void {
-    try {
-        if (!player || item === undefined || item === null) return;
-        const main = getMain();
-        if (!main || player === main.name) return; // our own use is already visible locally
+/** Find the live mirror entity for a remote player (main.players first, then a
+ * fallback scan over the entity list for a tagged mirror). */
+function findMirror(player: string): any {
+    const main = getMain();
+    if (main) {
         const p = main.players[player];
         const ent = p && p.entity;
-        if (!ent || !ent.coll || ent._killed) return;
-        // FoodIconEntity attaches itself to the target's action-attached list, so
-        // the target must be an actor entity (player mirrors / enemies are).
-        if (typeof ent.addActionAttached !== 'function') return;
-
-        const FoodIcon: any = (sc as any).FoodIconEntity;
-        if (!FoodIcon) return;
-
-        // Icon index comes from the item's foodSprite, exactly like the native
-        // consume action (sc.ItemConsumption.getAction).
-        let foodName = 'SANDWICH';
-        try {
-            const inv: any = (sc as any).inventory;
-            if (inv && typeof inv.getItem === 'function') {
-                const def = inv.getItem(item);
-                foodName = (def && def.foodSprite) || 'SANDWICH';
+        if (ent && ent.coll && !ent._killed) return ent;
+    }
+    try {
+        const g: any = (ig as any).game;
+        if (g && Array.isArray(g.entities)) {
+            for (const e of g.entities) {
+                if (e && !e._killed && e.coll && e._mpMirror && e.name === player) return e;
             }
-        } catch (_) { /* fall back to the default sandwich sprite */ }
-        const table: any = (sc as any).FOOD_SPRITE;
-        const icon = table && typeof table[foodName] === 'number' ? table[foodName] : 0;
-
-        // One icon per player at a time (rapid item spam replaces, never stacks).
-        for (const old of live.slice()) {
-            if (old.player === player) killIcon(old);
         }
+    } catch (_) { /* ignore */ }
+    return null;
+}
 
-        const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: ent });
-        if (!fx) return;
-        const ic: IIcon = { player, entity: fx };
-        live.push(ic);
+function log(msg: string): void {
+    try {
+        const now = Date.now();
+        if (now - lastLogAt > 1000) {
+            lastLogAt = now;
+            console.log('[multiplayer][itemUse] ' + msg);
+        }
+    } catch (_) { /* never break from logging */ }
+}
 
-        const states: any = (sc as any).FOOD_ICON_STATE || { HOLD: 0, BUBBLE: 1, DONE: 2 };
-        // Mirror the native consume action timing: hold briefly, pop into the
-        // bubble, then finish (FoodIconEntity kills itself after DONE).
-        window.setTimeout(() => {
-            try { if (fx && !fx._killed) fx.setState(states.BUBBLE); } catch (_) { /* ignore */ }
-        }, 220);
-        window.setTimeout(() => {
-            try { if (fx && !fx._killed) fx.setState(states.DONE); } catch (_) { /* ignore */ }
-        }, 900);
-        window.setTimeout(() => killIcon(ic), 1500);
+/** Spawn the FoodIconEntity above `player`'s mirror. Returns true when the
+ * indicator was spawned (or an existing one was replaced); false when the
+ * mirror/entity isn't available yet and the caller should retry shortly. */
+function tryShowItemUse(player: string, item: string | number): boolean {
+    if (!player || item === undefined || item === null) return true; // drop invalid, no retry
+    const main = getMain();
+    if (!main || player === main.name) return true; // own use is already visible locally
+
+    const ent = findMirror(player);
+    if (!ent) {
+        log('no mirror yet for ' + player + ' — queued');
+        return false;
+    }
+    // FoodIconEntity attaches itself to the target's action-attached list, so
+    // the target must be an actor entity (player mirrors / enemies are).
+    if (typeof ent.addActionAttached !== 'function') {
+        log('mirror for ' + player + ' has no addActionAttached — cannot attach food icon');
+        return true; // unrecoverable for this mirror; don't retry forever
+    }
+
+    const FoodIcon: any = (sc as any).FoodIconEntity;
+    if (!FoodIcon) {
+        log('sc.FoodIconEntity missing');
+        return true;
+    }
+
+    let foodName = 'SANDWICH';
+    try {
+        const inv: any = (sc as any).inventory;
+        if (inv && typeof inv.getItem === 'function') {
+            const def = inv.getItem(item);
+            foodName = (def && def.foodSprite) || 'SANDWICH';
+        }
+    } catch (_) { /* fall back to the default sandwich sprite */ }
+    const table: any = (sc as any).FOOD_SPRITE;
+    const icon = table && typeof table[foodName] === 'number' ? table[foodName] : 0;
+
+    // One icon per player at a time (rapid item spam replaces, never stacks).
+    for (const old of live.slice()) {
+        if (old.player === player) killIcon(old);
+    }
+
+    const fx: any = (ig as any).game.spawnEntity(FoodIcon, 0, 0, 0, { icon, combatant: ent });
+    if (!fx) {
+        log('spawn failed for ' + player);
+        return false; // retry — a null spawn is usually a one-frame fluke
+    }
+    const ic: IIcon = { player, entity: fx };
+    live.push(ic);
+    log('spawned food icon for ' + player + ' item=' + item + ' sprite=' + foodName);
+
+    const states: any = (sc as any).FOOD_ICON_STATE || { HOLD: 0, BUBBLE: 1, DONE: 2 };
+    window.setTimeout(() => {
+        try { if (fx && !fx._killed) fx.setState(states.BUBBLE); } catch (_) { /* ignore */ }
+    }, 220);
+    window.setTimeout(() => {
+        try { if (fx && !fx._killed) fx.setState(states.DONE); } catch (_) { /* ignore */ }
+    }, 900);
+    window.setTimeout(() => killIcon(ic), 1500);
+    return true;
+}
+
+/** A remote player used an item — pop the exact single-player food icon above
+ * their head. Queues the spawn briefly when the mirror isn't there yet. */
+export function showItemUse(player: string, item: string | number): void {
+    try {
+        if (!tryShowItemUse(player, item)) {
+            pending.push({ player, item, until: Date.now() + 1500 });
+        }
     } catch (_) { /* an indicator must never break the frame */ }
 }
 
-/** Drop every live indicator (logout / server loss / map cleanup). */
+/** Drop every live indicator + pending spawn (logout / server loss / map cleanup). */
 export function clearItemUseIndicators(): void {
     for (const ic of live.slice()) killIcon(ic);
     live = [];
+    pending = [];
 }
 
 /**
  * Install once per process: wraps sc.PlayerModel.useItem so a SUCCESSFUL local
- * item use is announced to the instance. The remote visual is driven entirely by
- * the spawned FoodIconEntity, so no per-frame update loop is needed here.
+ * item use is announced to the instance. Also runs a tiny per-frame pump that
+ * retries queued remote indicators until the remote mirror exists.
  */
 export function installItemUseIndicators(gm: () => Multiplayer | undefined): void {
     getMain = gm;
@@ -114,6 +177,9 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
                         if (conn && typeof conn.isOpen === 'function' && conn.isOpen()
                             && typeof conn.itemUse === 'function') {
                             conn.itemUse(id);
+                            log('emitted itemUse for local item ' + id);
+                        } else {
+                            log('itemUse NOT emitted (conn missing/closed/method absent)');
                         }
                     }
                 } catch (_) { /* a sync failure must never break item use */ }
@@ -121,4 +187,18 @@ export function installItemUseIndicators(gm: () => Multiplayer | undefined): voi
             };
         }
     } catch (_) { /* the hook must never break the model */ }
+
+    try {
+        const s: any = (window as any).simplify;
+        if (s && typeof s.registerUpdate === 'function') {
+            s.registerUpdate(() => {
+                if (!pending.length) return;
+                const now = Date.now();
+                for (let i = pending.length - 1; i >= 0; i--) {
+                    const p = pending[i];
+                    if (now >= p.until || tryShowItemUse(p.player, p.item)) pending.splice(i, 1);
+                }
+            });
+        }
+    } catch (_) { /* ignore */ }
 }
