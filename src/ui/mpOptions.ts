@@ -434,10 +434,16 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     this.list.addButton(rows[r], true); r++;
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optShowPing'), t('optShowPingDesc'), 'showPing', refreshTags);
                     this.list.addButton(rows[r], true); r++;
-                    // Round 21: host tick rate. No live action — latched at the next
-                    // host-acquire (getHostTickInterval reads it then), so the rows'
-                    // onApplied is a no-op.
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optHostTick'), t('optHostTickDesc'), 'hostTickRate', HOST_TICK_LABELS, HOST_TICK_VALUES, () => { /* latched at next host-acquire */ });
+                    // Round 21: host tick rate. Latched at host-acquire, and ROUND 80
+                    // now HOT-APPLIES while WE are the current host so the hostile
+                    // entity stream AND the enemy-projectile stream both follow the
+                    // newly selected frequency immediately.
+                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optHostTick'), t('optHostTickDesc'), 'hostTickRate', HOST_TICK_LABELS, HOST_TICK_VALUES, () => {
+                        try {
+                            const m = getMain();
+                            if (m && m.host && m.netSync) m.netSync.setBlockInterval(m.getHostTickInterval());
+                        } catch (_) { /* next host-acquire still latches it */ }
+                    });
                     this.list.addButton(rows[r], true); r++;
                     // Round 23: own playerState send rate. HOT-APPLIES — netSync reads it
                     // live every tick (shouldSendPlayerState's floor), so the rows' onApplied
@@ -807,26 +813,10 @@ export function startNameTagLoop(getMain: () => Multiplayer | undefined): void {
 
 // --------------------------------------------------------------- network debug overlay
 
-/** Round 21: bit counter -> compact human string. Units step by 1024:
- * ['bit','kb','Mb','Gb']; values below 1024 show as a plain integer + 'bit',
- * anything else as one decimal + the unit. Rates (bits/sec) are formatted here and
- * the caller appends `/s` — the mod's network displays have used kbps since
- * Round 21, so the header and the simple debug overlay keep this unit. */
-function formatBits(bits: number): string {
-    if (!isFinite(bits) || bits < 0) bits = 0;
-    const units = ['bit', 'kb', 'Mb', 'Gb'];
-    let v = bits;
-    let u = 0;
-    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
-    if (u === 0) return Math.round(v) + 'bit';
-    return v.toFixed(1) + units[u];
-}
-
-/** ROUND 76 (advanced network tool): byte counter -> compact human string.
- * 1024-stepping units: ['B','kB','MB','GB']; values below 1024 show as a plain
- * integer + 'B', anything else as one decimal + the unit. Used for the per-event
- * rates/totals of the network tool (explicit kB/MB units, never confused with
- * the kbps header). */
+/** ROUND 80 (unit unification): ALL network-debug displays use byte-based units
+ * ('B','kB','MB','GB'). The engine counters are still bits/sec internally, so
+ * callers convert with `/ 8` before calling this. 1024-stepping; values below
+ * 1024 show as a plain integer + 'B', anything else as one decimal + the unit. */
 function formatBytes(bytes: number): string {
     if (!isFinite(bytes) || bytes < 0) bytes = 0;
     const units = ['B', 'kB', 'MB', 'GB'];
@@ -886,11 +876,11 @@ function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
         if (!str && typeof conn.getNetStats === 'function') {
             const s = conn.getNetStats();
             // Round 22: arrow glyphs for up/down (user-requested; ↑ ↓ render in the game
-            // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us. Rates keep the
-            // kbps convention the mod has always used (formatBits).
-            str = '↑ ' + formatBits(s.upBitsSec) + '/s  ↓ ' + formatBits(s.downBitsSec) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
+            // fonts — unlike ◀ ▶). esbuild escapes the glyphs for us.
+            // ROUND 80: all rates/totals are bytes (B/kB/MB), not bits.
+            str = '↑ ' + formatBytes(s.upBitsSec / 8) + '/s  ↓ ' + formatBytes(s.downBitsSec / 8) + '/s  LOSS ' + Math.round(s.lossPct) + '%';
             if (getMpOption('showNetDebugCumulative')) {
-                str += '\n↑ ' + formatBits(s.upBitsTotal) + '  ↓ ' + formatBits(s.downBitsTotal);
+                str += '\n↑ ' + formatBytes(s.upBitsTotal / 8) + '  ↓ ' + formatBytes(s.downBitsTotal / 8);
                 // Item 3: display the two per-stream entityState rates separately. The old
                 // "TICK n/s" summed the fixed 15Hz BASE stream + the option's HOSTILE stream,
                 // reading ~75 in combat at a 60Hz setting (a display artifact, not an
@@ -956,10 +946,9 @@ function buildNetToolText(conn: any): string {
         try {
             const s: any = typeof conn.getNetStats === 'function' ? conn.getNetStats() : null;
             if (s) {
-                // The header keeps the mod's long-standing kbps convention (the
-                // engine counter is bits/s); the per-event rows use kB/s with
-                // explicit units — 合计(kB/s) × 8 ≈ 标题(kbps).
-                str = '↑ ' + formatBits(s.upBitsSec) + '/s   ↓ ' + formatBits(s.downBitsSec) + '/s   ' + t('netToolLoss') + ' ' + Math.round(s.lossPct || 0) + '%\n';
+                // ROUND 80: header + rows + totals all use bytes (B/kB/MB). The
+                // engine counters are bits/sec, so convert before formatting.
+                str = '↑ ' + formatBytes(s.upBitsSec / 8) + '/s   ↓ ' + formatBytes(s.downBitsSec / 8) + '/s   ' + t('netToolLoss') + ' ' + Math.round(s.lossPct || 0) + '%\n';
             }
         } catch (_) { /* header is cosmetic */ }
         if (!top.length) {

@@ -4905,6 +4905,10 @@ export class NetSync {
 				this._mpBaseFullAccum = 0;
 				this._mpHostileFullAccum = 0;
 				this._mpBaseTimer = 0;
+				// ROUND 80: the first hostile/projectile blocks on the new map must fire
+				// at the configured cadence immediately.
+				this.sendTimer = 0;
+				this._mpProjSendTimer = 0;
 				this._mpBaseLastPlayerCount = -1;
 				this._mpHostileLastPlayerCount = -1;
 				this._mpUidSeen = Object.create(null);
@@ -5536,6 +5540,12 @@ export class NetSync {
 		if (isFinite(sec) && sec > 0) {
 			this.blockInterval = sec;
 			this.sendTimer = 0;
+			// ROUND 80 (projectile cadence): the enemy-projectile stream must follow
+			// the same option-driven host frequency. Re-arm its accumulator too —
+			// otherwise a host re-acquire / live option change keeps the OLD cadence
+			// until the previous timer expires (or indefinitely, if the timer was
+			// armed before the latch).
+			this._mpProjSendTimer = 0;
 			// Item 3: tell the connector the real hostile cadence so the net-debug HUD
 			// shows the true active tick (e.g. 60(H)/s) instead of the double-counted
 			// hostile+base sum. 1/sec = Hz; guard with optional-call for old connectors.
