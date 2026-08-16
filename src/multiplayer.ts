@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.50';
+export const MP_VERSION = '1.70.51';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1238,8 +1238,14 @@ export class Multiplayer {
 			// transition (the no-pause swallow only guards NEW pauses, not an already
 			// open pause GUI).
 			const prevPartied = !!(this.partyMembers && this.partyMembers.length > 1);
+			// ROUND 112: bot retention on party collapse. If a NON-leader member
+			// leaves a 2-person party the server disbands it (partyUpdate null), but
+			// the leader themselves is still "owning" the follower bots and should
+			// keep them while solo. Only OUR OWN leave/kick should cull them.
+			const selfWasLeaderBefore = !!(this.partyLeader && this.partyLeader === this.name);
 			this.partyMembers = party ? party.members.slice() : [];
 			this.partyLeader = party ? party.leader : undefined;
+			if (party && party.members.indexOf(this.name) !== -1) this._mpSelfPartyExit = false;
 			this.applyPartyRoster(this.partyMembers);
 			// FIX: a player can open a pause GUI (backpack/inventory/ESC) while SOLO.
 			// If a teammate then joins while that GUI is still open, setPaused(true) was
@@ -1256,12 +1262,25 @@ export class Multiplayer {
 				} catch (_) { /* a pause fix must never break the roster handler */ }
 			}
 			if (!party) {
-				// Round 13: party disbanded/kicked -> drop every synced follower bot for
-				// good. This runs BEFORE applyPartyBots' party-size gates could skip the
-				// cleanup (applyPartyBots([]) alone never fired: partyMembers is emptied
-				// first, hitting its early return, so member bots kept following the
-				// ex-member into solo).
-				this.clearSyncedPartyBots();
+				// ROUND 112: a party can collapse while the LEADER is still the one
+				// standing (a member left / disconnected / was kicked from a 2-person
+				// party). Follower bots belong to the leader — keep them in that case.
+				// Only our OWN leave/kick removes them.
+				const keepLeaderBots = selfWasLeaderBefore && !this._mpSelfPartyExit;
+				if (!keepLeaderBots) {
+					// Round 13: party disbanded/kicked -> drop every synced follower bot for
+					// good. This runs BEFORE applyPartyBots' party-size gates could skip the
+					// cleanup (applyPartyBots([]) alone never fired: partyMembers is emptied
+					// first, hitting its early return, so member bots kept following the
+					// ex-member into solo).
+					this.clearSyncedPartyBots();
+				} else {
+					console.log('[multiplayer] solo after a member left — leader keeps its follower bots: '
+						+ JSON.stringify(this.partyBots));
+					// The botState stream has no audience anymore, but the local
+					// follower entities stay native on the leader.
+					this.stopBotStream();
+				}
 				// Round 16: roster lost members (kick received / leave / disband) -> wipe
 				// EVERY name tag so a kicked/left player's tag can't linger at its last
 				// projected position. The per-frame applyNameTagsNow rebuilds fresh for
@@ -1312,6 +1331,11 @@ export class Multiplayer {
 		if (typeof (conn as any).onPartySelfEvent === 'function') {
 			safeWire((conn as any).onPartySelfEvent.bind(conn), (event: string) => {
 				try {
+					// ROUND 112: remember OUR departure so the partyUpdate(null)
+					// handler knows whether the leader actually left (bots must go)
+					// or merely lost a member and stays solo (bots stay).
+					if (event === 'leave' || event === 'kicked') this._mpSelfPartyExit = true;
+					if (event === 'join') this._mpSelfPartyExit = false;
 					const key = event === 'join' ? 'partySelfJoined'
 						: event === 'kicked' ? 'partySelfKicked'
 						: 'partySelfLeft';
@@ -1583,6 +1607,10 @@ export class Multiplayer {
 	private _mpBotCutsceneActive = false;
 	/** Bot names unpuppeted for the local cutscene (re-puppeted when it ends). */
 	private _mpCutsceneUnpuppetedBots: string[] = [];
+	/** ROUND 112: latched by partySelfEvent when WE leave / get kicked so the very
+	 * next partyUpdate(null) can tell "I left" apart from "my party collapsed
+	 * because a MEMBER left". The leader keeps follower bots in the latter case. */
+	private _mpSelfPartyExit = false;
 	/** Names present in the last received botState block (cull vanished bots). */
 	private _mpLastBotNames: string[] = [];
 	private _mpBotSeenOnce = false;
