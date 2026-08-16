@@ -35,7 +35,7 @@ import { IChangeMapResult } from './connection';
 import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey, isSharedTownNow } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
-import { closeMpWindows, showMpWindow } from './ui/socialMenuInject';
+import { closeMpWindows, showMpWindow, showStartModeWindow } from './ui/socialMenuInject';
 import { NetSync } from './sync/netSync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.58';
+export const MP_VERSION = '1.70.59';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3509,30 +3509,70 @@ export class Multiplayer {
 		}
 	}
 
-	/** ROUND 103: modal choice for a brand-new online account. Returns 'bridge'
-	 * (restore the server's 新手港新手桥 template with zeroed playtime) or
-	 * 'fresh' (normal story beginning at hideout.entrance). */
+	/** ROUND 103/119: modal choice for a brand-new online account. The RECOMMENDED
+	 * card depends on whether this device already has a CrossCode save:
+	 *  - never played locally -> recommend 'fresh' (story beginning, full intro);
+	 *  - existing local save  -> recommend 'bridge' (skip the intro, jump straight
+	 *    into Rookie Harbor bridge, ready to play with friends).
+	 * Returns 'bridge' (restore the server's 新手港新手桥 template with zeroed
+	 * playtime) or 'fresh' (normal story beginning at hideout.entrance). */
 	private chooseStartMode(): Promise<'fresh' | 'bridge'> {
 		return new Promise((resolve) => {
 			let settled = false;
+			const experienced = this.hasPlayedCrossCodeBefore();
+			const recommended: 'fresh' | 'bridge' = experienced ? 'bridge' : 'fresh';
 			const pick = (mode: 'fresh' | 'bridge') => (): void => {
 				if (settled) return;
 				settled = true;
 				resolve(mode);
 			};
 			try {
-				showMpWindow({
+				const handle = showStartModeWindow({
 					title: t('startModeTitle'),
-					content: t('startModeBody'),
-					buttons: [
-						{ label: t('startModeBridge'), style: 'mpPrimary', cb: pick('bridge') },
-						{ label: t('startModeFresh'), cb: pick('fresh') },
+					body: experienced ? t('startModeBodyPlayed') : t('startModeBodyNew'),
+					options: [
+						{
+							mode: 'bridge',
+							title: t('startModeBridge'),
+							description: t('startModeBridgeDesc'),
+							tag: t('startModeBridgeTag'),
+							recommended: recommended === 'bridge',
+						},
+						{
+							mode: 'fresh',
+							title: t('startModeFresh'),
+							description: t('startModeFreshDesc'),
+							tag: t('startModeFreshTag'),
+							recommended: recommended === 'fresh',
+						},
 					],
+					onPick: (mode) => {
+						try { pick(mode)(); } catch (_) { /* ignore */ }
+					},
 				});
-			} catch (_) { /* popup unavailable -> fresh story */ }
-			// If the player closes the window with ×/outside click, default to fresh.
-			window.setTimeout(pick('fresh'), 30000);
+				// mpWin bridge unavailable (shouldn't happen once installed): fall back
+				// to the recommendation instead of silently waiting.
+				if (!handle) pick(recommended)();
+			} catch (_) { pick(recommended)(); }
+			// If the player never chooses (window ignored), after 30s follow the same
+			// played/unplayed recommendation rather than always defaulting to fresh.
+			window.setTimeout(() => {
+				if (!settled) pick(recommended)();
+			}, 30000);
 		});
+	}
+
+	/** ROUND 119: true when this device already has a local CrossCode save
+	 * (manual slot or autosave) — the signal that the player has played the game
+	 * before. Read directly from ig.storage, which is initialised long before the
+	 * title screen's connect button can be pressed. */
+	private hasPlayedCrossCodeBefore(): boolean {
+		try {
+			const st: any = (ig as any).storage;
+			if (!st) return false;
+			if (typeof st.hasSaves === 'function') return !!st.hasSaves();
+			return !!(st.autoSlot || (Array.isArray(st.slots) && st.slots.length > 0));
+		} catch (_) { return false; }
 	}
 
 	private startConnect(): void {

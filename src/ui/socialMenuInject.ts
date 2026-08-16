@@ -195,6 +195,12 @@ let _requestsTabBtn: any = null;
 let _mpWindowTeardown: (() => void) | null = null;
 let _confirmRemoveRef: ((name: string, onConfirm: () => void) => void) | null = null;
 let _showMpWindowRef: ((opts: { title: string, content: string, buttons: Array<{ label: string, style?: string, cb: () => void }> }) => (() => void) | null) | null = null;
+let _showStartModeWindowRef: ((opts: {
+	title: string;
+	body: string;
+	options: Array<{ mode: 'fresh' | 'bridge'; title: string; description: string; tag: string; recommended: boolean }>;
+	onPick: (mode: 'fresh' | 'bridge') => void;
+}) => (() => void) | null) | null = null;
 
 /** Close every open social-menu mp window (accept/decline, withdraw, friend-remove
  * confirm) + the add-friend box. Safe to call any time (no-ops when nothing is
@@ -208,6 +214,18 @@ export function closeMpWindows(): void {
  * returns its close handle so the caller can dismiss it when the socket recovers. */
 export function showMpWindow(opts: { title: string, content: string, buttons: Array<{ label: string, style?: string, cb: () => void }> }): (() => void) | null {
     if (_showMpWindowRef) { try { return _showMpWindowRef(opts); } catch (_) { /* ignore */ } }
+    return null;
+}
+
+/** ROUND 119: first-login start-mode chooser — the two big square cards. Wired at
+ * install time like showMpWindow; multiplayer.ts calls it before launching the game. */
+export function showStartModeWindow(opts: {
+	title: string;
+	body: string;
+	options: Array<{ mode: 'fresh' | 'bridge'; title: string; description: string; tag: string; recommended: boolean }>;
+	onPick: (mode: 'fresh' | 'bridge') => void;
+}): (() => void) | null {
+    if (_showStartModeWindowRef) { try { return _showStartModeWindowRef(opts); } catch (_) { /* ignore */ } }
     return null;
 }
 
@@ -309,6 +327,35 @@ function ensureMpWindowStyle(): void {
 .mpDisabled { font-size: 12px; color: #6f93ad; opacity: 0.9; }
 .mpSectionLabel { font-size: 12px; letter-spacing: 1px; color: #8fd6ff; margin: 14px 0 6px 0; }
 .mpEmpty { font-size: 12px; color: #6f93ad; text-align: center; padding: 10px; }
+/* ROUND 119 - first-login start choice: two BIG SQUARE cards fill most of the
+   window. Each card is the button itself (title + recommendation tag + the
+   explanation of what that start means). */
+.mpWin.mpWinStart { width: 680px; max-width: 94vw; padding: 18px 20px 20px 20px; }
+.mpWin.mpWinStart .mpWinHead { margin-bottom: 10px; }
+.mpWin.mpWinStart .mpWinBtns { display: none; }
+.mpWin.mpWinStart .mpWinMsg { width: 100%; }
+.mpStartBody { font-size: 13px; line-height: 1.6; color: #eaf7ff;
+    text-align: center; margin: 0 auto 14px auto; max-width: 560px; }
+.mpStartGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; width: 100%; }
+.mpStartCard { box-sizing: border-box; width: 100%; aspect-ratio: 1 / 1; min-height: 300px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; padding: 22px 20px; cursor: pointer;
+    background: rgba(18, 50, 72, 0.9); color: #eaf7ff;
+    border: 2px solid #6fc7ff; border-radius: 10px;
+    font-family: inherit; text-align: center;
+    transition: transform 0.12s ease-out, background 0.12s ease-out, box-shadow 0.12s ease-out; }
+.mpStartCard:hover { transform: translateY(-3px);
+    background: rgba(46, 104, 142, 0.95); box-shadow: 0 0 12px rgba(111,199,255,0.65); }
+.mpStartCard:active { transform: translateY(0); }
+.mpStartCard.mpStartRec { background: rgba(31, 111, 74, 0.9); border-color: #7dffa8; color: #eafff2; }
+.mpStartCard.mpStartRec:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 12px rgba(125,255,168,0.65); }
+.mpStartTag { display: block; font-size: 11px; letter-spacing: 1px;
+    padding: 3px 12px; border-radius: 12px; color: #cfeaff;
+    background: rgba(8, 26, 44, 0.55); border: 1px solid rgba(111,199,255,0.5); }
+.mpStartCard.mpStartRec .mpStartTag { color: #d9ffe5; background: rgba(8, 42, 26, 0.55); border-color: rgba(125,255,168,0.7); }
+.mpStartCardTitle { font-size: 17px; letter-spacing: 2px; line-height: 1.25; }
+.mpStartCardDesc { font-size: 12px; line-height: 1.6; color: #cfeaff; max-width: 280px; }
+.mpStartCard.mpStartRec .mpStartCardDesc { color: #dfffe9; }
 `;
     document.head.appendChild(style);
 }
@@ -374,6 +421,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
     };
     _confirmRemoveRef = (name, onConfirm) => confirmRemoveFriend(name, onConfirm);
     _showMpWindowRef = showMpWindow;
+    _showStartModeWindowRef = showStartModeWindow;
 
     // ---------------------------------------------------------------- helpers
 
@@ -541,10 +589,11 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
      * window and the friend-remove confirm. Single-active-window: a new mp window
      * EXPLICITLY replaces any open one (closeMpModals first), so a confirm window
      * is never closed by an unrelated focus event. */
-    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }> }): (() => void) | null {
+    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }>, windowClass?: string }): (() => void) | null {
         closeMpModals(); // deliberate replacement: only a new window closes the old one
         ensureMpWindowStyle();
         const box = $('<div class="mpWin"></div>');
+        if (opts.windowClass) box.addClass(opts.windowClass);
         const head = $('<div class="mpWinHead"></div>');
         head.append('<span class="mpWinTitle">' + opts.title + '</span>');
         const close = $('<button type="button" class="mpWinClose" title="Close">&times;</button>');
@@ -603,6 +652,40 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         try {
             const content = $('<div class="mpWinMsg"></div>').text(opts.content);
             return openMpWindow({ title: opts.title, content, buttons: opts.buttons });
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /** ROUND 119: first-login start chooser rendered as two large square CARDS.
+     * openMpWindow supplies the modal chrome, focus handling and outside-click
+     * dismissal; the cards are part of the CONTENT and report their pick through
+     * `onPick`, then close via the handle returned by openMpWindow. */
+    function showStartModeWindow(opts: {
+        title: string;
+        body: string;
+        options: Array<{ mode: 'fresh' | 'bridge'; title: string; description: string; tag: string; recommended: boolean }>;
+        onPick: (mode: 'fresh' | 'bridge') => void;
+    }): (() => void) | null {
+        try {
+            const content = $('<div class="mpWinMsg mpWinStart"></div>');
+            content.append($('<div class="mpStartBody"></div>').text(opts.body));
+            const grid = $('<div class="mpStartGrid"></div>');
+            for (const o of opts.options) {
+                const card = $('<button type="button" class="mpStartCard' + (o.recommended ? ' mpStartRec' : '') + '"></button>');
+                card.attr('data-mode', o.mode);
+                card.append($('<span class="mpStartTag"></span>').text(o.tag));
+                card.append($('<span class="mpStartCardTitle"></span>').text(o.title));
+                card.append($('<span class="mpStartCardDesc"></span>').text(o.description));
+                grid.append(card);
+            }
+            content.append(grid);
+            const handle = openMpWindow({ title: opts.title, content, buttons: [], windowClass: 'mpWinStart' });
+            grid.find('.mpStartCard').on('click', function(this: HTMLElement) {
+                try { opts.onPick($(this).attr('data-mode') as 'fresh' | 'bridge'); } catch (_) { /* ignore */ }
+                try { if (handle) handle(); } catch (_) { /* ignore */ }
+            });
+            return handle;
         } catch (_) {
             return null;
         }
