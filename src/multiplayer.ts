@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.51';
+export const MP_VERSION = '1.70.52';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -287,6 +287,13 @@ export class Multiplayer {
 	 * cutscene (a teleport mid-story would fight the story UI). Fired from the
 	 * netSync onCutsceneEnd callback once the cutscene ends. Latest wins. */
 	private _pendingRegroup: { kind: 'request', target?: string } | { kind: 'move', leader?: string, map?: string, pos?: Vec3 } | null = null;
+	/** ROUND 113: target position for the regroup landing correction. Position-based
+	 * TeleportPosition has to pass level/baseZPos BEFORE the target map's levels are
+	 * loaded, so the loader can place the player with the WRONG level floor ("sunk
+	 * under the floor"). onceGameReady then re-applies the position with the real
+	 * target-map level geometry. */
+	private _mpRegroupLandingFix: { map: string, x: number, y: number, z: number } | null = null;
+	private _mpRegroupFixAttempts = 0;
 
 	public getAreaPath(): string {
 		return currentAreaPath();
@@ -1824,6 +1831,13 @@ export class Multiplayer {
 					0,
 					pos.z || 0,
 					p && p.coll && p.coll.size ? p.coll.size : { x: 16, y: 16 });
+				// ROUND 113: the position above can still use level 0 for a leader
+				// standing on level 1+ (baseZPos is a raw z value, and updateBaseZPos
+				// re-derives the floor from coll.level). Correct level/baseZPos from the
+				// REAL target-map geometry right after loadingComplete.
+				this._mpRegroupLandingFix = { map: target, x: pos.x, y: pos.y, z: pos.z };
+				this._mpRegroupFixAttempts = 0;
+				this.onceGameReady(() => this.applyRegroupLandingFix());
 				(ig.game as any).teleport(target, tp);
 				return;
 			} catch (e) {
@@ -1836,6 +1850,62 @@ export class Multiplayer {
 		} catch (e) {
 			console.warn('[multiplayer] regroup teleport failed, going to default town', e);
 			try { (ig.game as any).teleport('rhombus-sqr.central'); } catch (_) { /* ignore */ }
+		}
+	}
+
+	/**
+	 * ROUND 113: after a position-based regroup load, re-apply the target z with the
+	 * REAL target-map level index and floor height. CrossCode's loadLevel no-marker
+	 * branch blindly trusts TeleportPosition.level/baseZPos, and we cannot know the
+	 * target map's level heights before it loads — level 0 + a level-1 leader z is
+	 * exactly the "teleported under the floor" state. Re-runs once for belt-and-
+	 * braces (floors built by ground entities settle on the second pass).
+	 */
+	private applyRegroupLandingFix(): void {
+		try {
+			const fix = this._mpRegroupLandingFix;
+			const g: any = ig.game;
+			if (!fix || !g || !g.playerEntity || !g.playerEntity.coll) return;
+			if (g.mapName !== fix.map) {
+				// A newer teleport superseded this one — the fix no longer applies.
+				this._mpRegroupLandingFix = null;
+				this._mpRegroupFixAttempts = 0;
+				return;
+			}
+			const p: any = g.playerEntity;
+			const c: any = p.coll;
+			if (!c._collData && typeof c.initCollData === 'function') {
+				try { c.initCollData(); } catch (_) { /* ignore */ }
+			}
+			const wantZ = Math.round(Number(fix.z) || 0);
+			let level = typeof g.getLevelIdx === 'function' ? g.getLevelIdx(wantZ) : 0;
+			if (!(level >= 0) || !g.levels || !g.levels[level]) level = 0;
+			const floor = (g.levels && g.levels[level]) ? g.levels[level].height : wantZ;
+			// Snap UP out of the floor first; keep a genuine above-floor leader z.
+			c.level = level;
+			c.baseZPos = floor;
+			if (c.pos.z <= c.baseZPos && wantZ > c.pos.z) c.pos.z = wantZ;
+			else if (c.pos.z < c.baseZPos) c.pos.z = c.baseZPos;
+			// The engine's complete ground pass resolves bridges/ground entities that
+			// sit above the raw level height (mirrors netSync's mirror-floor pump).
+			const phys: any = g.physics;
+			if (phys && c._collData && typeof phys.updateGroundEntity === 'function') {
+				const zero: any = (typeof Vec2 !== 'undefined' && (Vec2 as any).createC)
+					? (Vec2 as any).createC(0, 0) : { x: 0, y: 0 };
+				const onGround = Math.abs(c.pos.z - c.baseZPos) < 1;
+				try { phys.updateGroundEntity(c, zero, onGround, 0, false); } catch (_) { /* ignore */ }
+			}
+			try { if ((sc as any).map && typeof (sc as any).map.validateCurrentPlayerFloor === 'function') (sc as any).map.validateCurrentPlayerFloor(); } catch (_) { /* ignore */ }
+			console.log('[multiplayer] regroup landing corrected: wantZ=' + wantZ + ' level=' + level
+				+ ' baseZ=' + Math.round(c.baseZPos) + ' posZ=' + Math.round(c.pos.z) + ' map=' + fix.map);
+		} catch (_) { /* a landing fix must never break the load */ }
+		// One delayed re-pass catches floors that only exist after the first ground
+		// entities finish settling; then drop the fix.
+		if (this._mpRegroupFixAttempts++ >= 1) {
+			this._mpRegroupLandingFix = null;
+			this._mpRegroupFixAttempts = 0;
+		} else {
+			setTimeout(() => this.applyRegroupLandingFix(), 200);
 		}
 	}
 
