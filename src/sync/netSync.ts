@@ -2198,6 +2198,58 @@ export class NetSync {
 						// IN RANGE of an enemy — not just one who attacked first — stays
 						// hittable instead of taking no damage until they close on the host.
 						this.parent(enemy);
+						// ROUND 118 (slope nav freeze): the enemy currently holds a MIRROR
+						// target but its NavPath has been failing. CrossCode caches a failed
+						// A* pair (`ig.navigation.cachedFailure`) and — while the searcher and
+						// target stay put — `path.failCount` can remain stuck at 1 forever, so
+						// EnemyType.onNavigationFailed never reaches its >5s clear turn: the
+						// enemy stands completely still on the slope until somebody walks
+						// close enough to change the target's nav node. The engine's lose
+						// timer never fires either (the target well inside loseDistance), and
+						// the old ROUND 39/48 immediate cross-block/range clears were removed
+						// in 1.70.55 to preserve real mid-fight locks. This watchdog keeps
+						// BOTH: a genuine failing path (not distance) is released after a
+						// short grace, and a per-enemy nav-hold prevents the _mpEngaged
+						// re-pin / proximity acquire from instantly re-latching the exact
+						// same nav pair in a freeze loop. When the player genuinely closes
+						// within detectDistance the hold is bypassed, so the enemy re-engages
+						// the moment the member is truly back in reach.
+						try {
+							const tgtx = enemy.target;
+							if (tgtx && tgtx._mpMirror && !enemy._killed) {
+								let nf = 0;
+								try {
+									const np = enemy.nav && enemy.nav.path;
+									if (np && typeof np.failCount === 'number') nf = np.failCount;
+								} catch (_) { /* ignore */ }
+								const nowMs = Date.now();
+								if (nf > 0) {
+									if (!enemy._mpNavFailAt) {
+										enemy._mpNavFailAt = nowMs;
+									} else if (nowMs - enemy._mpNavFailAt >= 1500) {
+										const releasedAt = enemy._mpNavReleasedAt || 0;
+										if (!releasedAt || nowMs - releasedAt >= 2500) {
+											enemy._mpNavReleasedAt = nowMs;
+											enemy._mpNavFailAt = nowMs;
+											enemy._mpNavHold = { name: tgtx.name, until: nowMs + 1500 };
+											enemy._mpEngaged = null;
+											try { enemy.setTarget(null); } catch (_) { /* ignore */ }
+											try {
+												console.warn('[netsync] tg.navfail uid=' + enemy.uid
+													+ ' tgt=' + tgtx.name + ' failCount=' + nf
+													+ ' — releasing unreachable mirror target (watchdog)');
+											} catch (_) { /* ignore */ }
+										} else {
+											enemy._mpNavFailAt = nowMs; // release cooldown — don't thrash
+										}
+									}
+								} else {
+									enemy._mpNavFailAt = 0;
+								}
+							} else {
+								enemy._mpNavFailAt = 0;
+							}
+						} catch (_) { /* never break target update */ }
 						// ROUND 53 (the "enemy chases the member but never lands a hit" fix): the live dump
 						// (uid=416 hedgehog) showed the enemy ENGAGED on test2 with that member's mirror 78px
 						// away, yet enemy.target = the HOST player 468px away — beyond its loseDistance — so it
@@ -2224,6 +2276,10 @@ export class NetSync {
 								let best: any = null, bestD = 1e9;
 								for (let mi = 0; mi < mm2.length; mi++) {
 									const cand = mm2[mi];
+									// ROUND 118: don't let the just-released nav-failure target be
+									// re-picked by this far-target retarget path.
+									if (enemy._mpNavHold && cand.name === enemy._mpNavHold.name
+										&& Date.now() < enemy._mpNavHold.until) continue;
 									let sb3 = true;
 									try { sb3 = (ig.game as any).getLevelIdx(enemy.coll.pos.z) === (ig.game as any).getLevelIdx(cand.coll.pos.z); } catch (_) { sb3 = true; }
 									if (!sb3) continue;
@@ -2243,6 +2299,8 @@ export class NetSync {
 										enemy.setTarget(best);
 										try { if (best.name && !enemy._mpEngaged) enemy._mpEngaged = { name: best.name }; } catch (_) { /* ignore */ }
 										try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ }
+										enemy._mpNavHold = null;
+										enemy._mpNavFailAt = 0;
 									}
 								}
 						} catch (_) { /* never break target update */ }
@@ -2261,20 +2319,22 @@ export class NetSync {
 								const m = (window as any).__mpMain;
 								const pl = m && m.players ? m.players[eng.name] : null;
 								const mir = pl && pl.entity;
-								// Re-pin only while the engager's mirror is live + on-map. Once it
-								// dies / leaves / despawns, drop the engagement so the enemy goes
-								// back to normal (and other mirrors are NOT auto-pulled in).
-								// ROUND 37 (item 4): also only re-pin while the mirror is in the
-								// enemy's OWN nav-block. CrossCode's A* is per-level-block
-								// (redoPath resolves the target node via ig.game.getLevelIdx(z), and
-								// the search only walks the enemy's block grid), so a mirror one
-								// block over is nav-unreachable — re-pinning it loops forever
-								// (path fails -> vanilla lose-drop -> re-pin -> fail), leaving the
-								// enemy perpetually "engaged" yet never able to land a hit. Release
-								// the engagement so the vanilla lose-check de-aggros it (per-block
-								// combat scope); the member can still damage it packet-wise and it
-								// re-acquires on proximity when they return.
-								if (mir && !mir._killed && !(pl && (pl as any)._mpCutscene) && enemy.setTarget) {
+								// ROUND 118: a nav-failure release put this engagement on hold.
+								// Don't re-pin the same nav pair while the hold runs — the
+								// watchdog already proved the pair unreachable. A genuinely
+								// close mirror (within detectDistance) bypasses the hold.
+								let holdBlock = false;
+								try {
+									const hold = enemy._mpNavHold;
+									if (hold && hold.name === eng.name && Date.now() < hold.until) {
+										const tdH = this.targetDetect;
+										const detectH = (tdH && tdH.detectDistance > 0) ? tdH.detectDistance : 120;
+										holdBlock = !(mir && mir.coll && enemy.distanceTo(mir) < detectH);
+									}
+								} catch (_) { holdBlock = false; }
+								if (holdBlock) {
+									enemy._mpEngaged = null;
+								} else if (mir && !mir._killed && !(pl && (pl as any)._mpCutscene) && enemy.setTarget) {
 									let sameBlock = true;
 									try {
 										sameBlock = (ig.game as any).getLevelIdx(enemy.coll.pos.z)
@@ -2323,6 +2383,7 @@ export class NetSync {
 										} else {
 											enemy.setTarget(mir);
 											try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ }
+											enemy._mpNavFailAt = 0;
 										}
 									}
 								} else {
@@ -2350,6 +2411,16 @@ export class NetSync {
 									const mir = mirrors[i];
 									const dist = enemy.distanceTo(mir);
 									const dz = Math.abs(enemy.coll.pos.z - mir.coll.pos.z);
+									// ROUND 118: the nav-failure watchdog just released this exact
+									// mirror because its NavPath could not reach it. Skip it while
+									// the hold runs UNLESS the member has genuinely closed within
+									// the vanilla detect distance (the "walks up and it wakes up"
+									// behaviour).
+									const holdP = enemy._mpNavHold;
+									if (holdP && mir.name === holdP.name && Date.now() < holdP.until
+										&& dist >= ((td.detectDistance > 0) ? td.detectDistance : 120)) {
+										continue;
+									}
 									// ROUND 37 (item 4): don't proximity-acquire a mirror in a
 									// DIFFERENT nav-block — a mirror with no detectZDelta one block
 									// over can fall inside detectDistance in 2D yet is nav-unreachable,
@@ -2373,6 +2444,8 @@ export class NetSync {
 									if (sameBlock && dist < mpAcquire && (!td.detectZDelta || dz < td.detectZDelta)) {
 										if (td.onDistance || td.onCloseBattle) {
 											this.assignTarget(enemy, mir, true);
+											enemy._mpNavHold = null;
+											enemy._mpNavFailAt = 0;
 											// ROUND 42 (Symptom 3): a mirror acquired by PROXIMITY was
 											// never marked engaged, so the lose-check dropped it after
 											// loseTime (~3s) and the re-acquire cancelAction() killed every
@@ -3797,9 +3870,29 @@ export class NetSync {
 						=== (ig.game as any).getLevelIdx(mirror.coll.pos.z);
 				} catch (_) { sameBlock = true; }
 				if (sameBlock) {
-					try { target.targetLoseTimer = 0; } catch (_) { /* ignore */ }
-					try { target.setTarget(mirror); } catch (_) { /* ignore */ }
-					try { target._mpEngaged = { name: hit.attacker }; } catch (_) { /* ignore */ }
+					// ROUND 118: the nav-failure watchdog deemed this attacker's mirror
+					// unreachable just now (slope/stairs nav cache). A packet hit from
+					// outside detect range still DOES the damage, but must not re-pin the
+					// enemy onto a nav pair that just proved unreachable — the hold is
+					// only bypassed once the member genuinely gets close.
+					let heldFar = false;
+					try {
+						const holdH = target._mpNavHold;
+						if (holdH && holdH.name === hit.attacker && Date.now() < holdH.until) {
+							let detectH = 120;
+							try {
+								const etH = target.enemyType && target.enemyType.targetDetect;
+								if (etH && etH.detectDistance > 0) detectH = etH.detectDistance;
+							} catch (_) { /* default below */ }
+							heldFar = !(mirror && mirror.coll && target.distanceTo(mirror) < detectH);
+						}
+					} catch (_) { heldFar = false; }
+					if (!heldFar) {
+						try { target.targetLoseTimer = 0; } catch (_) { /* ignore */ }
+						try { target.setTarget(mirror); } catch (_) { /* ignore */ }
+						try { target._mpEngaged = { name: hit.attacker }; } catch (_) { /* ignore */ }
+						target._mpNavFailAt = 0;
+					}
 				}
 			}
 			// Group aggro: a member hitting ONE enemy of a cluster must aggro the
