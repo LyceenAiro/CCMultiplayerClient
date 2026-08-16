@@ -753,6 +753,46 @@ export class SocketIoConnector implements IConnection {
 		this.socket.emit('partyRegroup', target ? { target } : {});
 	}
 
+	// ---- 1.70.61 剧情同步模式 (story sync mode) ----
+	// All story-sync events use plain socket.emit (NOT syncEmit): they are
+	// PARTY-scoped and must travel even while our own instance has one member.
+	public storySyncRequest(quest: string): void {
+		this.socket.emit('storySyncRequest', { quest });
+	}
+	public storySyncCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void {
+		this.socket.emit('storySyncCheckResult', { reqId, quest, available: !!available, active: !!active, solved: !!solved });
+	}
+	public storySyncJoinCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void {
+		this.socket.emit('storySyncJoinCheckResult', { reqId, quest, available: !!available, active: !!active, solved: !!solved });
+	}
+	public storySyncState(quest: string, state: any, map?: string): void {
+		this.socket.emit('storySyncState', { quest, state, map: typeof map === 'string' ? map : '' });
+	}
+	public storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number): void {
+		this.socket.emit('storySyncEvent', { quest, map, key, kind: kind === 'location' ? 'location' : 'trigger', type });
+	}
+	public storySyncEventEnd(seq: number): void {
+		this.socket.emit('storySyncEventEnd', { seq });
+	}
+	public storySyncCancel(quest: string): void {
+		this.socket.emit('storySyncCancel', { quest });
+	}
+	public storySyncComplete(quest: string, state: any): void {
+		this.socket.emit('storySyncComplete', { quest, state });
+	}
+	public storySyncSkipVote(seq: number): void {
+		this.socket.emit('storySyncSkipVote', { seq });
+	}
+	public storySyncSkipAnswer(seq: number, yes: boolean): void {
+		this.socket.emit('storySyncSkipAnswer', { seq, yes: !!yes });
+	}
+	public storySyncNudge(quest: string, to: string[]): void {
+		this.socket.emit('storySyncNudge', {
+			quest,
+			to: Array.isArray(to) ? to.filter((x) => typeof x === 'string' && x.length > 0 && x.length <= 32).slice(0, 8) : [],
+		});
+	}
+
 	// ---- round 23 wave 4 + ROUND 93: WORLD / PARTY / PRIVATE CHAT ----
 	public chat(text: string, channel: 'world' | 'party' | 'private' = 'party', target?: string): void {
 		if (!this.socket || !this.socket.connected) return;
@@ -1476,6 +1516,101 @@ export class SocketIoConnector implements IConnection {
 	/** Round 23 wave 3: party action outcomes (invite accepted/declined/busy/full). */
 	public onPartyActionResult(callback: (result: any) => void): void {
 		this.socket.on('partyActionResult', (data: any) => callback(data));
+	}
+
+	// ---- 1.70.61 story-sync listener bridge ----
+	public onStorySyncCheck(callback: (reqId: string, quest: string) => void): void {
+		this.socket.on('storySyncCheck', (data: any) => {
+			if (data && typeof data.reqId === 'string' && typeof data.quest === 'string') callback(data.reqId, data.quest);
+		});
+	}
+	public onStorySyncJoinCheck(callback: (reqId: string, quest: string) => void): void {
+		this.socket.on('storySyncJoinCheck', (data: any) => {
+			if (data && typeof data.reqId === 'string' && typeof data.quest === 'string') callback(data.reqId, data.quest);
+		});
+	}
+	public onStorySyncStart(callback: (data: { quest: string, leader: string, members: string[] }) => void): void {
+		this.socket.on('storySyncStart', (data: any) => {
+			if (data && typeof data.quest === 'string' && typeof data.leader === 'string' && Array.isArray(data.members)) {
+				callback({ quest: data.quest, leader: data.leader, members: data.members.filter((m: any) => typeof m === 'string') });
+			}
+		});
+	}
+	public onStorySyncStartFailed(callback: (data: { reqId: string, quest: string, reason: string, names: string[] }) => void): void {
+		this.socket.on('storySyncStartFailed', (data: any) => {
+			if (data && typeof data.quest === 'string') {
+				callback({
+					reqId: typeof data.reqId === 'string' ? data.reqId : '',
+					quest: data.quest,
+					reason: typeof data.reason === 'string' ? data.reason : 'unknown',
+					names: Array.isArray(data.names) ? data.names.filter((n: any) => typeof n === 'string') : [],
+				});
+			}
+		});
+	}
+	public onStorySyncState(callback: (data: { from: string, quest: string, state: any, map?: string }) => void): void {
+		this.socket.on('storySyncState', (data: any) => {
+			if (data && typeof data.quest === 'string' && data.state && typeof data.state === 'object') {
+				callback({ from: typeof data.from === 'string' ? data.from : '', quest: data.quest, state: data.state, map: typeof data.map === 'string' ? data.map : undefined });
+			}
+		});
+	}
+	public onStorySyncEvent(callback: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number, seq: number }) => void): void {
+		this.socket.on('storySyncEvent', (data: any) => {
+			if (data && typeof data.quest === 'string' && typeof data.map === 'string' && typeof data.key === 'string') {
+				callback({
+					from: typeof data.from === 'string' ? data.from : '',
+					quest: data.quest,
+					map: data.map,
+					key: data.key,
+					kind: data.kind === 'location' ? 'location' : 'trigger',
+					type: Number(data.type) || 1,
+					seq: Number(data.seq) || 0,
+				});
+			}
+		});
+	}
+	public onStorySyncEnd(callback: (data: { quest: string, reason: string, state?: any, by?: string, leader?: string }) => void): void {
+		this.socket.on('storySyncEnd', (data: any) => {
+			if (data && typeof data.quest === 'string' && typeof data.reason === 'string') {
+				callback({
+					quest: data.quest,
+					reason: data.reason,
+					state: data.state && typeof data.state === 'object' ? data.state : undefined,
+					by: typeof data.by === 'string' ? data.by : undefined,
+					leader: typeof data.leader === 'string' ? data.leader : undefined,
+				});
+			}
+		});
+	}
+	public onStorySyncSkipVote(callback: (data: { seq: number, from: string }) => void): void {
+		this.socket.on('storySyncSkipVote', (data: any) => {
+			if (data && typeof data.seq === 'number' && typeof data.from === 'string') callback({ seq: data.seq, from: data.from });
+		});
+	}
+	public onStorySyncSkipResult(callback: (data: { seq: number, pass: boolean, reason?: string, from?: string }) => void): void {
+		this.socket.on('storySyncSkipResult', (data: any) => {
+			if (data && typeof data.seq === 'number' && typeof data.pass === 'boolean') {
+				callback({
+					seq: data.seq,
+					pass: data.pass,
+					reason: typeof data.reason === 'string' ? data.reason : undefined,
+					from: typeof data.from === 'string' ? data.from : undefined,
+				});
+			}
+		});
+	}
+	public onStorySyncNudge(callback: (data: { from: string, quest: string, to: string[] }) => void): void {
+		this.socket.on('storySyncNudge', (data: any) => {
+			if (data && typeof data.from === 'string' && typeof data.quest === 'string') {
+				callback({ from: data.from, quest: data.quest, to: Array.isArray(data.to) ? data.to.filter((n: any) => typeof n === 'string') : [] });
+			}
+		});
+	}
+	public onStorySyncResend(callback: (data: { quest: string }) => void): void {
+		this.socket.on('storySyncResend', (data: any) => {
+			if (data && typeof data.quest === 'string') callback({ quest: data.quest });
+		});
 	}
 	// ---- lobby query callbacks ----
 	public onRoomPlayers(callback: (players: string[], host?: string) => void): void {

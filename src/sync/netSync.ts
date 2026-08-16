@@ -7274,6 +7274,14 @@ export class NetSync {
 	private sendCutsceneEntityBlock(): void {
 		try {
 			if (this.main.host) return;
+			// 1.70.61 story sync: while a MEMBER replays a leader-triggered story
+			// video, the host's authoritative enemy block is the single source of
+			// story monsters — members must not also stream their local cutscene
+			// copies as csPuppets (that would render a second set of ghosts).
+			try {
+				const story: any = (window as any).__mpStory;
+				if (story && typeof story.isLocalMember === 'function' && story.isLocalMember()) return;
+			} catch (_) { /* ignore */ }
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
 			this._mpCsSendTimer -= ig.system.tick;

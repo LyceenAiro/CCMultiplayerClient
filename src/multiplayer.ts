@@ -37,6 +37,7 @@ import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows, showMpWindow, showStartModeWindow } from './ui/socialMenuInject';
 import { NetSync } from './sync/netSync';
+import { StorySyncController } from './sync/storySync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { saveUploadQueue } from './sync/saveUploadQueue';
@@ -53,7 +54,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.60';
+export const MP_VERSION = '1.70.61';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -275,6 +276,10 @@ export class Multiplayer {
 	private _pendingReady: Array<() => void> = [];
 	private socialOverlay!: SocialOverlay;
 	public netSync?: NetSync;
+	/** 1.70.61 剧情同步模式 (story sync controller). Created once per process
+	 * (its quest snapshot/save guard survive reconnects); install() rewires the
+	 * current socket every connect. */
+	public storySync?: StorySyncController;
 	/** Round 20: GHOST CHESTS sync module (party-aware chest visibility). Installed
 	 * once; the session handle is re-bound every connect (initializeListeners). */
 	public ghostChests?: IGhostChestsModule;
@@ -1017,6 +1022,10 @@ export class Multiplayer {
 		// binds to the current socket; the inject inside is once-guarded.
 		this.netSync = new NetSync(this);
 		this.netSync.install();
+		// 1.70.61: story-sync controller. One instance per client process (engine
+		// hooks/quest snapshot are once-guarded); install() re-binds to THIS socket.
+		if (!this.storySync) this.storySync = new StorySyncController(this);
+		this.storySync.install();
 		// Round 19: PVP-duel isolation — sc.pvp observer + isolated reasserts
 		// (same game-side territory as netSync; sc.pvp exists from game init).
 		// Once-guarded inside, so re-running every connect cannot double-register.
@@ -1280,6 +1289,10 @@ export class Multiplayer {
 			}
 			if (party && party.members.indexOf(this.name) !== -1) this._mpSelfPartyExit = false;
 			this.applyPartyRoster(this.partyMembers);
+			// 1.70.61: story-sync revalidates itself against the live roster
+			// (self depature / disband are normally preceded by storySyncEnd
+			// from the server — this is the belt-and-braces restore path).
+			try { if (this.storySync) this.storySync.syncWithParty(); } catch (_) { /* ignore */ }
 			// FIX: a player can open a pause GUI (backpack/inventory/ESC) while SOLO.
 			// If a teammate then joins while that GUI is still open, setPaused(true) was
 			// already consumed and the round-10 swallow never re-fires — the host would
@@ -1369,6 +1382,7 @@ export class Multiplayer {
 					// or merely lost a member and stays solo (bots stay).
 					if (event === 'leave' || event === 'kicked') this._mpSelfPartyExit = true;
 					if (event === 'join') this._mpSelfPartyExit = false;
+					try { if (this.storySync) this.storySync.onPartySelfEvent(event); } catch (_) { /* ignore */ }
 					const key = event === 'join' ? 'partySelfJoined'
 						: event === 'kicked' ? 'partySelfKicked'
 						: 'partySelfLeft';
@@ -4216,6 +4230,9 @@ export class Multiplayer {
 		this.players = {};
 		this.partyMembers = [];
 		this.partyLeader = undefined;
+		// 1.70.61: story sync must leave NO save-guard/snapshot residue behind on
+		// logout/server loss — restore the quest model first, then reset the mode.
+		try { if (this.storySync) this.storySync.onSessionCleared(); } catch (_) { /* ignore */ }
 		// Round 17: remote-ping cache is session-scoped — wipe it on logout/server loss
 		// so a stale ping never leaks into the next session's tags.
 		this.remotePings = {};

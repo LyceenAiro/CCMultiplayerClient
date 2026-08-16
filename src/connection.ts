@@ -203,6 +203,36 @@ export interface IConnection {
     /** Ask the server for a teammate's location (manual regroup). `target` = the
      * clicked teammate's username; without it the leader is used. */
     partyRegroup(target?: string): void;
+    // ---- 1.70.61 剧情同步模式 (story sync mode) ----
+    /** Leader-only: ask the server to run the party-wide eligibility handshake for
+     * a quest (all online members must be active or solved, leader active). */
+    storySyncRequest(quest: string): void;
+    /** Reply to the server's `storySyncCheck` for the party-wide start handshake. */
+    storySyncCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void;
+    /** Reply to the server's `storySyncJoinCheck` — joining a party whose story
+     * sync is already active requires the same quest to be accepted or solved. */
+    storySyncJoinCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void;
+    /** Leader -> everyone: this client's authoritative quest progress (locks all
+     * members onto the same task state). */
+    storySyncState(quest: string, state: any, map?: string): void;
+    /** Leader -> everyone: the story event just started on the leader (members
+     * replay the same local engine event; key = entity mapId string). */
+    storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number): void;
+    /** Leader-only: the authoritative engine event finished — invalidate any
+     * open skip vote so nobody's no-timeout vote modal strands forever. */
+    storySyncEventEnd(seq: number): void;
+    /** Leader-only: end the mode for the whole party; members restore their own
+     * quest state. */
+    storySyncCancel(quest: string): void;
+    /** Leader-only: the locked quest reached its final node — hand the final state
+     * out so unfinished members commit the completion and claim the reward once. */
+    storySyncComplete(quest: string, state: any): void;
+    /** Ask the party to vote on skipping the current synced animation. */
+    storySyncSkipVote(seq: number): void;
+    /** Vote yes/no on someone's skip request. */
+    storySyncSkipAnswer(seq: number, yes: boolean): void;
+    /** Urge specific absent teammates to come to the waiting story trigger. */
+    storySyncNudge(quest: string, to: string[]): void;
     /** ROUND 93 (chat channels): send a chat message. `channel` is 'world'
      * (global), 'party' (team) or 'private' (direct message to `target`). The
      * server relays it and never echoes to the sender. */
@@ -431,6 +461,34 @@ export interface IConnection {
     /** Round 23 wave 3: party action outcomes (invite accepted/declined/busy/full) —
      * consumed for the invite busy-check + button re-enable. */
     onPartyActionResult(callback: (result: any) => void): void;
+    // ---- 1.70.61 story-sync callbacks ----
+    /** Server asks US whether `quest` is accepted/solved (party-wide handshake). */
+    onStorySyncCheck(cb: (reqId: string, quest: string) => void): void;
+    /** Server asks US whether `quest` is accepted/solved before it lets the accept
+     * into a story-syncing party through. */
+    onStorySyncJoinCheck(cb: (reqId: string, quest: string) => void): void;
+    /** The mode envelope: quest + leader + the exact members that started it. */
+    onStorySyncStart(cb: (data: { quest: string, leader: string, members: string[] }) => void): void;
+    /** The start handshake failed — `reason` is one of 'notLeader','busy',
+     * 'offline','timeout','partyGone','partyChanged','membersNotReady',
+     * 'leaderNotActive','mismatch'. */
+    onStorySyncStartFailed(cb: (data: { reqId: string, quest: string, reason: string, names: string[] }) => void): void;
+    /** Leader's quest state (server-stamped sender for the echo check). */
+    onStorySyncState(cb: (data: { from: string, quest: string, state: any, map?: string }) => void): void;
+    /** Leader started a story event — members replay it locally. */
+    onStorySyncEvent(cb: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number, seq: number }) => void): void;
+    /** The mode ended. reason = 'complete' | 'cancel' | 'leave' | 'leaderLeft' |
+     * 'partyEnd'. 'complete' carries the final `state`. */
+    onStorySyncEnd(cb: (data: { quest: string, reason: string, state?: any, by?: string, leader?: string }) => void): void;
+    /** Someone asked to skip the current synced animation (everyone votes). */
+    onStorySyncSkipVote(cb: (data: { seq: number, from: string }) => void): void;
+    /** Unanimous yes -> everyone fast-forwards locally; any no/abort -> cancel. */
+    onStorySyncSkipResult(cb: (data: { seq: number, pass: boolean, reason?: string, from?: string }) => void): void;
+    /** A teammate at the trigger urged us to come. */
+    onStorySyncNudge(cb: (data: { from: string, quest: string, to: string[] }) => void): void;
+    /** Server asks the leader to re-broadcast the current quest state (a fresh
+     * member just joined mid-sync). */
+    onStorySyncResend(cb: (data: { quest: string }) => void): void;
     // ---- lobby query callbacks ----
     onRoomPlayers(callback: (players: string[], host?: string) => void): void;
     onOnlineCount(callback: (count: number) => void): void;

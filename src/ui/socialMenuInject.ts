@@ -532,6 +532,11 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                 }
                 setInviteGuard(false);
                 refreshOpenMenu();
+            } else if (result.action === 'accept' && result.ok === false) {
+                // 1.70.61: joining a story-syncing party was denied (quest not
+                // accepted/solved) — surface the server's reason instead of a
+                // silent acceptance popup close.
+                showMpToast({ title: result.error || t('partyJoinFailed') });
             }
         });
         // Round 23 wave 3: search results for the add-friend window (one open at a
