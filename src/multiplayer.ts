@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.47';
+export const MP_VERSION = '1.70.48';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3487,6 +3487,46 @@ export class Multiplayer {
 						}
 					} catch (_) { /* ignore */ }
 					return this.parent(name, ...rest);
+				},
+				// ROUND 110 (PVP KO crash): the engine's PvpModel.onPostUpdate /
+				// onPostKO loop over `sc.party.getPartyMemberEntityByIndex(...)` and
+				// DEREFERENCE the result (`.dying` / `.regenPvp(...)`). Network party
+				// members intentionally have NO follower entity (mirrors only), so the
+				// getter returns null and the PVP KO screen crashes. Only while a PVP
+				// round is in its KO state (sc.pvp.state === 3), substitute an inert
+				// stand-in for a missing network member: `dying` mirrors the local
+				// player (so "player party all down" is judged by the local player,
+				// exactly what a solo PVP duel needs) and regenPvp is a no-op (the
+				// local player already regens once).
+				getPartyMemberEntityByIndex(this: any, a: number, b?: boolean) {
+					try {
+						const pvp: any = (sc as any).pvp;
+						if (pvp && pvp.state === 3) {
+							const cp = this.currentParty;
+							const name = cp && cp[a];
+							const e = this.partyEntities && cp && this.partyEntities[cp[a]];
+							if (name && !e) {
+								const mdl = this.models && this.models[name];
+								const m = (window as any).__mpMain;
+								if (mdl && mdl._mpName && m && m.partyMembers && m.partyMembers.indexOf(name) !== -1) {
+									const standin: any = {
+										_mpAbsentNetStandin: true,
+										model: mdl,
+										isDefeated() { return false; },
+										regenPvp() { /* the local player already regened */ },
+									};
+									Object.defineProperty(standin, 'dying', {
+										get() {
+											const p = ig.game && (ig.game as any).playerEntity;
+											return p ? p.dying : 0;
+										},
+									});
+									return standin;
+								}
+							}
+						}
+					} catch (_) { /* fall back to the native getter */ }
+					return this.parent(a, b);
 				},
 				// Our _mp party members have no follower entity (partyEntities[name] is
 				// undefined). The native isDefeated() dereferences it blindly:
