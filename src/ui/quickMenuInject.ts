@@ -26,8 +26,9 @@ import { openPrivateChannel } from './chatBox';
  *     routes clicks through the standard mouseOverGui + getGuiClick path.
  *  5. PARTY BOTS INSPECTABLE — sc.PartyMemberEntity (follower bots) had no
  *     getQuickMenuSettings, so the SHIFT scan skipped them. They now report a
- *     'PartyMember' type: a green anchor with the bot's display name plus an
- *     info box showing name / 等级 / 经验 / HP.
+ *     'PartyMember' type: a green anchor with the bot's display name, plus the
+ *     NATIVE enemy-style hover box (HP/ATK/DEF/FOC + elemental resistances)
+ *     fed from the bot's live PartyMemberModel.params.
  */
 
 // sc.PARTY_MEMBER_TYPE.FRIEND (kept in sync with the game).
@@ -599,102 +600,56 @@ export function installQuickMenuEnhancements(getMain: () => Multiplayer | undefi
         },
     });
 
-    // Stats box: bot name + 等级 / 经验 / HP lines, mirroring the OnlinePlayer box
-    // layout. setMouseRecord(true) so the sticky isMouseOver (section 1b) keeps it
-    // alive while the cursor reads the stats.
-    scAny.QUICK_INFO_BOXES.PartyMember = (ig as any).BoxGui.extend({
-        ninepatch: new (ig as any).NinePatch('media/gui/menu.png', {
-            width: 8, height: 8, left: 8, top: 8, right: 8, bottom: 8,
-            offsets: { 'default': { x: 432, y: 304 }, flipped: { x: 456, y: 304 } },
-        }),
-        transitions: {
-            HIDDEN: { state: { alpha: 0 }, time: 0.2, timeFunction: KEY_SPLINES.LINEAR },
-            DEFAULT: { state: {}, time: 0.2, timeFunction: KEY_SPLINES.EASE },
-        },
-        title: null,
-        levelLine: null,
-        expLine: null,
-        hpLine: null,
-        active: false,
-        init(this: any) {
-            this.parent(127, 86);
-            try { this.hook.setMouseRecord(true); } catch (_) { /* ignore */ }
-            this.title = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.title.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.title.setPos(0, 2);
-            this.addChildGui(this.title);
-            this.levelLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.levelLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.levelLine.setPos(0, 20);
-            this.addChildGui(this.levelLine);
-            this.expLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.expLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.expLine.setPos(0, 36);
-            this.addChildGui(this.expLine);
-            this.hpLine = new sc.TextGui('', { font: sc.fontsystem.smallFont });
-            this.hpLine.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_TOP);
-            this.hpLine.setPos(0, 52);
-            this.addChildGui(this.hpLine);
-            this.doStateTransition('HIDDEN', true);
-        },
-        updateDrawables(this: any, a: any) {
-            this.parent(a);
-            a.addColor('#CCCCCC', 3, this.title.hook.size.y + 1, 121, 1);
-        },
-        // Same placement as the OnlinePlayer box: right of the anchor, clamped to
-        // the screen, flipped to the left near the right edge.
-        alignToBase(this: any, a: any) {
-            try {
-                const d = this.hook;
-                const snap = d.currentState && d.currentState.alpha === 0;
-                const ax = a.pos.x + Math.floor(a.size.x / 2);
-                const rawY = a.pos.y + Math.floor(a.size.y / 2) - 46;
-                const cy = Math.max(10, Math.min((ig as any).system.height - 150, rawY));
-                const w = (d.size && d.size.x) || 127;
-                if (ax + w + 60 < (ig as any).system.width) {
-                    this.currentTileOffset = 'default';
-                    if (snap) { d.pos.x = ax + 30; d.pos.y = cy; }
-                    if (typeof d.doPosTranstition === 'function') d.doPosTranstition(ax + 20, cy, 0.2, (KEY_SPLINES as any).EASE);
-                } else {
-                    this.currentTileOffset = 'flipped';
-                    if (snap) { d.pos.x = ax - w - 31; d.pos.y = cy; }
-                    if (typeof d.doPosTranstition === 'function') d.doPosTranstition(ax - w - 21, cy, 0.2, (KEY_SPLINES as any).EASE);
-                }
-            } catch (_) { /* ignore */ }
-        },
-        show(this: any, anchor: any) {
-            this.alignToBase(anchor.hook);
-            this.setData(anchor.entity);
-            this.doStateTransition('DEFAULT');
-            this.active = true;
-        },
-        hide(this: any, instant?: boolean) {
-            this.doStateTransition('HIDDEN', instant);
-            this.active = false;
-        },
-        setData(this: any, entity: any) {
-            try {
-                const mdl = entity && entity.model;
-                const name = mdl && (typeof mdl.getCharacterName === 'function' ? mdl.getCharacterName() : mdl.name);
-                this.title.setFont(sc.fontsystem.smallFont);
-                this.title.setText(name || '???');
-                const lvl = mdl && typeof mdl.level === 'number' ? String(mdl.level) : '?';
-                this.levelLine.setText(t('levelLabel') + lvl);
-                const exp = mdl && typeof mdl.exp === 'number' ? String(mdl.exp) : '?';
-                this.expLine.setText(t('expLabel') + exp);
-                let cur: any = mdl && mdl.params ? mdl.params.currentHp : null;
-                let max: any = null;
-                if (mdl && mdl.params && typeof mdl.params.getStat === 'function') {
-                    try { max = mdl.params.getStat('hp'); } catch (_) { max = null; }
-                }
-                // Round 22: a dead teammate's HP is stored as -maxHp (the HpHudBarGui
-                // flash trigger) — display-only clamp so the inspect box never shows a
-                // negative number.
-                if (typeof cur === 'number') cur = Math.max(0, cur);
-                this.hpLine.setText(t('hpLabel') + (cur == null ? '?' : cur) + ' / ' + (max == null ? '?' : max));
-            } catch (_) { /* ignore */ }
-        },
-    });
+	// Stats box: MONSTER-STYLE hover box (the native sc.QUICK_INFO_BOXES.Enemy
+	// layout) driven by the bot's PartyMemberModel.params instead of an
+	// enemyDataList entry — title, HP/ATK/DEF/FOC lines, the four elemental
+	// resistances and the pointer arrow match the enemy inspection look.
+	// setData ignores the enemyName argument and reads model.params live.
+	scAny.QUICK_INFO_BOXES.PartyMember = scAny.QUICK_INFO_BOXES.Enemy.extend({
+		setData(this: any, _enemyName: string, entity: any) {
+			const ent = entity || (this.anchor && this.anchor.entity);
+			const mdl = ent && ent.model;
+			const name = mdl && (typeof mdl.getCharacterName === 'function'
+				? mdl.getCharacterName()
+				: (mdl.name || ent.name)) || '???';
+			this.title.setFont(sc.fontsystem.smallFont);
+			this.title.setText(name);
+			if (this.title.hook.size.x >= 121) {
+				this.title.setFont(sc.fontsystem.tinyFont);
+				this.title.setPos(0, 6);
+				this.tiny = true;
+			} else {
+				this.tiny = false;
+				this.title.setPos(0, 2);
+			}
+			// No enemy-data record for a follower bot -> stats are visible, never
+			// scrambled, and always read from the live model params.
+			try { if (this.resistance && typeof this.resistance.hide === 'function') this.resistance.hide(); } catch (_) { /* ignore */ }
+			const params = mdl && mdl.params;
+			const stat = (key: string) => {
+				try { return params && typeof params.getStat === 'function' ? params.getStat(key) : null; } catch (_) { return null; }
+			};
+			const num = (v: any, fallback: number) => (typeof v === 'number' && isFinite(v) ? v : fallback);
+			try {
+				this.baseHp.number.scramble = false;
+				this.baseAttack.number.scramble = false;
+				this.baseDefense.number.scramble = false;
+				this.baseFocus.number.scramble = false;
+				this.baseHp.setNumber(num(stat('hp'), 9999), true);
+				this.baseAttack.setNumber(num(stat('attack'), 999), true);
+				this.baseDefense.setNumber(num(stat('defense'), 999), true);
+				this.baseFocus.setNumber(num(stat('focus'), 999), true);
+				const factor = stat('elemFactor');
+				this.resistance.setResistance(Array.isArray(factor) && factor.length >= 4
+					? factor.slice(0, 4)
+					: [1, 1, 1, 1], true);
+			} catch (_) { /* ignore */ }
+		},
+		show(this: any, anchor: any) {
+			this.anchor = anchor;
+			this.parent(anchor);
+		},
+	});
 
     console.log('[multiplayer] quick-menu enhancements installed (anchor follow + hover-sticky boxes + online-player + party-bot inspect)');
 }
