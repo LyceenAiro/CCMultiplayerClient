@@ -215,7 +215,7 @@ export class NetSync {
 	 * gets its fade written on the next pass — a name-keyed cache would inherit a
 	 * stale "already applied" entry and leave a mid-cutscene respawn at full alpha).
 	 * Reset on map change / disconnect / cutscene end. */
-	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number, status?: boolean }> = new Map();
+	private _mpMirrorFadeCache: Map<any, { alpha: number, coll: any, hp: number, status?: boolean, ignore?: boolean }> = new Map();
 	/** ROUND 85 (door stuck fix): doors whose ignoreCollision we set for a remote
 	 * mirror walk. The per-frame pump restores the previous collision-ignore state
 	 * after a FIXED wall-clock grace — never after openTimer, which a body standing
@@ -6946,7 +6946,8 @@ export class NetSync {
 				// handles both the activation and the time-based expiry automatically.
 				const grace = nowMs < ((e as any)._mpNoCollUntil || this._mpMirrorGraceUntil || 0);
 				const transition = typeof e._mpFadeInStart === 'number' || typeof e._mpFadeOutUntil === 'number';
-				const targetColl = (inTown || fade || grace || transition) ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
+				const noPlayerCollide = !!(inTown || fade || grace || transition);
+				const targetColl = noPlayerCollide ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
 				// Main-city refactor: hide the under-feet HP bar entirely while in a shared
 				// town (a room full of auto-matched players would stack dozens of HP bars).
 				// ROUND 82: use hook._visible (the only reliable gate — StatusBar.update
@@ -6960,10 +6961,15 @@ export class NetSync {
 				const hpAlpha = inTown ? 0 : (fade ? 0.25 : (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1));
 				const cached = this._mpMirrorFadeCache.get(e);
 				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl
+					|| cached.ignore !== noPlayerCollide
 					|| cached.hp !== hpAlpha || cached.status !== statusVisible) {
-					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, hp: hpAlpha, status: statusVisible });
+					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, ignore: noPlayerCollide, hp: hpAlpha, status: statusVisible });
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
 					try { if (e.animState) e.animState.alpha = targetAlpha; } catch (_) { /* ignore */ }
+					// ROUND 107: coll.type=IGNORE alone is NOT enough for some engine
+					// collision variants; `ignoreCollision` is the trace-entity equivalent
+					// and must be driven by the same single decision-maker.
+					try { e.ignoreCollision = !!noPlayerCollide; } catch (_) { /* ignore */ }
 					// HP bar: _visible is the real gate; localAlpha still follows the
 					// cutscene/base convention while the engine keeps overriding it.
 					try {
