@@ -2471,6 +2471,20 @@ export class NetSync {
 						const pool = [ig.game.playerEntity, ...mirrors];
 						return pool[Math.floor(Math.random() * pool.length)];
 					};
+					// ROUND 111 (PVP KO retarget crash): while sc.pvp.state === 3 the
+					// party getter returns an inert stand-in for network members without
+					// local follower entities (see multiplayer.ts). sc.Combat.getEnemyTarget
+					// passes that stand-in to _addPartyMember, whose isInScreen probe
+					// dereferenced the stand-in's missing coll. Never add the stand-in to
+					// the candidate pool at all — the local player is already in it.
+					if (typeof CombatProto._addPartyMember === 'function' && !CombatProto._mpAddPartyMemberPatched) {
+						CombatProto._mpAddPartyMemberPatched = true;
+						const origAddPartyMember = CombatProto._addPartyMember;
+						CombatProto._addPartyMember = function (this: any, pool: any, member: any, c: any) {
+							if (member && member._mpAbsentNetStandin) return;
+							return origAddPartyMember.call(this, pool, member, c);
+						};
+					}
 				}
 			} catch (e) { console.warn('[netsync] enemy-target inject failed', e); }
 

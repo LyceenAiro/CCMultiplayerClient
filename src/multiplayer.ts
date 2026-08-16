@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.49';
+export const MP_VERSION = '1.70.50';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3512,9 +3512,26 @@ export class Multiplayer {
 									const standin: any = {
 										_mpAbsentNetStandin: true,
 										model: mdl,
+										target: null,
+										targetedBy: [],
+										_killed: false,
 										isDefeated() { return false; },
 										regenPvp() { /* the local player already regened */ },
 									};
+									// ROUND 111: PVP KO enemies can still reselect targets while
+									// state 3 is playing out, and sc.Combat.getEnemyTarget runs
+									// EntityTools.isInScreen(standin) -> standin.coll.pos. Expose
+									// coll/size/pos as the local player's values so any screen or
+									// geometry probe on the stand-in stays safe.
+									Object.defineProperty(standin, 'coll', {
+										get() { const lp = ig.game && (ig.game as any).playerEntity; return lp ? lp.coll : null; },
+									});
+									Object.defineProperty(standin, 'size', {
+										get() { const lp0 = ig.game && (ig.game as any).playerEntity; return lp0 && lp0.coll ? lp0.coll.size : null; },
+									});
+									Object.defineProperty(standin, 'pos', {
+										get() { const lp1 = ig.game && (ig.game as any).playerEntity; return lp1 && lp1.coll ? lp1.coll.pos : null; },
+									});
 									Object.defineProperty(standin, 'dying', {
 										get() {
 											const p = ig.game && (ig.game as any).playerEntity;
