@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.46';
+export const MP_VERSION = '1.70.47';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -491,6 +491,8 @@ export class Multiplayer {
 	 * (onPlayerChangeMap), which is why it is factored out.
 	 */
 	public lockEntity(entity: IMultiplayerEntity, pos: Vec3): void {
+		const e: any = entity;
+		if (!e || !e.coll) return;
 		const protectedPos = {xProtected: pos.x, yProtected: pos.y, zProtected: pos.z};
 		Object.defineProperty(protectedPos, 'x', { get() { return protectedPos.xProtected; }, set() { return; } });
 		Object.defineProperty(protectedPos, 'y', { get() { return protectedPos.yProtected; }, set() { return; } });
@@ -514,8 +516,13 @@ export class Multiplayer {
 		if (collRaw && collRaw._inCollisionMap && physRaw && typeof physRaw.removeFromCollMap === 'function') {
 			try { physRaw.removeFromCollMap(collRaw); } catch (_) { /* ignore */ }
 		}
-		Object.defineProperty(entity.coll, 'pos',
-			{ get() { return protectedPos; }, set() { /* network-driven: drop physics writes */ } });
+		// ROUND 109 (cutscene bot unlocks): every locked property is marked AND made
+		// configurable so unlockEntity can restore a native writable value later.
+		try {
+			Object.defineProperty(entity.coll, 'pos',
+				{ get() { return protectedPos; }, set() { /* network-driven: drop physics writes */ }, configurable: true });
+			collRaw._mpPosLock = true;
+		} catch (_) { /* an already-locked value just stays locked */ }
 
 		try {
 			if (collRaw && physRaw && typeof physRaw.addToCollMap === 'function') {
@@ -536,23 +543,92 @@ export class Multiplayer {
 		} catch (_) { /* the map is rebuilt on the next setPos anyway */ }
 
 		let protectedAnim = entity.currentAnim;
-		Object.defineProperty(entity, 'currentAnim', {
-			get() { return protectedAnim; },
-			set(data) { if (data && (data as any).protected) { protectedAnim = (data as any).protected; } },
-		});
+		try {
+			Object.defineProperty(entity, 'currentAnim', {
+				get() { return protectedAnim; },
+				set(data) { if (data && (data as any).protected) { protectedAnim = (data as any).protected; } },
+				configurable: true,
+			});
+			e._mpAnimLock = true;
+		} catch (_) { /* already locked -> leave as is */ }
 
 		const protectedFace = entity.face ? {xProtected: entity.face.x, yProtected: entity.face.y}
 			: {xProtected: 0, yProtected: 0};
 		Object.defineProperty(protectedFace, 'x', {get() { return protectedFace.xProtected; }, set() { return; } });
 		Object.defineProperty(protectedFace, 'y', {get() { return protectedFace.yProtected; }, set() { return; } });
-		Object.defineProperty(entity, 'face',
-			{ get() { return protectedFace; }, set() { /* network-driven: drop physics writes */ } });
+		try {
+			Object.defineProperty(entity, 'face',
+				{ get() { return protectedFace; }, set() { /* network-driven: drop physics writes */ }, configurable: true });
+			e._mpFaceLock = true;
+		} catch (_) { /* already locked -> leave as is */ }
 
 		let protectedState = entity.currentState;
-		Object.defineProperty(entity, 'currentState', {
-			get() { return protectedState; },
-			set(data) { if (data && (data as any).protected) { protectedState = (data as any).protected; } },
-		});
+		try {
+			Object.defineProperty(entity, 'currentState', {
+				get() { return protectedState; },
+				set(data) { if (data && (data as any).protected) { protectedState = (data as any).protected; } },
+				configurable: true,
+			});
+			e._mpStateLock = true;
+		} catch (_) { /* already locked -> leave as is */ }
+	}
+
+	/**
+	 * ROUND 109: undoes lockEntity for a single party bot so the engine can drive
+	 * it again (collision physics + anims + face + action state all become native
+	 * writable plain values). Used ONLY during cutscene bot independence — the 1.4.2
+	 * physics writes `coll.pos.x/y/z` directly and SET_ENTITY_POS/SET_FACE/DO_ACTION
+	 * write `currentAnim`/`face`/`currentState`, so a bot that is merely un-puppeted
+	 * but still property-locked cannot move at all (the old ROUND 107 fix missed
+	 * this, which is exactly why the member's Emilie never walked in the cutscene).
+	 */
+	public unlockEntity(entity: IMultiplayerEntity): void {
+		const e: any = entity;
+		if (!e || !e.coll) return;
+		const c: any = e.coll;
+		try {
+			if (c._mpPosLock) {
+				const p = c.pos;
+				const fp = {
+					x: Number(p && p.x) || 0,
+					y: Number(p && p.y) || 0,
+					z: Number(p && p.z) || 0,
+				};
+				Object.defineProperty(c, 'pos',
+					{ value: fp, writable: true, enumerable: true, configurable: true });
+				c._mpPosLock = false;
+			}
+		} catch (_) { /* never break the cutscene */ }
+		try {
+			if (e._mpAnimLock) {
+				const raw = e.currentAnim;
+				const anim = raw && typeof raw === 'object' && ('protected' in raw) ? raw.protected : raw;
+				Object.defineProperty(e, 'currentAnim',
+					{ value: anim, writable: true, enumerable: true, configurable: true });
+				e._mpAnimLock = false;
+			}
+		} catch (_) { /* ignore */ }
+		try {
+			if (e._mpFaceLock) {
+				const f = e.face;
+				const ff = {
+					x: Number(f && f.x) || 0,
+					y: Number(f && f.y) || 0,
+				};
+				Object.defineProperty(e, 'face',
+					{ value: ff, writable: true, enumerable: true, configurable: true });
+				e._mpFaceLock = false;
+			}
+		} catch (_) { /* ignore */ }
+		try {
+			if (e._mpStateLock) {
+				const raw = e.currentState;
+				const st = raw && typeof raw === 'object' && ('protected' in raw) ? raw.protected : raw;
+				Object.defineProperty(e, 'currentState',
+					{ value: st, writable: true, enumerable: true, configurable: true });
+				e._mpStateLock = false;
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	/** Writes a network-supplied animation/face through the entity's lock. */
@@ -1939,13 +2015,18 @@ export class Multiplayer {
 		} catch (_) { /* a toast must never break the roster handler */ }
 	}
 
-	/** ROUND 107: cutscene bot independence. On non-leader clients, the story bots
-	 * locally added by the game are normally leader-driven puppets. A cutscene that
-	 * requires the bot to walk/act next to the LOCAL player never progresses for
-	 * members because their bot copy is locked to the leader. While the local
-	 * cutscene runs we unpuppet every locally-present bot (let it run its own AI so
-	 * it follows the local player), ignore the leader botState stream, and then
-	 * re-puppet the SAME bots when the cutscene ends so normal leader sync returns. */
+	/** ROUND 107 + 109: cutscene bot independence. On non-leader clients, the story
+	 * bots locally added by the game are normally leader-driven puppets. A cutscene
+	 * that requires the bot to walk/act next to the LOCAL player never progresses
+	 * for members because their bot copy is locked to the leader.
+	 *
+	 * ROUND 109 (the actual fix): unpuppeting alone is NOT enough — markPuppetBot
+	 * also called lockEntity, and the 1.4.2 engine writes position/anim/face/state
+	 * as plain properties. A still-locked bot therefore cannot move a single pixel,
+	 * so `ensureLeaderBotsUnPuppeted()` on its own never made Emilie walk. While the
+	 * local cutscene runs we now UNLOCK every locally-present bot property back to
+	 * native writable values, ignore the leader botState stream, and then re-lock/
+	 * re-puppet the bots when the cutscene ends so normal leader sync returns. */
 	private beginBotCutsceneIndependence(): void {
 		try {
 			if (this._mpBotCutsceneActive) return;
@@ -1957,16 +2038,33 @@ export class Multiplayer {
 			for (const name of party.currentParty) {
 				if (!name || roster.indexOf(name) !== -1) continue; // real member -> mirror, not bot
 				const e = this.partyBotEntity(party, name);
-				if (e && e._mpPuppet) this._mpCutsceneUnpuppetedBots.push(name);
+				if (!e || e._killed) continue;
+				// ROUND 109: restore native writable pos/anim/face/state BEFORE the
+				// cutscene's SET_ENTITY_POS / NAVIGATE_TO_POINT / SET_FACE steps run.
+				const wasPuppet = !!e._mpPuppet;
+				const wasPosLock = !!(e.coll && e.coll._mpPosLock);
+				const wasAnimLock = !!e._mpAnimLock;
+				const wasFaceLock = !!e._mpFaceLock;
+				try { this.unlockEntity(e); } catch (_) { /* ignore */ }
+				console.log('[multiplayer] cutscene bot ' + name
+					+ ' -> native (puppet=' + wasPuppet
+					+ ' posLock=' + wasPosLock + '->' + !!(e.coll && e.coll._mpPosLock)
+					+ ' animLock=' + wasAnimLock + '->' + !!e._mpAnimLock
+					+ ' faceLock=' + wasFaceLock + '->' + !!e._mpFaceLock + ')');
+				if (wasPuppet) this._mpCutsceneUnpuppetedBots.push(name);
 			}
 			this.ensureLeaderBotsUnPuppeted(); // full AI + noDie/isDefeated restore
 			this._mpBotCutsceneActive = true;
-			console.log('[multiplayer] cutscene bot independence active for: ' + JSON.stringify(this._mpCutsceneUnpuppetedBots));
+			console.log('[multiplayer] cutscene bot independence active (unlocked puppets: '
+				+ JSON.stringify(this._mpCutsceneUnpuppetedBots)
+				+ ' / party=' + JSON.stringify(party.currentParty.slice())
+				+ ')');
 		} catch (_) { /* never break the cutscene */ }
 	}
 
-	/** ROUND 107: the cutscene ended — re-freeze bots as leader-driven puppets and
-	 * reset the botState deltas so the very next stream re-syncs their positions. */
+	/** ROUND 107 + 109: the cutscene ended — re-freeze every non-roster bot as a
+	 * leader-driven puppet (freshly-spawned cutscene bots too, not just the ones we
+	 * had collected) and reset the botState deltas so the next stream re-syncs. */
 	private endBotCutsceneIndependence(): void {
 		try {
 			if (!this._mpBotCutsceneActive) return;
@@ -1975,16 +2073,21 @@ export class Multiplayer {
 			this._mpBotCutsceneActive = false;
 			const party: any = (sc as any).party;
 			const roster = this.partyMembers || [];
-			for (const name of names) {
-				if (!party || roster.indexOf(name) !== -1) continue;
-				const e = this.partyBotEntity(party, name);
-				if (e && !e._killed) this.markPuppetBot(name);
+			if (party && party.currentParty) {
+				for (const name of party.currentParty) {
+					if (!name || roster.indexOf(name) !== -1) continue;
+					const e = this.partyBotEntity(party, name);
+					if (e && !e._killed) {
+						try { this.markPuppetBot(name); } catch (_) { /* ignore */ }
+					}
+				}
 			}
 			// Accept the next leader block as a fresh full set (no vanish cull of
 			// bots we temporarily reparented).
 			this._mpLastBotNames = [];
 			this._mpBotSeenOnce = false;
-			console.log('[multiplayer] cutscene bot independence ended; re-syncing leader bots');
+			console.log('[multiplayer] cutscene bot independence ended; re-syncing leader bots (was: '
+				+ JSON.stringify(names) + ')');
 		} catch (_) { /* ignore */ }
 	}
 
@@ -2116,6 +2219,10 @@ export class Multiplayer {
 			// spectators (solo / party of one) must not adopt the host's bots.
 			if (this.host) return;
 			if (!this.partyMembers || this.partyMembers.length <= 1) return;
+			// ROUND 109: while a local cutscene runs, the local engine owns every
+			// follower bot (native AI + unlocked properties). The recurring
+			// partyBots re-broadcast must not re-add / re-puppet / re-lock them.
+			if (this._mpBotCutsceneActive && !this.isPartyLeader) return;
 			// Add newly announced bots.
 			for (const name of this.partyBots) {
 				if (!name || party.currentParty.indexOf(name) !== -1) continue;
@@ -2276,6 +2383,9 @@ export class Multiplayer {
 				const e: any = party.partyEntities[name];
 				if (e && e._mpPuppet) {
 					e._mpPuppet = false;
+					// ROUND 109: puppet flag alone leaves the entity property-locked —
+					// restore native writable pos/anim/face/state too.
+					try { this.unlockEntity(e); } catch (_) { /* ignore */ }
 					if (e.model) {
 						e.model._mpBotSynced = false;
 						// Restore the pre-puppet noDie so the promoted leader's bot can die
