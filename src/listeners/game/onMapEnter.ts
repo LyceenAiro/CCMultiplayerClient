@@ -58,13 +58,13 @@ export class OnMapEnterListener {
 		// no pending response; the host flag from the session is used as-is. If a
 		// response is still outstanding (legacy path), re-apply it afterwards.
 		if (pending) {
-			pending.then((result) => {
+			const applyResult = (result: any) => {
 				this.main.host = result.isHost;
 				// Round 20: remember the NEW instance's host username for the " (Host)"
 				// name-tag label (optional field — guarded against older servers).
 				if (typeof result.host === 'string') this.main.instanceHost = result.host;
 				// Round 21: host tick-rate latch on host-acquire (this load made us the
-				// new instance's host) — read once at acquire, not live.
+				// new instance's host) — read once at acquire, never read live.
 				if (result.isHost) {
 					try { if (this.main.netSync) this.main.netSync.setBlockInterval(this.main.getHostTickInterval()); } catch (_) { /* ignore */ }
 				}
@@ -83,7 +83,23 @@ export class OnMapEnterListener {
 						? { x: mm.pos.x, y: mm.pos.y, z: typeof mm.pos.z === 'number' ? mm.pos.z : 0 }
 						: undefined,
 				}));
-			}).catch(() => { /* keep current flag */ });
+			};
+			// ROUND 116 (team-wipe revive): the response was already consumed by
+			// onTeleport's await, so it is cached on the request promise. Apply it
+			// SYNCHRONOUSLY here: a same-map checkpoint "LOAD" is fully cached and
+			// the engine can call loadingComplete inside this very loadLevel call —
+			// before any `pending.then` microtask could run. The load-complete roster
+			// reconcile would otherwise see newInstanceMembers still undefined,
+			// stamp playersRosterReady with an empty room (solo mode), and neither
+			// client would ever receive the other's post-revive playerState.
+			const cached: any = (pending as any)._mpCachedRoster;
+			if (cached) {
+				applyResult(cached);
+			} else {
+				pending.then((result) => {
+					applyResult(result);
+				}).catch(() => { /* keep current flag */ });
+			}
 		}
 	}
 

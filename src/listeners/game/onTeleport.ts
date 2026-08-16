@@ -261,6 +261,15 @@ export class OnTeleportListener {
 			// A newer teleport superseded this one: its response must NOT overwrite
 			// the host flag (stale verdict for the wrong map).
 			if (gen !== undefined && gen !== this._teleportGen) return;
+			// ROUND 116 (team-wipe revive): stash the response ON the request
+			// promise. onMapEnter needs the instance roster (newInstanceMembers)
+			// BEFORE loadLevel can synchronously finish a cached same-map reload —
+			// a plain `pending.then` microtask runs only after that loadingComplete
+			// already consumed an undefined roster, leaving every client believing
+			// it is a solo instance ("revived, same room, but nobody can see each
+			// other; party HUD stays dead"). The cache lets onMapEnter apply the
+			// roster synchronously at the top of the wrapped loadLevel.
+			(req as any)._mpCachedRoster = result;
 			this.main.host = result.isHost;
 			// Round 20: remember the NEW instance's host username for the " (Host)"
 			// name-tag label (optional field — guarded against older servers).

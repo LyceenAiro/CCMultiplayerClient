@@ -297,6 +297,15 @@ export class OnPlayerChangeMapListener {
 					// ROUND 83: the roster decision is final now — until the NEXT map load,
 					// names not in playersOnThisMap are stale (even when the roster is empty).
 					instance.main.playersRosterReady = true;
+					// ROUND 116 (diag): one line per map-load reconcile so revive-split
+					// reports can be read without instrumented builds. roster=none means
+					// newInstanceMembers was still undefined at loadingComplete.
+					try {
+						console.log('[multiplayer] loadingComplete roster reconcile: roster='
+							+ (roster !== undefined ? String(roster.length) : 'none')
+							+ ' keep=' + Array.from(keep).join(',')
+							+ ' map=' + myMap);
+					} catch (_) { /* ignore */ }
 					// ROUND 84: proactively spawn every kept member that has no LIVE mirror.
 					// reconcile above may have deleted a kept record whose old entity was
 					// killed by clearMap; waiting for their next playerState caused the
