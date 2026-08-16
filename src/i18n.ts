@@ -23,6 +23,7 @@ const enDict: { [key: string]: string } = {
     // Round 19: party invites / teleports auto-declined while in a cutscene.
     inviteBusy: 'In a cutscene — party invite declined automatically',
     teleportBusy: 'In a cutscene — teleporting unavailable',
+    teleportUnlocked: 'You have not unlocked that area yet',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: 'Online ',
@@ -231,6 +232,7 @@ const zhDict: { [key: string]: string } = {
     // Round 19: party invites / teleports auto-declined while in a cutscene.
     inviteBusy: '过场动画中，已自动拒绝组队邀请',
     teleportBusy: '过场动画中，无法传送到队友身边',
+    teleportUnlocked: '你尚未解锁该区域，无法传送到队友身边',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: '在线 ',

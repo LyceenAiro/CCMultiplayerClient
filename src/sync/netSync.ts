@@ -522,6 +522,21 @@ export class NetSync {
 		return !!(t && t._mpWaterGraceUntil && now < t._mpWaterGraceUntil);
 	}
 
+	/** ROUND 103: local-player fall/water flag streamed with playerState. */
+	private localOverFallTerrain(): boolean {
+		try {
+			const p: any = ig.game && ig.game.playerEntity;
+			if (!p || !p.coll) return false;
+			const t: any = (ig as any).terrain;
+			if (!t || typeof t.getPointTerrain !== 'function') return false;
+			const w = Math.min(p.coll.size.x || 16, 4);
+			const h = Math.min(p.coll.size.y || 16, 4);
+			const val = t.getPointTerrain(p.coll.pos.x + (p.coll.size.x || 16) / 2,
+				p.coll.pos.y + (p.coll.size.y || 16) / 2, p.coll.pos.z + 4, w, h);
+			return !!(val && typeof t.isFallTerrain === 'function' && t.isFallTerrain(val));
+		} catch (_) { return false; }
+	}
+
 	constructor(private main: Multiplayer) { }
 
 	public install(): void {
@@ -2187,22 +2202,27 @@ export class NetSync {
 								let loseD3 = 320;
 								try { const td4 = this.targetDetect; if (td4 && td4.loseDistance > 0) loseD3 = td4.loseDistance; } catch (_) { /* ignore */ }
 								let curFar = false;
-								try { curFar = enemy.distanceTo(enemy.target) > loseD3; } catch (_) { curFar = false; }
-								if (curFar) {
-									const mm2 = mirrorTargets();
-									let best: any = null, bestD = 1e9;
-									for (let mi = 0; mi < mm2.length; mi++) {
-										const cand = mm2[mi];
-										let sb3 = true;
-										try { sb3 = (ig.game as any).getLevelIdx(enemy.coll.pos.z) === (ig.game as any).getLevelIdx(cand.coll.pos.z); } catch (_) { sb3 = true; }
-										if (!sb3) continue;
-										let dC = 1e9;
-										try { dC = enemy.distanceTo(cand); } catch (_) { continue; }
-										// only retarget to a mirror that is actually REACHABLE (within the enemy's
-										// own keep/lose band), not merely the nearest one.
-										if (dC < loseD3 && dC < bestD) { best = cand; bestD = dC; }
-									}
-									if (best) {
+								let dCur = 1e9;
+								try { dCur = enemy.distanceTo(enemy.target); curFar = dCur > loseD3; } catch (_) { curFar = false; }
+								// ROUND 105: also switch from the HOST player to a CLOSER party
+								// mirror (the pre-water case only switched when the host target was
+								// unreachable). After a mirror lost its aggro to a water fall the
+								// enemy frequently re-acquired the near host and never returned to
+								// the member. Choosing the closer same-block combatant fixes that.
+								const mm2 = mirrorTargets();
+								let best: any = null, bestD = 1e9;
+								for (let mi = 0; mi < mm2.length; mi++) {
+									const cand = mm2[mi];
+									let sb3 = true;
+									try { sb3 = (ig.game as any).getLevelIdx(enemy.coll.pos.z) === (ig.game as any).getLevelIdx(cand.coll.pos.z); } catch (_) { sb3 = true; }
+									if (!sb3) continue;
+									let dC = 1e9;
+									try { dC = enemy.distanceTo(cand); } catch (_) { continue; }
+									// only retarget to a mirror that is actually REACHABLE (within the enemy's
+									// own keep/lose band), not merely the nearest one.
+									if (dC < loseD3 && dC < bestD) { best = cand; bestD = dC; }
+								}
+								if (best && (curFar || bestD < dCur)) {
 										try { const m4 = (window as any).__mpMain; if (m4 && m4.netSync) m4.netSync._sfxLog('tg.reachmirror', 'uid=' + enemy.uid + ' from=nonmirror far dMir=' + Math.round(bestD)); } catch (_) { /* ignore */ }
 									// ROUND 59 (diagnostics): narrate the retarget — FROM what (host/mirror/none,
 									// with its distance) TO the reachable mirror. Distinguishes the ROUND 53
@@ -2214,7 +2234,6 @@ export class NetSync {
 										try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ }
 									}
 								}
-							}
 						} catch (_) { /* never break target update */ }
 						// ROUND 31 (item 2 / item 5): only re-pin a target on an enemy that a MEMBER
 						// has ALREADY engaged (its group aggro'd it). The round-30 block re-pinned the
@@ -5285,6 +5304,9 @@ export class NetSync {
 			// melee sweep visuals on every mirror (see spawnAttackFxForAnim).
 			em: this.localElementMode(),
 			cl: this.localPlayerClass(),
+			// ROUND 104: fall/water flag — observers grant the mirror a short
+			// aggro grace while the owner quick-falls/respawns.
+			fl: this.localOverFallTerrain() ? 1 : 0,
 			// Round 19 (Part 1): cutscene flag — teammates fade our mirror + dim our
 			// name tag while we're in a story sequence, and skip aggro targeting us.
 			cs: (sc as any).model && (sc as any).model.isCutscene ? ((sc as any).model.isCutscene() ? 1 : 0) : 0,
@@ -8417,6 +8439,9 @@ export class NetSync {
 		if (pl) (pl as any)._mpCutscene = !!s.cs;
 		if (pl && pl.entity) {
 			const ent: any = pl.entity;
+			// ROUND 104: owner is over fall terrain/quick-falling — arm the aggro
+			// grace so host-side target logic doesn't de-aggro during the fall.
+			try { if (s.fl) ent._mpWaterGraceUntil = Date.now() + 1500; } catch (_) { /* ignore */ }
 			// Round 27 (item 4): stash the owner's guard state ON THE MIRROR so the host's
 			// dynamic-shield injection can judge damage/guard/perfect-guard for this player.
 			// gd/gst/gws arrive with the guard packet; gw/gm/ga/def are cached when present

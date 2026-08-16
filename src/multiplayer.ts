@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.38';
+export const MP_VERSION = '1.70.39';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1628,22 +1628,18 @@ export class Multiplayer {
 		const target = map && typeof map === 'string' ? map : 'rhombus-sqr.central';
 		console.log('[multiplayer] regrouping to party leader ' + leader + ' @ ' + target);
 
-		// UNLOCK POLICY (round 6, user directive): a party regroup is ALWAYS allowed.
-		// The old hard "进度不足" block keyed off `ig.vars.storage.maps`, which the
-		// engine only populates on VISIT (onLevelChange) — a save that unlocked the
-		// block story-wise but never stood on one of its maps (e.g. skipped prologue)
-		// was wrongly rejected, and the engine's own "area unlocked" accessor is
-		// visit-based too, so no stricter signal exists. Members are safe in
-		// never-visited areas anyway: onMapEnter strips local Enemy/EnemySpawner and
-		// the host block drives puppets (round-3 design). Residual risk: ending up
-		// HOST of the target instance (leader left meanwhile) makes quest-gated
-		// spawns LOCAL, which can wedge the loader — so for a not-yet-visited area
-		// we force the enemy strip for THIS load even when host.
+		// UNLOCK POLICY (ROUND 105, user directive): manual "传送到队友身边" is NOT
+		// allowed into an area the local save hasn't unlocked — teleporting story-locked
+		// content caused wedged enemies/spoilers. Shared towns always stay allowed.
 		const targetArea = areaPathOfMap(target);
 		if (SHARED_TOWNS.indexOf(targetArea) === -1 && !hasUnlockedArea(target)) {
-			this.mpForceStripNextLoad = true;
-			console.log('[multiplayer] regroup into not-yet-visited area ' + targetArea
-				+ ' — allowed; forcing enemy strip for this load (host-wedge guard)');
+			console.warn('[multiplayer] regroup blocked: area not unlocked (' + targetArea + ', target=' + target + ')');
+			try {
+				if (getMpOption('showNameTags') !== false) {
+					showMpToast({ title: t('teleportUnlocked') });
+				}
+			} catch (_) { /* ignore */ }
+			return;
 		}
 
 		// Close the pause/main menu BEFORE teleporting: this button lives in the
@@ -1700,8 +1696,11 @@ export class Multiplayer {
 				const tp = new (ig as any).TeleportPosition(null);
 				tp.setFromData(null, { x: pos.x, y: pos.y, z: pos.z || 0 },
 					p && p.face ? p.face : { x: 0, y: 1 },
-					p && p.coll ? p.coll.level : 0,
-					p && p.coll ? p.coll.baseZPos : 0,
+					// ROUND 105: do NOT carry the OLD map's level/baseZPos into the new
+					// map — that was the "half body sunk into the floor" regroup bug.
+					// Land exactly on the leader's reported z plane.
+					0,
+					pos.z || 0,
 					p && p.coll && p.coll.size ? p.coll.size : { x: 16, y: 16 });
 				(ig.game as any).teleport(target, tp);
 				return;
