@@ -117,6 +117,52 @@ export function ensureStorySyncStyle(): void {
 .mpStoryBar button { background: #155a86; color: #eaf7ff; border: 1px solid #6fc7ff;
 	border-radius: 999px; padding: 3px 12px; cursor: pointer; font-size: 12px; }
 .mpStoryBar button:hover { background: #1d79b7; }
+.mpStoryBar button.primary { background: #155a86; }
+.mpStoryBar button.danger { background: #5c1f28; border-color: #ff8e9f; }
+.mpStoryComm { position: fixed; inset: 0; z-index: 10030; pointer-events: none;
+	display: flex; align-items: center; justify-content: center;
+	flex-direction: column; text-align: center; animation: mpStoryCommBack 3.4s ease forwards; }
+.mpStoryCommGlow { position: absolute; left: 50%; top: 50%; width: 640px; height: 220px;
+	transform: translate(-50%,-50%); border-radius: 50%;
+	background: radial-gradient(circle, rgba(255,198,64,0.28) 0%, rgba(255,198,64,0.06) 55%, transparent 72%);
+	filter: blur(6px); animation: mpStoryCommPulse 1.5s ease-in-out infinite; }
+.mpStoryCommDuty { position: relative; font-family: 'Noto Sans SC','Microsoft YaHei',sans-serif;
+	font-size: 27px; font-weight: bold; letter-spacing: 12px; color: #8fd6ff;
+	text-shadow: 0 0 12px rgba(111,199,255,0.8); margin-bottom: 14px;
+	animation: mpStoryZoomIn 0.38s cubic-bezier(.2,1.4,.4,1) forwards; }
+.mpStoryCommTitle { position: relative; font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
+	font-size: 62px; font-weight: 900; letter-spacing: 10px; color: #ffd068;
+	background: linear-gradient(180deg, #fff7cf 12%, #ffe08a 38%, #f4a91c 62%, #8a5110 95%);
+	-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+	text-shadow: 0 3px 0 rgba(70,35,0,0.45), 0 0 26px rgba(255,196,80,0.95);
+	animation: mpStoryZoomIn 0.5s cubic-bezier(.2,1.5,.4,1) forwards; }
+.mpStoryCommSub { position: relative; margin-top: 16px; font-size: 16px; letter-spacing: 3px;
+	color: #eaf7ff; text-shadow: 0 0 10px rgba(111,199,255,0.9);
+	animation: mpStoryZoomIn 0.62s cubic-bezier(.2,1.5,.4,1) forwards; }
+.mpStoryCommLine { position: relative; width: 520px; max-width: 76vw; height: 2px;
+	margin-top: 10px; background: linear-gradient(90deg, transparent, #ffd068 18%, #fff7cf 50%, #ffd068 82%, transparent);
+	transform: scaleX(0); animation: mpStoryLine 0.5s ease-out 0.18s forwards; }
+@keyframes mpStoryCommBack { 0%, 82% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
+@keyframes mpStoryZoomIn { 0% { transform: scale(0.55); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+@keyframes mpStoryLine { to { transform: scaleX(1); } }
+@keyframes mpStoryCommPulse { 0%,100% { opacity: 0.55; transform: translate(-50%,-50%) scale(0.9); }
+	50% { opacity: 0.95; transform: translate(-50%,-50%) scale(1.05); } }
+.mpStoryStar { position: fixed; right: 14px; bottom: 14px; z-index: 9995;
+	width: 34px; height: 34px; pointer-events: auto; cursor: help;
+	background: radial-gradient(circle at 34% 30%, #fff3b0, #ffd13e 46%, #c98a00 82%);
+	clip-path: polygon(50% 0%, 61% 34%, 98% 35%, 69% 55%, 78% 93%, 50% 71%, 22% 93%, 31% 55%, 2% 35%, 39% 34%);
+	filter: drop-shadow(0 0 7px rgba(255,205,70,0.85));
+	animation: mpStarGleam 1.5s ease-in-out infinite; }
+.mpStoryStar:hover { transform: scale(1.08); cursor: help; }
+@keyframes mpStarGleam { 0%,100% { box-shadow: none; } 50% {
+	box-shadow: 0 0 12px rgba(255,210,80,0.85), 0 0 0 3px rgba(255,190,40,0.25); } }
+.mpStoryStar::after { content: attr(data-tip); position: absolute; right: 44px; top: 50%;
+	transform: translateY(-50%) translateX(-6px); background: rgba(6,18,30,0.96);
+	border: 1px solid #6fc7ff; border-radius: 6px; padding: 8px 12px; color: #dff3ff;
+	font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif; font-size: 13px;
+	white-space: nowrap; opacity: 0; pointer-events: none;
+	transition: opacity 0.15s ease, transform 0.15s ease; }
+.mpStoryStar:hover::after { opacity: 1; transform: translateY(-50%) translateX(0); }
 `;
 	try {
 		if (document.head) document.head.appendChild(style);
@@ -163,6 +209,7 @@ export class StorySyncController {
 	private questMenuGroup: any = null;
 	private hudBar: JQuery | null = null;
 	private hudBarSignature = '';
+	private hudStar: JQuery | null = null;
 
 	private updateRegistered = false;
 	private questObserverInstalled = false;
@@ -575,6 +622,11 @@ export class StorySyncController {
 			showMpToast({ title: t('storySyncStartedMember'), subtitle: this.questLabel(this.quest) });
 		}
 		try { this.refreshQuestButton(); } catch (_) { /* ignore */ }
+		// 1.70.62: auto-close any open menu (backpack/quest/quick menu) on BOTH
+		// sides, then broadcast the FF14-style "duty commenced" text banner to the
+		// whole party.
+		try { this.closeGameMenus(); } catch (_) { /* ignore */ }
+		try { this.playCommencementBanner(); } catch (_) { /* ignore */ }
 	}
 
 	private lockQuestHud(): void {
@@ -723,6 +775,7 @@ export class StorySyncController {
 				}
 			}
 			this.updateHudBar();
+			this.updateGameStar();
 			this.updateWaitingPrompt();
 		} catch (_) { /* never break the frame */ }
 	}
@@ -1575,6 +1628,60 @@ export class StorySyncController {
 	}
 
 	// ------------------------------------------------------------- HUD strip
+
+	/** 1.70.62: close the regular menu / quick menu so a just-started story sync
+	 * drops every player straight back into the game world for the intro banner.
+	 * Mirrors the engine's own menu-key code path (model.enterRunning), which
+	 * drives MainMenu._exitMenu + sc.menu.exitMenu and clears the menu stack. */
+	private closeGameMenus(): void {
+		try {
+			const model: any = (sc as any).model;
+			if (!model) return;
+			if (typeof model.isMenu !== 'function' && typeof model.isQuickMenu !== 'function') return;
+			if (model.isMenu && model.isMenu()) {
+				model.enterRunning();
+			} else if (model.isQuickMenu && model.isQuickMenu()) {
+				model.enterRunning();
+			}
+		} catch (_) { /* never hard-fail the sync start */ }
+	}
+
+	/** 1.70.62: FF14-duty-commence-style big glowing text for every party member
+	 * (leader included). Pure overlay — no pointer interception, auto-fades after
+	 * the CSS animation (3.4s). */
+	private playCommencementBanner(): void {
+		try {
+			if (typeof document === 'undefined' || !document.body) return;
+			try { $('.mpStoryComm').remove(); } catch (_) { /* ignore */ }
+			const box = $('<div class="mpStoryComm"></div>');
+			box.append('<div class="mpStoryCommGlow"></div>');
+			box.append('<div class="mpStoryCommDuty">' + t('storySyncCommDuty') + '</div>');
+			box.append('<div class="mpStoryCommTitle">' + t('storySyncCommTitle') + '</div>');
+			box.append('<div class="mpStoryCommLine"></div>');
+			box.append('<div class="mpStoryCommSub">' + t('storySyncCommSub').replace('{quest}', this.questLabel(this.quest)) + '</div>');
+			$(document.body).append(box);
+			(window as any).setTimeout(() => {
+				try { box.remove(); } catch (_) { /* ignore */ }
+			}, 3500);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Bottom-right star shown for the ENTIRE sync; hovering it says the mode is
+	 * active (tooltip via CSS). Managed per-frame with the same change gate style
+	 * as the top bar. */
+	private updateGameStar(): void {
+		try {
+			if (typeof document === 'undefined' || !document.body) return;
+			if (!this.active) {
+				if (this.hudStar) { this.hudStar.remove(); this.hudStar = null; }
+				return;
+			}
+			if (!this.hudStar || !document.body.contains(this.hudStar[0])) {
+				this.hudStar = $('<div class="mpStoryStar" data-tip="' + t('storySyncStarTip') + '"></div>');
+				$(document.body).append(this.hudStar);
+			}
+		} catch (_) { /* ignore */ }
+	}
 
 	private hudBarHtml(): string | null {
 		if (!this.active) return null;

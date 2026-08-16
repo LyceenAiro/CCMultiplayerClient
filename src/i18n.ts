@@ -303,6 +303,11 @@ const enDict: { [key: string]: string } = {
     storySyncBarMember: 'Following leader',
     storySyncBarPlaying: 'Cutscene playing',
     storySyncBarCancel: 'Cancel Sync',
+    // 1.70.62 — FF14-style duty-commence banner + resting star
+    storySyncCommDuty: 'DUTY COMMENCED',
+    storySyncCommTitle: 'STORY SYNC',
+    storySyncCommSub: 'Quest: {quest}',
+    storySyncStarTip: 'Story sync in progress',
 };
 
 const zhDict: { [key: string]: string } = {
@@ -595,6 +600,11 @@ const zhDict: { [key: string]: string } = {
     storySyncBarMember: '跟随队长观看',
     storySyncBarPlaying: '动画播放中',
     storySyncBarCancel: '取消同步',
+    // 1.70.62 — FF14式“任务开始”大字横幅 + 常驻星星
+    storySyncCommDuty: 'DUTY COMMENCED',
+    storySyncCommTitle: '任务同步开始',
+    storySyncCommSub: '任务：{quest}',
+    storySyncStarTip: '任务同步中',
 };
 
 let cached: { [key: string]: string } | null = null;
