@@ -1,7 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { ILootDrop } from '../connection';
 import { t } from '../i18n';
-import { isSharedTownNow } from '../util/areaUtil';
+import { isSharedTownNow, areaPathOfMap, SHARED_TOWNS, currentAreaPath } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
 import { showRemoteHeal } from '../ui/healSync';
 
@@ -6904,7 +6904,8 @@ export class NetSync {
 	public updateRemoteMirrorFade(): void {
 		try {
 			this._mpEnsureDoorHook();
-			const inTown = isSharedTownNow();
+			const inTown = isSharedTownNow()
+				|| SHARED_TOWNS.indexOf(areaPathOfMap((ig.game as any).mapName || '')) !== -1;
 			const nowMs = Date.now();
 			for (const name in this.main.players) {
 				const pm = this.main.players[name];
@@ -6963,6 +6964,9 @@ export class NetSync {
 				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl
 					|| cached.ignore !== noPlayerCollide
 					|| cached.hp !== hpAlpha || cached.status !== statusVisible) {
+					if ((!cached || cached.ignore !== noPlayerCollide) && e._mpMirror) {
+						console.log('[collision] mirror ' + name + ' ignore=' + noPlayerCollide + ' targetType=' + targetColl + ' inTown=' + inTown + ' fade=' + fade + ' areaPath=' + currentAreaPath() + ' map=' + ((ig.game as any).mapName || '?'));
+					}
 					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, ignore: noPlayerCollide, hp: hpAlpha, status: statusVisible });
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
 					try { if (e.animState) e.animState.alpha = targetAlpha; } catch (_) { /* ignore */ }
