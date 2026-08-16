@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.48';
+export const MP_VERSION = '1.70.49';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1739,7 +1739,7 @@ export class Multiplayer {
 		// Close the pause/main menu BEFORE teleporting: this button lives in the
 		// Social menu, and ig.Game.update only consumes teleporting.levelData while
 		// !paused — with the menu still open the teleport froze at a black fade
-		// until the 15s watchdog bounced the player (round-6 black screen).
+		// until the 5s watchdog bounced the player (round-6 black screen).
 		try {
 			const mdl: any = (sc as any).model;
 			if (mdl && ((mdl.isMenu && mdl.isMenu()) || (mdl.isPaused && mdl.isPaused()))) {

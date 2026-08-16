@@ -9,12 +9,13 @@ export class OnTeleportListener {
 	 * watchdog exists to clean up). */
 	private _teleportGen = 0;
 
-	/** ROUND 100 (teleport recovery rework): the 15s watchdog no longer trusts a
+	/** ROUND 100 (teleport recovery rework): the 5s watchdog no longer trusts a
 	 * fixed timer alone — it only fires when the loader/map-request made NO
 	 * progress for the whole window (same pending signature). The first recovery
 	 * re-attempts the SAME map the player was already entering instead of yanking
 	 * them to Rhombus Square; only a second consecutive no-progress wedge on the
 	 * same map escalates to Rhombus Square. */
+	private static readonly NO_PROGRESS_MS = 5000;
 	private _lastProgressSig = '';
 	private _lastProgressAt = 0;
 	private _recoveredMap = '';
@@ -97,7 +98,7 @@ export class OnTeleportListener {
 							instance._lastProgressSig = sig;
 							instance._lastProgressAt = Date.now();
 						}
-						if (Date.now() - instance._lastProgressAt > 15000) {
+						if (Date.now() - instance._lastProgressAt > OnTeleportListener.NO_PROGRESS_MS) {
 							instance._lastProgressSig = '';
 							instance._lastProgressAt = Date.now();
 							instance.recoverFromStuckTeleport();
@@ -138,7 +139,7 @@ export class OnTeleportListener {
 			if (target === this._recoveredMap) this._sameMapRecoveries++;
 			else { this._recoveredMap = target; this._sameMapRecoveries = 1; }
 
-			console.warn('[multiplayer] teleport made no progress for 15s; map=' + target
+			console.warn('[multiplayer] teleport made no progress for ' + (OnTeleportListener.NO_PROGRESS_MS / 1000) + 's; map=' + target
 				+ ' sameMapRecoveries=' + this._sameMapRecoveries);
 			this.dumpLoaderState();
 			this.forceUnstickLoader();
@@ -270,7 +271,7 @@ export class OnTeleportListener {
 			console.warn('[multiplayer] changeMapResponse failed; teleport proceeds with previous host flag', e);
 		});
 		// Never soft-lock the player on a hung server: proceed after 3s either way
-		// (the 15s stuck-teleport watchdog remains the last-resort safety net).
+		// (the 5s stuck-teleport watchdog remains the last-resort safety net).
 		const timeout = new Promise<void>((resolve) => setTimeout(resolve, 3000));
 		return Promise.race([settled, timeout]);
 	}
