@@ -88,6 +88,17 @@ export function isSharedTownNow(): boolean {
 }
 
 /**
+ * True when a MAP (dot-name, e.g. "rookie-harbor.west") belongs to a shared
+ * town area. Derived from the map name alone, so it stays correct even while
+ * sc.map.currentPlayerArea has not caught up yet (map-entry frames, member-side
+ * teleports).
+ */
+export function isSharedTownMap(mapName: string): boolean {
+	if (!mapName) return false;
+	return SHARED_TOWNS.indexOf(areaPathOfMap(mapName)) !== -1;
+}
+
+/**
  * True when the LOCAL player has unlocked/visited the *area* (block) a map belongs
  * to — i.e. the save's `ig.vars.storage.maps` table has ANY entry whose key starts
  * with the area's camelCase prefix. The engine keys that table by

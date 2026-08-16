@@ -1,7 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { ILootDrop } from '../connection';
 import { t } from '../i18n';
-import { isSharedTownNow, areaPathOfMap, SHARED_TOWNS, currentAreaPath } from '../util/areaUtil';
+import { isSharedTownNow, isSharedTownMap, currentAreaPath } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
 import { showRemoteHeal } from '../ui/healSync';
 
@@ -6904,8 +6904,12 @@ export class NetSync {
 	public updateRemoteMirrorFade(): void {
 		try {
 			this._mpEnsureDoorHook();
-			const inTown = isSharedTownNow()
-				|| SHARED_TOWNS.indexOf(areaPathOfMap((ig.game as any).mapName || '')) !== -1;
+			// ROUND 108: derive "town" from BOTH the engine's area model and the
+			// raw map name. sc.map.currentPlayerArea can lag behind on a member
+			// client right after a multiplayer map enter, while ig.game.mapName is
+			// already the destination map (their diagnostic shows it is correct).
+			const mapName = ((ig.game as any).mapName || '') as string;
+			const inTown = isSharedTownNow() || isSharedTownMap(mapName);
 			const nowMs = Date.now();
 			for (const name in this.main.players) {
 				const pm = this.main.players[name];
@@ -6937,7 +6941,8 @@ export class NetSync {
 				}
 				// Capture the mirror's base coll type once (the same _mpBaseCollType
 				// pattern refreshTownCollision used — it captures it there too, so this
-				// just reads it back if already set).
+				// just reads it back if already set). Captured BEFORE any write this
+				// function makes so a mid-grace first frame can't latch IGNORE as base.
 				if (e._mpBaseCollType === undefined) e._mpBaseCollType = e.coll.type;
 				// Round 21 (issue 1): 1s no-collision grace. A per-mirror _mpNoCollUntil
 				// (set in spawnMirrorNow — remote map-enter / revival / pvp-exit) OR the
@@ -6947,8 +6952,24 @@ export class NetSync {
 				// handles both the activation and the time-based expiry automatically.
 				const grace = nowMs < ((e as any)._mpNoCollUntil || this._mpMirrorGraceUntil || 0);
 				const transition = typeof e._mpFadeInStart === 'number' || typeof e._mpFadeOutUntil === 'number';
-				const noPlayerCollide = !!(inTown || fade || grace || transition);
+				// A mirror staged with playPuppetDeath must stay walk-through for its
+				// ~500ms FX window (its coll was deliberately flipped to IGNORE there).
+				const dying = !!((e as any)._mpDying);
+				const noPlayerCollide = !!(inTown || fade || grace || transition || dying);
 				const targetColl = noPlayerCollide ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
+				// ROUND 108 (collision re-assert fix): the cache stores the last TARGET
+				// we wrote, so a frame with an unchanged target used to skip the write.
+				// The engine may legally overwrite coll.type / ignoreCollision after
+				// that write (actor resets / default config re-applies can restore
+				// VIRTUAL), and the target-only change gate let the flip stick forever —
+				// exactly the observed "no collision for the first moments after map
+				// entry, then collision returns": the spawn grace wrote IGNORE, the
+				// engine restored VIRTUAL, but our cached target still said IGNORE.
+				// Compare the ACTUAL coll state against the target too, so any stale
+				// reality re-triggers the write on the next frame.
+				const actualType = e.coll.type;
+				const actualIgnore = !!e.coll.ignoreCollision;
+				const collStale = actualType !== targetColl || actualIgnore !== noPlayerCollide;
 				// Main-city refactor: hide the under-feet HP bar entirely while in a shared
 				// town (a room full of auto-matched players would stack dozens of HP bars).
 				// ROUND 82: use hook._visible (the only reliable gate — StatusBar.update
@@ -6963,9 +6984,23 @@ export class NetSync {
 				const cached = this._mpMirrorFadeCache.get(e);
 				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl
 					|| cached.ignore !== noPlayerCollide
-					|| cached.hp !== hpAlpha || cached.status !== statusVisible) {
-					if ((!cached || cached.ignore !== noPlayerCollide) && e._mpMirror) {
-						console.log('[collision] mirror ' + name + ' ignore=' + noPlayerCollide + ' targetType=' + targetColl + ' inTown=' + inTown + ' fade=' + fade + ' areaPath=' + currentAreaPath() + ' map=' + ((ig.game as any).mapName || '?'));
+					|| cached.hp !== hpAlpha || cached.status !== statusVisible
+					|| collStale) {
+					// Diagnostic: every target flip, plus reality corrections (rate-
+					// limited to 2s per mirror so a persistent fighter can't flood).
+					const ignoreFlipped = !cached || cached.ignore !== noPlayerCollide;
+					if (e._mpMirror && (ignoreFlipped || collStale)) {
+						const last: number = (e as any)._mpCollLogAt || 0;
+						if (ignoreFlipped || nowMs - last >= 2000) {
+							(e as any)._mpCollLogAt = nowMs;
+							console.log('[collision] mirror ' + name
+								+ ' wantIgnore=' + noPlayerCollide
+								+ ' targetType=' + targetColl
+								+ ' actualType=' + actualType
+								+ ' actualIgnore=' + actualIgnore
+								+ ' inTown=' + inTown + ' fade=' + fade + ' grace=' + grace + ' dying=' + dying
+								+ ' areaPath=' + currentAreaPath() + ' map=' + mapName);
+						}
 					}
 					this._mpMirrorFadeCache.set(e, { alpha: targetAlpha, coll: targetColl, ignore: noPlayerCollide, hp: hpAlpha, status: statusVisible });
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
@@ -6973,7 +7008,7 @@ export class NetSync {
 					// ROUND 107: coll.type=IGNORE alone is NOT enough for some engine
 					// collision variants; the collision ENTRY's `ignoreCollision` flag is the
 					// trace-entity equivalent (setSlipThrough writes it) and must be driven
-					// by the same single decision-maker.
+					// by the same single decision-maker. Written before the type flip...
 					try { e.coll.ignoreCollision = !!noPlayerCollide; } catch (_) { /* ignore */ }
 					// HP bar: _visible is the real gate; localAlpha still follows the
 					// cutscene/base convention while the engine keeps overriding it.
@@ -6994,6 +7029,10 @@ export class NetSync {
 						else if (e.coll) e.coll.type = targetColl;
 						this._mpReindexColl(e);
 					} catch (_) { /* ignore */ }
+					// ...and asserted AGAIN after the flip: re-bucketing paths can
+					// re-normalize ignoreCollision, and the town/cutscene slip-through
+					// must survive the type write.
+					try { if (e.coll.ignoreCollision !== (noPlayerCollide ? true : false)) e.coll.ignoreCollision = !!noPlayerCollide; } catch (_) { /* ignore */ }
 				}
 			}
 		} catch (_) { /* never break the frame */ }
