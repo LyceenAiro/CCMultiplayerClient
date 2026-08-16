@@ -6967,9 +6967,10 @@ export class NetSync {
 					// Body + shadow fade via animState.alpha (default 1; sprite path).
 					try { if (e.animState) e.animState.alpha = targetAlpha; } catch (_) { /* ignore */ }
 					// ROUND 107: coll.type=IGNORE alone is NOT enough for some engine
-					// collision variants; `ignoreCollision` is the trace-entity equivalent
-					// and must be driven by the same single decision-maker.
-					try { e.ignoreCollision = !!noPlayerCollide; } catch (_) { /* ignore */ }
+					// collision variants; the collision ENTRY's `ignoreCollision` flag is the
+					// trace-entity equivalent (setSlipThrough writes it) and must be driven
+					// by the same single decision-maker.
+					try { e.coll.ignoreCollision = !!noPlayerCollide; } catch (_) { /* ignore */ }
 					// HP bar: _visible is the real gate; localAlpha still follows the
 					// cutscene/base convention while the engine keeps overriding it.
 					try {
