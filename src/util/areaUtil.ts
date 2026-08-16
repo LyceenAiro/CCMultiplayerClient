@@ -118,3 +118,25 @@ export function hasUnlockedArea(mapName: string): boolean {
 		return true; // on any error, don't block the teleport
 	}
 }
+
+/**
+ * ROUND 106: STRICT per-map unlock check. `ig.vars.storage.maps` is keyed by the
+ * exact camelCased MAP name, so an interior house map (`area.house-1`) must have
+ * been VISITED before it counts as unlocked. Missing storage is treated as
+ * UNLOCKED for the loader wedge guard users, and as LOCKED by callers that gate
+ * manual regroup (they call this through a wrapped check only when storage is
+ * present — the group-travel gate itself returns false on missing storage).
+ */
+export function hasUnlockedMapStrict(mapName: string): boolean {
+	try {
+		const storage = (ig.vars as any) && (ig.vars as any).storage;
+		if (!storage || !storage.maps) return false;
+		const camel = mapName.replace(/(\-[a-z])/g, (m) => m.toUpperCase().replace('-', ''));
+		for (const key in storage.maps) {
+			if (key === camel) return true;
+		}
+		return false;
+	} catch (_) {
+		return false;
+	}
+}

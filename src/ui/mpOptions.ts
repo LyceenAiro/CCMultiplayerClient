@@ -740,6 +740,13 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                 if (!knownHere && onMap && !onMap[name] && ((m as any).playersRosterReady || Object.keys(onMap).length > 0)) continue;
                 const pl = players[name];
                 const ent = pl && pl.entity;
+                // ROUND 107: while the LOCAL player is in a story cutscene, other
+                // players have no collision and their name tags are hidden entirely.
+                const nsNow: any = (m as any).netSync;
+                if (nsNow && nsNow.inCutscene) {
+                    try { dropNameTag(name); } catch (_) { /* ignore */ }
+                    continue;
+                }
                 // Round 20: hide the tag the very first frame the death flag arrives
                 // (netSync sets _mpDying immediately in playPuppetDeath; _killed only
                 // lands ~500ms later via the delayed-death queue).

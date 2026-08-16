@@ -32,7 +32,7 @@ import { PlayerListener } from './listeners/game/playerListener';
 import { IMultiplayerEntity } from './mpEntity';
 import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
-import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, isSharedTownNow } from './util/areaUtil';
+import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, isSharedTownNow } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows, showMpWindow } from './ui/socialMenuInject';
@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.39';
+export const MP_VERSION = '1.70.40';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -961,7 +961,13 @@ export class Multiplayer {
 		this.onPromotedToHost = () => { try { this.netSync && this.netSync.promoteToHost(); } catch (e) { /* ignore */ } };
 		// Round 19: fire a regroup/teleport request stashed while the local player
 		// was in a cutscene (requestRegroup / regroupToPartyLeader stash it there).
-		this.netSync.onCutsceneEnd = () => { try { this.firePendingRegroup(); } catch (e) { /* ignore */ } };
+		this.netSync.onCutsceneEnd = () => {
+			try { this.endBotCutsceneIndependence(); } catch (e) { /* ignore */ }
+			try { this.firePendingRegroup(); } catch (e) { /* ignore */ }
+		};
+		// ROUND 107: story cutscenes that involve party bots (e.g. Emilie + Apollo
+		// on Bergen Trail) need the bot to follow the local player, not the leader.
+		this.netSync.onCutsceneStart = () => { try { this.beginBotCutsceneIndependence(); } catch (e) { /* ignore */ } };
 	}
 
 	/** Per-process game hooks: entity/player listeners, update pump, save sync.
@@ -1496,6 +1502,11 @@ export class Multiplayer {
 	 * to scope cleanup to NETWORK bots only — a solo player's own native bots
 	 * (Emilie/...) in a shared town are never stripped by another host's broadcast. */
 	private _mpAdoptedBots: { [name: string]: boolean } = {};
+	/** ROUND 107: true while a LOCAL cutscene lets every client run its own story
+	 * bots independently instead of following the leader's botState stream. */
+	private _mpBotCutsceneActive = false;
+	/** Bot names unpuppeted for the local cutscene (re-puppeted when it ends). */
+	private _mpCutsceneUnpuppetedBots: string[] = [];
 	/** Names present in the last received botState block (cull vanished bots). */
 	private _mpLastBotNames: string[] = [];
 	private _mpBotSeenOnce = false;
@@ -1628,12 +1639,13 @@ export class Multiplayer {
 		const target = map && typeof map === 'string' ? map : 'rhombus-sqr.central';
 		console.log('[multiplayer] regrouping to party leader ' + leader + ' @ ' + target);
 
-		// UNLOCK POLICY (ROUND 105, user directive): manual "传送到队友身边" is NOT
-		// allowed into an area the local save hasn't unlocked — teleporting story-locked
-		// content caused wedged enemies/spoilers. Shared towns always stay allowed.
+		// UNLOCK POLICY (ROUND 106, user directive): manual "传送到队友身边" is ONLY
+		// allowed for the exact map the local save has actually visited. Once an area
+		// or an interior house map hasn't been unlocked yet, cancel with a reason.
 		const targetArea = areaPathOfMap(target);
-		if (SHARED_TOWNS.indexOf(targetArea) === -1 && !hasUnlockedArea(target)) {
-			console.warn('[multiplayer] regroup blocked: area not unlocked (' + targetArea + ', target=' + target + ')');
+		const targetUnlocked = hasUnlockedArea(target) && hasUnlockedMapStrict(target);
+		if (!targetUnlocked) {
+			console.warn('[multiplayer] regroup blocked: target map not unlocked (' + target + ' / area=' + targetArea + ')');
 			try {
 				if (getMpOption('showNameTags') !== false) {
 					showMpToast({ title: t('teleportUnlocked') });
@@ -1919,6 +1931,61 @@ export class Multiplayer {
 				}
 			}
 		} catch (_) { /* a toast must never break the roster handler */ }
+	}
+
+	/** ROUND 107: cutscene bot independence. On non-leader clients, the story bots
+	 * locally added by the game are normally leader-driven puppets. A cutscene that
+	 * requires the bot to walk/act next to the LOCAL player never progresses for
+	 * members because their bot copy is locked to the leader. While the local
+	 * cutscene runs we unpuppet every locally-present bot (let it run its own AI so
+	 * it follows the local player), ignore the leader botState stream, and then
+	 * re-puppet the SAME bots when the cutscene ends so normal leader sync returns. */
+	private beginBotCutsceneIndependence(): void {
+		try {
+			if (this._mpBotCutsceneActive) return;
+			if (this.isPartyLeader) return; // the leader's own bots already follow locally
+			const party: any = (sc as any).party;
+			if (!party || !party.currentParty) return;
+			const roster = this.partyMembers || [];
+			this._mpCutsceneUnpuppetedBots = [];
+			for (const name of party.currentParty) {
+				if (!name || roster.indexOf(name) !== -1) continue; // real member -> mirror, not bot
+				const e = this.partyBotEntity(party, name);
+				if (e && e._mpPuppet) this._mpCutsceneUnpuppetedBots.push(name);
+			}
+			this.ensureLeaderBotsUnPuppeted(); // full AI + noDie/isDefeated restore
+			this._mpBotCutsceneActive = true;
+			console.log('[multiplayer] cutscene bot independence active for: ' + JSON.stringify(this._mpCutsceneUnpuppetedBots));
+		} catch (_) { /* never break the cutscene */ }
+	}
+
+	/** ROUND 107: the cutscene ended — re-freeze bots as leader-driven puppets and
+	 * reset the botState deltas so the very next stream re-syncs their positions. */
+	private endBotCutsceneIndependence(): void {
+		try {
+			if (!this._mpBotCutsceneActive) return;
+			const names = this._mpCutsceneUnpuppetedBots.slice();
+			this._mpCutsceneUnpuppetedBots = [];
+			this._mpBotCutsceneActive = false;
+			const party: any = (sc as any).party;
+			const roster = this.partyMembers || [];
+			for (const name of names) {
+				if (!party || roster.indexOf(name) !== -1) continue;
+				const e = this.partyBotEntity(party, name);
+				if (e && !e._killed) this.markPuppetBot(name);
+			}
+			// Accept the next leader block as a fresh full set (no vanish cull of
+			// bots we temporarily reparented).
+			this._mpLastBotNames = [];
+			this._mpBotSeenOnce = false;
+			console.log('[multiplayer] cutscene bot independence ended; re-syncing leader bots');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 107: ignore the leader stream while local cutscene bots run their own
+	 * AI (blind re-apply would re-puppet + lock them to the leader immediately). */
+	public botCutsceneActive(): boolean {
+		return this._mpBotCutsceneActive;
 	}
 
 	/** Round 11 HOST side: detect native party BOTS (models without _mpName) in
@@ -2269,6 +2336,8 @@ export class Multiplayer {
 			this._mpLastBotStateAt = Date.now();
 			if (data.from === this.name) return;
 			if (this.isPartyLeader) return; // we run our own bots with full AI
+			// ROUND 107: local cutscene takes priority over the leader's bot stream.
+			if (this._mpBotCutsceneActive) return;
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
 			const map = (ig.game && ig.game.mapName) || '';

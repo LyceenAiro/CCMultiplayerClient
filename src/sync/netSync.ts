@@ -181,6 +181,9 @@ export class NetSync {
 	/** Fired by the enterGame wrap when a cutscene ends (multiplayer.ts wires it to
 	 * fire any regroup/teleport request stashed mid-cutscene). */
 	public onCutsceneEnd?: () => void;
+	/** ROUND 107: fired by the enterCutscene wrap (multiplayer wires bot
+	 * independence to it — see beginBotCutsceneIndependence). */
+	public onCutsceneStart?: () => void;
 	/** Round 19 (Part 3): member-side cutscene-spawned monsters ('cs'+uid -> puppet).
 	 * Deliberately SEPARATE from the host-block `puppets` map — the two spaces never
 	 * interact (different spawn path, different reap rules, IGNORE collision). */
@@ -859,7 +862,15 @@ export class NetSync {
 						if (typeof GM.enterCutscene === 'function') {
 							const origEnterCutscene = GM.enterCutscene;
 							GM.enterCutscene = function (this: any, b: any) {
-								try { const ns = cur(); if (ns) ns.inCutscene = true; } catch (_) { /* ignore */ }
+								try {
+									const ns = cur();
+									if (ns) {
+										ns.inCutscene = true;
+										if (typeof ns.onCutsceneStart === 'function') {
+											try { ns.onCutsceneStart(); } catch (_) { /* ignore */ }
+										}
+									}
+								} catch (_) { /* ignore */ }
 								return origEnterCutscene.call(this, b);
 							};
 						}
