@@ -32,7 +32,7 @@ import { PlayerListener } from './listeners/game/playerListener';
 import { IMultiplayerEntity } from './mpEntity';
 import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
-import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, isSharedTownNow } from './util/areaUtil';
+import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey, isSharedTownNow } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows, showMpWindow } from './ui/socialMenuInject';
@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.45';
+export const MP_VERSION = '1.70.46';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1643,9 +1643,15 @@ export class Multiplayer {
 		// allowed for the exact map the local save has actually visited. Once an area
 		// or an interior house map hasn't been unlocked yet, cancel with a reason.
 		const targetArea = areaPathOfMap(target);
-		const targetUnlocked = hasUnlockedArea(target) && hasUnlockedMapStrict(target);
+		const areaUnlocked = hasUnlockedArea(target);
+		const mapUnlocked = hasUnlockedMapStrict(target);
+		const targetUnlocked = areaUnlocked && mapUnlocked;
 		if (!targetUnlocked) {
-			console.warn('[multiplayer] regroup blocked: target map not unlocked (' + target + ' / area=' + targetArea + ')');
+			console.warn('[multiplayer] regroup blocked: target map not unlocked (' + target
+				+ ' / area=' + targetArea
+				+ ' / areaUnlocked=' + areaUnlocked
+				+ ' / mapUnlocked=' + mapUnlocked
+				+ ' / storageKey=' + storageMapKey(target) + ')');
 			try {
 				if (getMpOption('showNameTags') !== false) {
 					showMpToast({ title: t('teleportUnlocked') });

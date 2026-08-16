@@ -99,11 +99,27 @@ export function isSharedTownMap(mapName: string): boolean {
 }
 
 /**
+ * The key under which the engine persists VISITED MAPS in ig.vars.storage.maps.
+ * Verified directly against 1.4.2 game.compiled.js: ig.Vars.onLevelChange stores
+ * `name.toCamel()` where `name` is the map FILE PATH ("rookie-harbor/west"), so
+ * saved keys use camelCased area segments AND SLASHES —
+ * "rookieHarbor/west", NOT "rookieHarbor.west". The old dot-format assumption
+ * never matched, which is exactly why an already-unlocked map could still be
+ * reported as "未解锁".
+ */
+export function storageMapKey(mapName: string): string {
+	return mapName
+		.replace(/(\-[a-z])/g, (m) => m.toUpperCase().replace('-', ''))
+		.replace(/\./g, '/');
+}
+
+/**
  * True when the LOCAL player has unlocked/visited the *area* (block) a map belongs
  * to — i.e. the save's `ig.vars.storage.maps` table has ANY entry whose key starts
  * with the area's camelCase prefix. The engine keys that table by
- * `mapName.toCamel()` (only `-x` -> `X`; dots are kept), so every map of area
- * "autumn-rise" is stored under a key like "autumnRise.path-1".
+ * `mapFileSlashPath.toCamel()` (see storageMapKey), so every map of area
+ * "autumn-rise" is stored under a key like "autumnRise/path-1". The dot-prefix
+ * form is also accepted for saves/handlers that still use dot keys.
  *
  * Area granularity is deliberate: a member can have unlocked the block ("上升之路")
  * without ever standing on the leader's exact sub-map, and the old per-map check
@@ -119,10 +135,11 @@ export function hasUnlockedArea(mapName: string): boolean {
 	try {
 		const storage = (ig.vars as any) && (ig.vars as any).storage;
 		if (!storage || !storage.maps) return true; // can't tell -> don't block
-		const camelArea = areaPathOfMap(mapName)
-			.replace(/(\-[a-z])/g, (m) => m.toUpperCase().replace('-', ''));
+		const camelArea = storageMapKey(areaPathOfMap(mapName));
 		for (const key in storage.maps) {
-			if (key === camelArea || key.indexOf(camelArea + '.') === 0) return true;
+			if (key === camelArea
+				|| key.indexOf(camelArea + '/') === 0
+				|| key.indexOf(camelArea + '.') === 0) return true;
 		}
 		return false;
 	} catch (_) {
@@ -132,19 +149,24 @@ export function hasUnlockedArea(mapName: string): boolean {
 
 /**
  * ROUND 106: STRICT per-map unlock check. `ig.vars.storage.maps` is keyed by the
- * exact camelCased MAP name, so an interior house map (`area.house-1`) must have
- * been VISITED before it counts as unlocked. Missing storage is treated as
- * UNLOCKED for the loader wedge guard users, and as LOCKED by callers that gate
- * manual regroup (they call this through a wrapped check only when storage is
- * present — the group-travel gate itself returns false on missing storage).
+ * exact camelCased map FILE path (slashes, e.g. "rhombusSqr/house-1"), so an
+ * interior house map (`area.house-1`) must have been VISITED before it counts as
+ * unlocked. Missing storage is treated as UNLOCKED for the loader wedge guard
+ * callers, and as LOCKED by callers that gate manual regroup (the group-travel
+ * gate itself returns false on missing storage).
  */
 export function hasUnlockedMapStrict(mapName: string): boolean {
 	try {
 		const storage = (ig.vars as any) && (ig.vars as any).storage;
 		if (!storage || !storage.maps) return false;
+		// Main form (1.4.2 save): camelCase + slashes. Also accept the legacy
+		// dot-camel and raw forms so older/newer save handlers never false-block.
 		const camel = mapName.replace(/(\-[a-z])/g, (m) => m.toUpperCase().replace('-', ''));
+		const candidates = [storageMapKey(mapName), camel, mapName, mapName.replace(/\./g, '/')];
 		for (const key in storage.maps) {
-			if (key === camel) return true;
+			for (const keyCand of candidates) {
+				if (keyCand && key === keyCand) return true;
+			}
 		}
 		return false;
 	} catch (_) {
