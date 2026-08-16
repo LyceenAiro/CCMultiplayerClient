@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.59';
+export const MP_VERSION = '1.70.60';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3554,11 +3554,9 @@ export class Multiplayer {
 				// to the recommendation instead of silently waiting.
 				if (!handle) pick(recommended)();
 			} catch (_) { pick(recommended)(); }
-			// If the player never chooses (window ignored), after 30s follow the same
-			// played/unplayed recommendation rather than always defaulting to fresh.
-			window.setTimeout(() => {
-				if (!settled) pick(recommended)();
-			}, 30000);
+			// ROUND 120: NO auto-pick timeout. The choosing player gets unlimited
+			// time; the two cards are the ONLY way out of the modal (its × and
+			// outside-click dismiss are disabled for this window).
 		});
 	}
 

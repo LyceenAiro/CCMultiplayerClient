@@ -588,16 +588,19 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
      * (×) closes without acting. Reused by the accept/decline window, the withdraw
      * window and the friend-remove confirm. Single-active-window: a new mp window
      * EXPLICITLY replaces any open one (closeMpModals first), so a confirm window
-     * is never closed by an unrelated focus event. */
-    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }>, windowClass?: string }): (() => void) | null {
+     * is never closed by an unrelated focus event. allowDismiss:false removes the
+     * × and ignores outside/focus dismissal — used by the required-choice start
+     * mode picker (ROUND 120), whose only exit is one of its two cards. */
+    function openMpWindow(opts: { title: string, content: JQuery, buttons: Array<{ label: string, style?: string, cb: () => void }>, windowClass?: string, allowDismiss?: boolean }): (() => void) | null {
         closeMpModals(); // deliberate replacement: only a new window closes the old one
         ensureMpWindowStyle();
+        const canDismiss = opts.allowDismiss !== false;
         const box = $('<div class="mpWin"></div>');
         if (opts.windowClass) box.addClass(opts.windowClass);
         const head = $('<div class="mpWinHead"></div>');
         head.append('<span class="mpWinTitle">' + opts.title + '</span>');
         const close = $('<button type="button" class="mpWinClose" title="Close">&times;</button>');
-        head.append(close);
+        if (canDismiss) head.append(close);
         box.append(head);
         box.append(opts.content);
         const btns = $('<div class="mpWinBtns"></div>');
@@ -621,7 +624,6 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             try { ig.system.regainFocus(); } catch (_) { /* ignore */ }
             try { (ig.interact as any).setBlockDelay(0.2); } catch (_) { /* ignore */ }
         };
-        close.on('click', done);
         // Focus moves to the clicked button — only treat focus loss OUTSIDE the
         // window as a dismiss, and ONLY while this window is the active one (a
         // focus event caused by a different window must never close us).
@@ -636,8 +638,11 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             if (!activeMpWindow || activeMpWindow.box[0] !== box[0]) return;
             if (box[0] && !box[0].contains(e.target as Node)) done();
         };
-        ig.system.addFocusListener(onFocus);
-        document.addEventListener('mousedown', onMousedown, true);
+        if (canDismiss) {
+            close.on('click', done);
+            ig.system.addFocusListener(onFocus);
+            document.addEventListener('mousedown', onMousedown, true);
+        }
         activeMpWindow = { box, done };
         return done;
     }
@@ -680,7 +685,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                 grid.append(card);
             }
             content.append(grid);
-            const handle = openMpWindow({ title: opts.title, content, buttons: [], windowClass: 'mpWinStart' });
+            const handle = openMpWindow({ title: opts.title, content, buttons: [], windowClass: 'mpWinStart', allowDismiss: false });
             grid.find('.mpStartCard').on('click', function(this: HTMLElement) {
                 try { opts.onPick($(this).attr('data-mode') as 'fresh' | 'bridge'); } catch (_) { /* ignore */ }
                 try { if (handle) handle(); } catch (_) { /* ignore */ }
