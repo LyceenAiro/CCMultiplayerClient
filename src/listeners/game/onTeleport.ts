@@ -58,7 +58,11 @@ export class OnTeleportListener {
 			const fireTeleport = () => {
 				try {
 					const m: any = (window as any).__mpMain;
-					if (m && m.netSync && m.netSync.isLocalDead()) m.netSync.abortDeathForTeleport();
+					// Force here: for a checkpoint reload the intent-time abort was
+					// deliberately deferred (see abortDeathForTeleport) so no live
+					// playerState leaks into the old instance; changeMapResponse has
+					// arrived by now and we are already routed into the target instance.
+					if (m && m.netSync && m.netSync.isLocalDead()) m.netSync.abortDeathForTeleport(true);
 				} catch (_) { /* ignore */ }
 				// Round 21 (issue 1): 1s no-collision grace for ALL mirrors once the real
 				// teleport actually starts — the new map's mirrors may overlap the local

@@ -7575,9 +7575,26 @@ export class NetSync {
 	/** Silent end of the death state for an IMMINENT teleport: restore HP/camera
 	 * but do NOT move the player — the teleport itself places them. Without this a
 	 * teleport during the countdown (server party-move, menu travel) leaves the pin
-	 * writing stale death-map coordinates onto the player in the new map. */
-	public abortDeathForTeleport(): void {
+	 * writing stale death-map coordinates onto the player in the new map.
+	 *
+	 * ROUND 116 (team-wipe revive split): a checkpoint reload fires its LOAD step
+	 * through this same wrapped teleport. Aborting at teleport INTENT revived the
+	 * player before changeMap had actually moved them to the new instance, so a
+	 * dead=0 + full-HP playerState still escaped into the OLD instance. A teammate
+	 * still down there saw that packet, spawned our "live" mirror, and took the
+	 * INDIVIDUAL soft-revive branch instead of the whole-party checkpoint flow —
+	 * landing the two clients in different instances ("can't see each other after
+	 * a wipe; recovers when someone changes map"). While `_mpCheckpointReloading`
+	 * is set we are at the END of the vanilla defeat cinematic and the very next
+	 * teleport IS the checkpoint load: hold the death state through the deferral
+	 * window instead, and only clear it at fireTeleport (`force`), AFTER
+	 * changeMapResponse has already routed us into the destination instance. */
+	public abortDeathForTeleport(force?: boolean): void {
 		if (!this._mpDead) return;
+		if (!force && this._mpCheckpointReloading) {
+			console.log('[multiplayer] checkpoint reload teleport — holding death state until the map switch fires');
+			return;
+		}
 		console.log('[multiplayer] teleport during death — aborting death state');
 		const p: any = ig.game && ig.game.playerEntity;
 		if (p && p.params) this.respawn(p, true);
@@ -7689,14 +7706,18 @@ export class NetSync {
 	}
 
 	/** ALL live PARTY-member mirrors (round 11: spectate cycling with LMB/RMB).
-	 * Same strict party scoping as firstLiveMirror. */
+	 * Same strict party scoping as firstLiveMirror. ROUND 116: a mirror staged by
+	 * playPuppetDeath (_mpDying) belongs to a player we already know is DEAD — its
+	 * ~500ms death FX does not make it live. Excluding it stops the death system
+	 * from spectating, soft-reviving next to, or delaying the whole-party wipe
+	 * latch on a corpse. */
 	private liveMirrors(): any[] {
 		const out: any[] = [];
 		const party = this.main.partyMembers;
 		for (const name in this.main.players) {
 			if (party.indexOf(name) === -1) continue; // not our party -> never counts
 			const ent = this.main.players[name] && this.main.players[name]!.entity;
-			if (ent && !ent._killed && ent.coll) out.push(ent);
+			if (ent && !ent._killed && !(ent as any)._mpDying && ent.coll) out.push(ent);
 		}
 		return out;
 	}
