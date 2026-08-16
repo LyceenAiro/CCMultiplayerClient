@@ -2303,24 +2303,23 @@ export class NetSync {
 										const m0x = (window as any).__mpMain;
 										const waterGrace = !!(m0x && m0x.netSync && m0x.netSync.prolongMirrorFallGrace
 											&& m0x.netSync.prolongMirrorFallGrace(mir, Date.now()));
-										// ROUND 48 (the persistent "member takes NO enemy damage" fix): the ROUND 47
-										// far-drop released _mpEngaged but left enemy.target STILL set on the far mirror
-										// — and the proximity-acquire branch below requires a TARGETLESS enemy
-										// (`if (!enemy.target)`), so the enemy was stuck: holding a far-mirror target it
-										// never chases (its own nav/A* won't walk a far target) yet unable to re-acquire
-										// a NEAR one. Restore the invariant: on far-drop ALSO clear the target if it is
-										// that same mirror. Next tick the enemy re-acquires via the vanilla host check,
-										// the mirror proximity-acquire below, or the connect re-latch (mirror branch of
-										// onPreDamageModification) — so an enemy that can genuinely reach the member still
-										// attacks; one that cannot re-acquires a close target instead of idling while red.
+										// ROUND 115 (vanilla-like aggro): beyond loseDistance we NO LONGER
+										// force-clear the mirror target. The parent updateTarget already
+										// advances targetLoseTimer every frame a target is out of lose
+										// range and clears it after loseTime (~3s) — that original lock
+										// behaviour is what the player expects mid-fight. While inside
+										// lose range the re-pin below keeps the fight attached.
 										if (!waterGrace && enemy.distanceTo(mir) > loseD) {
-											try { const m2 = (window as any).__mpMain; if (m2 && m2.netSync) m2.netSync._sfxLog('tg.hostlose', 'uid=' + (enemy && enemy.uid) + ' eng=' + (eng && eng.name) + ' d=' + Math.round(enemy.distanceTo(mir)) + '>' + Math.round(loseD)); } catch (_) { /* ignore */ }
-											enemy._mpEngaged = null;
-											// ROUND 48: drop the stale far-mirror target too, so the proximity-acquire
-											// branch below (gated on `!enemy.target`) can pick a REACHABLE candidate —
-											// otherwise this enemy sat target-stuck on the far mirror = "red but never
-											// attacks the member".
-											try { if (enemy.target === mir) enemy.setTarget(null); } catch (_) { /* ignore */ }
+											// ROUND 115 (vanilla-like aggro): DO NOT clear the target
+											// immediately. EnemyType.updateTarget's parent already ticks
+											// targetLoseTimer while beyond loseDistance and drops the target
+											// on its own after loseTime (~3s) — exactly the vanilla lock.
+											// The earlier far-drop here was the mid-fight "monster suddenly
+											// de-aggros" source: any dive/jump past the lose edge instantly
+											// erased the target and reset the enemy AI.
+											try { const m2 = (window as any).__mpMain; if (m2 && m2.netSync) m2.netSync._sfxLog('tg.hold', 'uid=' + (enemy && enemy.uid) + ' eng=' + (eng && eng.name) + ' d=' + Math.round(enemy.distanceTo(mir)) + '>lose=' + Math.round(loseD)); } catch (_) { /* ignore */ }
+											// Deliberately NO setTarget/reset here: the timer running in the
+											// parent call owns the genuine disengage, vanilla-style.
 										} else {
 											enemy.setTarget(mir);
 											try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ }
@@ -2330,53 +2329,16 @@ export class NetSync {
 									enemy._mpEngaged = null;
 								}
 							}
-							// ROUND 39 (item 4): ACTIVELY drop a target the enemy still holds on
-							// a CROSS-BLOCK mirror. The sameBlock gates here only stop RE-pinning
-							// and new acquisition — but an enemy pinned by applyForwardMirrorHit
-							// BEFORE the mirror moved cross-block (or pinned natively) is left with
-							// its target stuck on the nav-unreachable mirror, so it never lands a
-							// hit (the bug's live symptom). Clear it so the enemy falls back to the
-							// host (a reachable same-block player) or idles until the member returns.
-							// ROUND 48: extend the same clear to a mirror that is simply OUT OF LOSE
-							// RANGE (same block). The vanilla lose-check (`updateTarget` parent) only
-							// clears a far target after loseTime (~3s) of targetLoseTimer accrual —
-							// but every member hit / proximity re-acquire resets targetLoseTimer to 0,
-							// so a member fighting from a distance starves that timer forever and the
-							// enemy NEVER clears the far-mirror target on its own, while the acquire
-							// branch below needs `!enemy.target` and can't switch it to a close target.
-							// Dropping the target here (same rule as the ROUND 48 far-drop above, but
-							// for an enemy whose target persisted past its _mpEngaged release) lets the
-							// vanilla/acquire paths re-target a reachable candidate immediately. The
-							// moment the member closes within loseDistance again the proximity-acquire
-							// re-pins them, so a genuine fight is unaffected.
-							if (enemy.target && !enemy._killed) {
-								const tgt = enemy.target;
-								if (tgt && tgt._mpMirror) {
-									const m0w = (window as any).__mpMain;
-									const inWaterGrace = !!(m0w && m0w.netSync && m0w.netSync.prolongMirrorFallGrace
-										&& m0w.netSync.prolongMirrorFallGrace(tgt, Date.now()));
-									let sameBlock2 = true;
-									try {
-										sameBlock2 = (ig.game as any).getLevelIdx(enemy.coll.pos.z)
-											=== (ig.game as any).getLevelIdx(tgt.coll.pos.z);
-									} catch (_) { sameBlock2 = true; }
-									if (!inWaterGrace && !sameBlock2) {
-										try { enemy.setTarget(null); } catch (_) { /* ignore */ }
-										try { enemy._mpEngaged = null; } catch (_) { /* ignore */ }
-									} else {
-										// ROUND 48: same-block mirror but out of lose range AND no longer engaged
-										// -> clear the stale target (the vanilla lose-timer is starved, so it would
-										// never clear on its own). The proximity-acquire below re-acquires the member
-										// the instant they close back within loseDistance, so a real fight is intact.
-										let loseD2 = 320;
-										try { const td3 = this.targetDetect; if (td3 && td3.loseDistance > 0) loseD2 = td3.loseDistance; } catch (_) { /* ignore */ }
-										if (!inWaterGrace && !enemy._mpEngaged && enemy.distanceTo(tgt) > loseD2) {
-											try { const m3 = (window as any).__mpMain; if (m3 && m3.netSync) m3.netSync._sfxLog('tg.rangeless', 'uid=' + (enemy && enemy.uid) + ' d=' + Math.round(enemy.distanceTo(tgt)) + '>' + Math.round(loseD2)); } catch (_) { /* ignore */ }
-											try { enemy.setTarget(null); } catch (_) { /* ignore */ }
-										}
-									}
-								}
-							}
+							// ROUND 115 (vanilla-like aggro): the ROUND 39/48 block that actively
+							// cleared cross-block / out-of-lose mirror targets is REMOVED.
+							// Vanilla EnemyType.updateTarget already owns de-aggro: it ticks
+							// targetLoseTimer beyond loseDistance and clears after loseTime,
+							// and EnemyType.onNavigationFailed clears after repeated path
+							// failures. Immediate clears here made monsters drop their lock
+							// mid-fight the moment a player crossed the lose edge or a z-level
+							// boundary, which is the reported detarget/stop-chasing bug.
+							// Keeping the vanilla timer restores "locks and chases until the
+							// player is genuinely far away".
 						} catch (_) { /* never break target update */ }
 						// If the vanilla logic didn't acquire a target, try the nearest mirror
 						// in detect range (same distance/z-delta rules the vanilla branch uses).

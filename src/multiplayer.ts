@@ -53,7 +53,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.54';
+export const MP_VERSION = '1.70.55';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -1250,8 +1250,34 @@ export class Multiplayer {
 			// the leader themselves is still "owning" the follower bots and should
 			// keep them while solo. Only OUR OWN leave/kick should cull them.
 			const selfWasLeaderBefore = !!(this.partyLeader && this.partyLeader === this.name);
+			const prevPartyId = this._mpPartyId;
 			this.partyMembers = party ? party.members.slice() : [];
 			this.partyLeader = party ? party.leader : undefined;
+			const nextPartyId = party && typeof party.partyId === 'string' ? party.partyId : '';
+			this._mpPartyId = nextPartyId;
+			// ROUND 115: joining a DIFFERENT party (accepting an invite / moving from
+			// a leader-solo party into someone else's team) must drop the follower
+			// bots we brought from the previous party BEFORE the new roster and the
+			// new leader's bot broadcasts are applied. The joining player, not the new
+			// leader, owns that cleanup.
+			if (party && nextPartyId && nextPartyId !== prevPartyId
+				&& (this.partyBots.length > 0 || Object.keys(this._mpAdoptedBots).length > 0)) {
+				console.log('[multiplayer] joined a different party (' + prevPartyId + ' -> ' + nextPartyId
+					+ '); removing previous follower bots: ' + JSON.stringify(this.partyBots));
+				this.clearSyncedPartyBots();
+				// ROUND 115: also remove any local native follower entity not tracked
+				// by the network bot list — this is the "joining with my own bot" case.
+				try {
+					const sp: any = (sc as any).party;
+					if (sp && sp.currentParty) {
+						for (let i = sp.currentParty.length; i--;) {
+							const n = sp.currentParty[i];
+							if (n && this.partyMembers.indexOf(n) !== -1) continue;
+							try { sp.removePartyMember(n, null, true); } catch (_) { /* ignore */ }
+						}
+					}
+				} catch (_) { /* ignore */ }
+			}
 			if (party && party.members.indexOf(this.name) !== -1) this._mpSelfPartyExit = false;
 			this.applyPartyRoster(this.partyMembers);
 			// FIX: a player can open a pause GUI (backpack/inventory/ESC) while SOLO.
@@ -1618,6 +1644,10 @@ export class Multiplayer {
 	 * next partyUpdate(null) can tell "I left" apart from "my party collapsed
 	 * because a MEMBER left". The leader keeps follower bots in the latter case. */
 	private _mpSelfPartyExit = false;
+	/** ROUND 115: last server partyId. A CHANGE means we joined a different party —
+	 * our previously synced/officer follower bots no longer belong and are removed
+	 * BEFORE the new roster is applied. */
+	private _mpPartyId = '';
 	/** Names present in the last received botState block (cull vanished bots). */
 	private _mpLastBotNames: string[] = [];
 	private _mpBotSeenOnce = false;
@@ -1749,6 +1779,19 @@ export class Multiplayer {
 		} catch (_) { /* fall through to teleporting */ }
 		const target = map && typeof map === 'string' ? map : 'rhombus-sqr.central';
 		console.log('[multiplayer] regrouping to party leader ' + leader + ' @ ' + target);
+
+		// ROUND 115 (nearby-regroup mirror loss): if we are ALREADY on the leader's
+		// map we're in the same party instance. Teleporting anyway performs a
+		// changeMap leave/rejoin whose events can despawn the nearby teammates'
+		// mirrors right after the load — "already standing next to the leader, press
+		// teleport, and the leader disappears". Nothing to load, so just no-op here;
+		// the mirrors are already in place.
+		try {
+			if (target === ((ig.game as any).mapName || '')) {
+				console.log('[multiplayer] regroup skipped — already on the leader\'s map ' + target);
+				return;
+			}
+		} catch (_) { /* fall through to teleport */ }
 
 		// UNLOCK POLICY (ROUND 106, user directive): manual "传送到队友身边" is ONLY
 		// allowed for the exact map the local save has actually visited. Once an area
