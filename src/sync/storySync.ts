@@ -1288,6 +1288,52 @@ export class StorySyncController {
 		}
 	}
 
+	/** 1.70.72: classify a trigger as a BLOCKER (barrier / before-enter / runner
+	 * gate) rather than a party story beat. Heuristic (fail-open to gather for
+	 * anything plot-progressing or teleporting):
+	 *   - any CHANGE_VAR_NUMBER of plot.line or TELEPORT -> NOT a blocker;
+	 *   - otherwise a name matching block/barrier/before/runaway (or the known
+	 *     Berg/Trail/Apollo gates) -> blocker;
+	 *   - otherwise an NPC-runner sequence (SET/RESET_NPC_RUNNERS) with no
+	 *     plot/teleport steps -> blocker.
+	 * Blockers play natively on each client, so a lone player is stopped at the
+	 * gate exactly like solo play. */
+	private isBlockerTrigger(trig: any): boolean {
+		try {
+			if (!trig) return false;
+			const raw = trig._mpStorySettings || null;
+			const evType = Number(trig.eventType) || 0;
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			if (evType === EV.PARALLEL || (EV.PARALLEL === undefined && evType === 1)) return false;
+			const name = String((trig.name || (raw && raw.name) || '') as string);
+			const steps = raw && raw.event;
+			let hasPlot = false;
+			let hasTeleport = false;
+			let hasRunner = false;
+			const walk = (v: any): void => {
+				if (v === null || v === undefined) return;
+				if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+				if (typeof v !== 'object') return;
+				if (typeof v.type === 'string') {
+					if (v.type === 'TELEPORT') hasTeleport = true;
+					if (v.type === 'SET_NPC_RUNNERS' || v.type === 'RESET_NPC_RUNNERS') hasRunner = true;
+					if (v.type === 'CHANGE_VAR_NUMBER'
+						&& v.varName && String(v.varName).indexOf('plot.line') === 0) hasPlot = true;
+				}
+				for (const k in v) walk(v[k]);
+			};
+			walk(steps);
+			if (hasPlot || hasTeleport) return false;
+			const BLOCKER_NAMES = new Set(['BeforeEnteringTheMine', 'BeforeTrailBuldingEnter',
+				'BeforeTrailBuldingEnter2', 'ApolloBlocker', 'ApollBarrier1', 'ApollBarrier2',
+				'runAwayBlocker', 'BeforeDoorScene']);
+			if (BLOCKER_NAMES.has(name)) return true;
+			if (/block|barrier|before|runaway/i.test(name)) return true;
+			if (hasRunner && name && /npc|runner|gate|before|block|barrier/i.test(name)) return true;
+			return false;
+		} catch (_) { return false; }
+	}
+
 	/** Returns true when the controller consumed the frame (the caller skips its
 	 * native update). Ready-check mirrors the engine's own trigger predicates. */
 	public maybeGateTrigger(trig: any, kind: 'trigger' | 'location'): boolean {
@@ -1302,6 +1348,12 @@ export class StorySyncController {
 			if (kind === 'location') return false;
 			const typeNum = Number(trig.eventType) || (EV.PARALLEL || 1); // same default as ig.ENTITY.EventTrigger
 			if (typeNum === EV.PARALLEL || (EV.PARALLEL === undefined && typeNum === 1)) return false;
+			// 1.70.72: entry-gate / blocker scenes never gather. These cutscenes
+			// exist to STOP a player crossing into a dungeon (e.g.
+			// bergen.mine-entrance BeforeEnteringTheMine): waiting for the whole
+			// party would leave the barrier open and let players walk through.
+			// They play natively per client instead.
+			if (this.isBlockerTrigger(trig)) return false;
 			this.triggerBannerSeenAt = Date.now();
 			const g: any = ig.game;
 			if (!g || typeof g.isEventStartReady !== 'function') return false;
