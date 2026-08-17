@@ -309,6 +309,10 @@ const enDict: { [key: string]: string } = {
     storySyncSkipDeclinedBy: 'Declined by {name}',
     storySyncSkipInterrupted: 'The vote was interrupted (someone left / a new scene started).',
     storySyncSkipEventEnded: 'The cutscene already ended — no skip needed anymore.',
+    // 1.70.83 — story-companion protection + dead-save self-repair
+    storyCompanionKickBlocked: 'This companion is required by the current story and cannot be kicked.',
+    storyIntegrityFixedTitle: 'Main story state repaired',
+    storyIntegrityFixedBody: 'A broken story/party state was detected and restored automatically.',
     storySyncBarTitle: 'STORY SYNC',
     storySyncBarLeader: 'Leader · playing story',
     storySyncBarMember: 'Following leader',
@@ -617,6 +621,10 @@ const zhDict: { [key: string]: string } = {
     storySyncSkipDeclinedBy: '{name} 拒绝了跳过请求',
     storySyncSkipInterrupted: '表决被中断（有人离队或剧情已进入下一段）。',
     storySyncSkipEventEnded: '这段动画已经结束，无需再跳过。',
+    // 1.70.83 — 剧情队友保护 + 坏档自动修复
+    storyCompanionKickBlocked: '该角色是当前主线剧情必需的队友，无法踢出，以免剧情卡死。',
+    storyIntegrityFixedTitle: '主线剧情状态已修复',
+    storyIntegrityFixedBody: '检测到剧情/队伍状态异常，已自动恢复剪刀手路线与艾米莉队伍状态。',
     storySyncBarTitle: '剧情同步',
     storySyncBarLeader: '队长 · 剧情播放中',
     storySyncBarMember: '跟随队长观看',

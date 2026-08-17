@@ -1712,6 +1712,26 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         return !!(data && (data._mpKick || data._mpLeave || data._mpBotKick || data._mpRegroup || data._mpRemove));
     }
 
+    /** 1.70.83: native companions that are (a) currently needed by an active
+     * story sync or (b) were added by a story cutscene are protected from the
+     * mod's kick path. Removing them desyncs the engine party from the main
+     * story (the reported Emilie kick dead-locked "Follow Schneider to the
+     * First Scholars HQ"). Mod/offline bots with the same display name stay
+     * kickable because their models carry _mpName. */
+    function isStoryProtectedCompanion(party: any, name: string): boolean {
+        try {
+            if (!name || !party || !party.models) return false;
+            const mdl = party.models[name];
+            if (!mdl || mdl._mpName) return false;
+            const opts: any = (sc as any).PARTY_OPTIONS;
+            if (!Array.isArray(opts) || opts.indexOf(name) === -1) return false;
+            if (mdl._mpStoryAdded) return true;
+            const ctl: any = (window as any).__mpStory;
+            if (ctl && typeof ctl.isActive === 'function' && ctl.isActive()) return true;
+        } catch (_) { /* fail open to the old behaviour */ }
+        return false;
+    }
+
     /** Round 22: kick a live LOCAL party member/bot out of sc.party.currentParty
      * with full cleanup (tag drop + roster splice + adopted-bot delete). Shared by
      * the _mpBotKick execute path, the marker-less defense-in-depth route and the
@@ -1719,6 +1739,11 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
     function kickLocalPartyMember(menu: any, name: string): boolean {
         const party: any = (sc as any).party;
         if (!name || !party || typeof party.isPartyMember !== 'function' || !party.isPartyMember(name)) return false;
+        if (isStoryProtectedCompanion(party, name)) {
+            showMpToast({ title: t('storyCompanionKickBlocked') });
+            try { menu.options.hideSortMenu(); menu.onOptionsBack(); } catch (e) { /* ignore */ }
+            return true;
+        }
         try { party.removePartyMember(name, null, true); } catch (e) { /* ignore */ }
         // Round 15: hard-remove the cached name tag — the hide-pass only sets
         // _visible=false, and a cached tag can be re-shown by addTagAt (bot names are

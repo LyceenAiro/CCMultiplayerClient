@@ -282,6 +282,9 @@ export class StorySyncController {
 	private questModelHooksInstalled = false;
 	private eventStepsHooksInstalled = false;
 	private menuHooksInstalled = false;
+	private partyStoryMarkerInstalled = false;
+	private storyIntegrityCheckedAt = 0;
+	private storyIntegrityToastAt = 0;
 
 	constructor(main: any) {
 		this.main = main;
@@ -303,7 +306,10 @@ export class StorySyncController {
 					+ ' eventActive=' + self.currentEventActive
 					+ ' skipVote=' + self.skipVoteSeq
 					+ ' waiting=' + !!(self.waitingTrigger)
-					+ ' triggerBanner=' + self.triggerBannerKey);
+					+ ' triggerBanner=' + self.triggerBannerKey
+					+ ' plot=' + self.mainPlotLine()
+					+ ' followSchneider=' + self.permaTaskFollowsSchneiderHq()
+					+ ' map=' + ((ig.game && (ig.game as any).mapName) || ''));
 				if (self.active && q) {
 					const st = self.serializeQuestState(self.quest);
 					console.log('[mpstory] local quest state:', JSON.stringify(st));
@@ -346,6 +352,21 @@ export class StorySyncController {
 				if (!self.active) console.log('[mpstorytrig] NOT in story-sync mode (this only works while syncing)');
 			} catch (e) { console.warn('[mpstorytrig] failed', e); }
 		};
+	// 1.70.83: force-run the main-story dead-lock repair once (F8 console) and
+	// print the before/after plot.line + party state.
+	(window as any).__mpstoryfix = () => {
+		try {
+			const before = self.mainPlotLine();
+			const party: any = (sc as any).party;
+			console.log('[mpstoryfix] before plot=' + before + ' emilieInParty='
+				+ !!(party && typeof party.isPartyMember === 'function' && party.isPartyMember('Emilie'))
+				+ ' followSchneider=' + self.permaTaskFollowsSchneiderHq());
+			self.repairBrokenMainStoryState();
+			const after = self.mainPlotLine();
+			console.log('[mpstoryfix] after plot=' + after + ' emilieInParty='
+				+ !!(party && typeof party.isPartyMember === 'function' && party.isPartyMember('Emilie')));
+		} catch (e) { console.warn('[mpstoryfix] failed', e); }
+	};
 	}
 
 	// ---------------------------------------------------------------- install
@@ -961,6 +982,7 @@ export class StorySyncController {
 	private tick(): void {
 		try {
 			this.ensureEngineHooks();
+			this.ensureStoryIntegrity();
 			if (this.active) {
 				if (this.isLocalLeader()) {
 					this.stateTimer -= ig.system.tick || 0;
@@ -1009,6 +1031,7 @@ export class StorySyncController {
 		this.installTriggerHooks();
 		this.installEventStepHooks();
 		this.installQuestMenuHooks();
+		this.installPartyStoryMarkerHook();
 	}
 
 	private installQuestObserver(): void {
@@ -2176,6 +2199,139 @@ export class StorySyncController {
 				console.log('[storysync] unanimous skip — fast-forward locally');
 			}
 		} catch (_) { /* ignore */ }
+	}
+
+	// ------------------------------------------- story-companion integrity guard
+
+	/** 1.70.83: mark party members ADDED while a cutscene runs (ADD_PARTY_MEMBER
+	 * event steps) as story-added. The Social-menu kick path refuses to remove
+	 * story-added native companions, so a player can no longer kick Emilie (or
+	 * any later story companion) out of the engine party and desync the main
+	 * story from the game's party expectations. */
+	private installPartyStoryMarkerHook(): void {
+		try {
+			if (this.partyStoryMarkerInstalled) return;
+			const PM: any = (sc as any).PartyModel;
+			if (!PM || typeof PM.inject !== 'function') return;
+			this.partyStoryMarkerInstalled = true;
+			PM.inject({
+				addPartyMember(this: any, a: any, b: any, c: any, d: any, i: any) {
+					const r = this.parent(a, b, c, d, i);
+					try {
+						const model: any = (sc as any).model;
+						if (model && typeof model.isCutscene === 'function' && model.isCutscene()) {
+							const mdl = this.models && this.models[a];
+							if (mdl) mdl._mpStoryAdded = true;
+						}
+					} catch (_) { /* marker must never break the native call */ }
+					return r;
+				},
+			});
+			console.log('[storysync] story party-member marker installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Runs OUTSIDE story-sync mode only (during sync the leader's relayed state
+	 * is authoritative and must not be fought). Detects the known dead-lock that
+	 * kicking a story companion can produce — the "Follow Schneider to the First
+	 * Scholars HQ" task with a plot.line that no longer spawns Schneider — and
+	 * repairs it in the live session. The next normal save persists the fix. */
+	private ensureStoryIntegrity(): void {
+		try {
+			if (this.active) return;
+			if (!(ig as any).vars || !(ig as any).game || !ig.game.playerEntity) return;
+			const now = Date.now();
+			if (now - this.storyIntegrityCheckedAt < 1000) return;
+			this.storyIntegrityCheckedAt = now;
+			this.repairBrokenMainStoryState();
+		} catch (_) { /* never break the frame */ }
+	}
+
+	private permaTaskFollowsSchneiderHq(): boolean {
+		try {
+			const model: any = (sc as any).model;
+			const task = model && model.permaTask;
+			if (!task) return false;
+			let raw = '';
+			try { raw = JSON.stringify(task.data || task); } catch (_) { raw = String(task.data || task); }
+			if (raw.indexOf('First Scholars HQ') !== -1 && raw.indexOf('Schneider') !== -1
+				&& raw.indexOf('Follow') !== -1) return true;
+			// Fallback for a localized-only task payload.
+			const text = (ig as any).LangLabel && typeof (ig as any).LangLabel.getText === 'function'
+				? String((ig as any).LangLabel.getText(task)) : '';
+			return text.indexOf('第一学者') !== -1 && text.indexOf('剪刀手') !== -1 && text.indexOf('跟着') !== -1;
+		} catch (_) { return false; }
+	}
+
+	private repairBrokenMainStoryState(): void {
+		const vars: any = (ig as any).vars;
+		if (!vars || typeof vars.get !== 'function' || typeof vars.set !== 'function') return;
+		let line = Number(vars.get('plot.line'));
+		if (!isFinite(line)) return;
+		if (!this.permaTaskFollowsSchneiderHq()) return;
+		let fixed = false;
+		// The meeting scene normally ends at 3710 (Schneider spawns on
+		// autumn.path-3-1 from 3710 on). A snapshot rollback can leave the task
+		// text behind while plot.line sits below that.
+		if (line >= 3700 && line < 3710) {
+			vars.set('plot.line', 3710);
+			line = 3710;
+			fixed = true;
+			console.warn('[storysync] repaired plot.line -> 3710 for "Follow Schneider" task');
+		}
+		// Schneider hands over the guild pass at 3720 and hides again at 3730.
+		// If the pass is missing but the plot is already past his scene, roll the
+		// line back so he can be met again.
+		if (line >= 3730 && line < 3750) {
+			const inv: any = (sc as any).inventory;
+			const hasPass = !!(inv && typeof inv.getItemAmount === 'function' && inv.getItemAmount(170) > 0);
+			if (!hasPass) {
+				vars.set('plot.line', 3720);
+				line = 3720;
+				fixed = true;
+				console.warn('[storysync] repaired plot.line -> 3720 (guild pass missing)');
+			}
+		}
+		// Emilie is expected to be in the engine party for this whole segment
+		// (the Schneider scene animates her). Restore her when the story state
+		// says she should already be there.
+		if (line >= 3710 && line < 3750) {
+			const party: any = (sc as any).party;
+			if (party && typeof party.isPartyMember === 'function' && !party.isPartyMember('Emilie')
+				&& party.models && party.models['Emilie']) {
+				try {
+					party.models['Emilie']._mpStoryAdded = true;
+					party.addPartyMember('Emilie', null, true, false);
+					fixed = true;
+					console.warn('[storysync] repaired missing story companion Emilie');
+				} catch (_) { /* ignore */ }
+			}
+		}
+		// Belt-and-braces for the exact reported map: while the task is active and
+		// the plot is in Schneider's window, force his NPC visible/state-refreshed
+		// if it exists but was left hidden/killed by a bad save transition.
+		if (line >= 3710 && line < 3730 && ((ig.game as any).mapName || '') === 'autumn.path-3-1') {
+			const NPC: any = (ig.ENTITY as any).NPC;
+			const ents: any[] = (ig.game as any).entities || [];
+			let found = false;
+			for (const e of ents) {
+				if (!e || e._killed || !(NPC && e instanceof NPC)) continue;
+				if (String(e.name || '') !== 'schneider') continue;
+				found = true;
+				if (e.hidden) { e.hidden = false; fixed = true; }
+				if (e.animState && e.animState.alpha === 0) { e.animState.alpha = 1; fixed = true; }
+				try { if (typeof e.updateNpcState === 'function') e.updateNpcState(true); } catch (_) { /* ignore */ }
+				break;
+			}
+			if (!found) console.warn('[storysync] Follow-Schneider task active but NPC "schneider" missing on autumn.path-3-1');
+		}
+		if (fixed) {
+			try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			if (Date.now() - this.storyIntegrityToastAt > 8000) {
+				this.storyIntegrityToastAt = Date.now();
+				showMpToast({ title: t('storyIntegrityFixedTitle'), subtitle: t('storyIntegrityFixedBody') });
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------ nudges
