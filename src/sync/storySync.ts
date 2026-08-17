@@ -26,7 +26,7 @@ import { showMpToast } from '../ui/toasts';
  *      a member leaving/kicked affects only that member; others keep syncing.
  */
 
-const GATHER_RADIUS = 320;
+const GATHER_RADIUS = 480;
 const GATHER_Z_DELTA = 96;
 const STATE_SEND_INTERVAL = 0.25;   // seconds — leader quest-state coalescing
 const STATE_HEARTBEAT = 1.5;        // seconds — periodic re-send for self-heal
@@ -1281,11 +1281,12 @@ export class StorySyncController {
 		this.triggerBannerTrig = trig;
 		this.triggerBannerSignature = '';
 		this.triggerBannerSeenAt = Date.now();
-		// Multiple nearby triggers can satisfy their conditions on alternating
-		// frames; keep ONE console line per trigger per 10s instead of flooding.
-		const now = Date.now();
-		if (!this.triggerZoneLog[key] || now - this.triggerZoneLog[key] > 10000) {
-			this.triggerZoneLog[key] = now;
+		// 1.70.69: keep ONE console line per trigger for the whole session (nearby
+		// triggers satisfy their conditions on alternating frames — logging even
+		// every 10s produced the repeated onEnter/arrive spam). __mpstorytrig()
+		// remains available for live diagnosis.
+		if (!this.triggerZoneLog[key]) {
+			this.triggerZoneLog[key] = Date.now();
 			console.log('[storysync] entered trigger zone kind=' + kind + ' key=' + this.triggerKey(trig)
 				+ ' name=' + (trig.name || '(none)') + ' eventType=' + trig.eventType);
 		}
