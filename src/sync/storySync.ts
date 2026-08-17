@@ -223,6 +223,7 @@ export class StorySyncController {
 	private triggerBannerTrig: any = null;
 	private triggerBannerSeenAt = 0;
 	private triggerBannerSent = false;
+	private triggerZoneLog: { [key: string]: number } = Object.create(null);
 	private hudStar: JQuery | null = null;
 
 	private updateRegistered = false;
@@ -1113,6 +1114,14 @@ export class StorySyncController {
 		try {
 			if (!this.active) return false;
 			if (!trig || !trig.coll) return false;
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			// 1.70.66: gate ONLY story events. PARALLEL EventTriggers (snow on/off,
+			// ambient effects) and every LocationEvent are environmental — they must
+			// keep running natively on each client, otherwise we swallow harmless
+			// weather switches and spam "entered trigger zone" for non-story spots.
+			if (kind === 'location') return false;
+			const typeNum = Number(trig.eventType) || (EV.PARALLEL || 1); // same default as ig.ENTITY.EventTrigger
+			if (typeNum === EV.PARALLEL || (EV.PARALLEL === undefined && typeNum === 1)) return false;
 			this.triggerBannerSeenAt = Date.now();
 			const g: any = ig.game;
 			if (!g || typeof g.isEventStartReady !== 'function') return false;
@@ -1218,8 +1227,14 @@ export class StorySyncController {
 		this.triggerBannerTrig = trig;
 		this.triggerBannerSignature = '';
 		this.triggerBannerSeenAt = Date.now();
-		console.log('[storysync] entered trigger zone kind=' + kind + ' key=' + this.triggerKey(trig)
-			+ ' name=' + (trig.name || '(none)') + ' eventType=' + trig.eventType);
+		// Multiple nearby triggers can satisfy their conditions on alternating
+		// frames; keep ONE console line per trigger per 10s instead of flooding.
+		const now = Date.now();
+		if (!this.triggerZoneLog[key] || now - this.triggerZoneLog[key] > 10000) {
+			this.triggerZoneLog[key] = now;
+			console.log('[storysync] entered trigger zone kind=' + kind + ' key=' + this.triggerKey(trig)
+				+ ' name=' + (trig.name || '(none)') + ' eventType=' + trig.eventType);
+		}
 	}
 
 	private clearTriggerBannerIf(trig: any, kind: 'trigger' | 'location'): void {
