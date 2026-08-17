@@ -144,29 +144,61 @@ export function ensureStorySyncStyle(): void {
 .mpTriggerBanner button.mpSkipVoteNo { background: #5c1f28; border-color: #ff8e9f; color: #ffe3e7; }
 .mpTriggerBanner button.mpSkipVoteNo:hover { background: #7c2a36; }
 .mpStoryComm { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
-	z-index: 10030; pointer-events: none; text-align: center;
-	padding-top: calc(33vh - 130px); animation: mpStoryCommBack 3.4s ease forwards; }
-.mpStoryCommGlow { position: absolute; left: 50%; top: calc(33vh - 130px); width: 640px; height: 220px;
+	z-index: 10030; pointer-events: none; display: flex;
+	align-items: center; justify-content: center;
+	animation: mpStoryCommBack 3.4s ease forwards; }
+.mpStoryCommGlow { position: absolute; left: 50%; top: 47%; width: 780px; height: 280px;
 	transform: translate(-50%,-50%); border-radius: 50%;
-	background: radial-gradient(circle, rgba(255,198,64,0.28) 0%, rgba(255,198,64,0.06) 55%, transparent 72%);
-	filter: blur(6px); animation: mpStoryCommPulse 1.5s ease-in-out infinite; }
-.mpStoryCommDuty { position: relative; font-family: 'Noto Sans SC','Microsoft YaHei',sans-serif;
-	font-size: 27px; font-weight: bold; letter-spacing: 12px; color: #8fd6ff;
-	text-shadow: 0 0 12px rgba(111,199,255,0.8); margin-bottom: 14px;
-	animation: mpStoryZoomIn 0.38s cubic-bezier(.2,1.4,.4,1) forwards; }
-.mpStoryCommTitle { position: relative; font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
-	font-size: 62px; font-weight: 900; letter-spacing: 10px; color: #ffd068;
-	background: linear-gradient(180deg, #fff7cf 12%, #ffe08a 38%, #f4a91c 62%, #8a5110 95%);
+	background: radial-gradient(circle, rgba(255,198,64,0.26) 0%, rgba(255,198,64,0.05) 55%, transparent 72%);
+	filter: blur(8px); animation: mpStoryCommPulse 1.6s ease-in-out infinite; }
+.mpStoryCommInner { position: relative; text-align: center; transform: translateY(-6vh); }
+.mpStoryCommTitle { position: relative;
+	font-family: 'STZhongsong','Source Han Serif SC','Noto Serif SC','SimSun',serif;
+	font-size: 58px; font-weight: 700; letter-spacing: 16px; padding-left: 16px; color: #ffd068;
+	background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
 	-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
-	text-shadow: 0 3px 0 rgba(70,35,0,0.45), 0 0 26px rgba(255,196,80,0.95);
-	animation: mpStoryZoomIn 0.5s cubic-bezier(.2,1.5,.4,1) forwards; }
-.mpStoryCommSub { position: relative; margin-top: 16px; font-size: 16px; letter-spacing: 3px;
-	color: #eaf7ff; text-shadow: 0 0 10px rgba(111,199,255,0.9);
-	animation: mpStoryZoomIn 0.62s cubic-bezier(.2,1.5,.4,1) forwards; }
-.mpStoryCommLine { position: relative; width: 520px; max-width: 76vw; height: 2px;
-	margin-top: 10px; background: linear-gradient(90deg, transparent, #ffd068 18%, #fff7cf 50%, #ffd068 82%, transparent);
-	transform: scaleX(0); animation: mpStoryLine 0.5s ease-out 0.18s forwards; }
+	filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 24px rgba(255,196,80,0.6));
+	animation: mpStoryZoomIn 0.5s cubic-bezier(.2,1.5,.4,1) both; }
+.mpStoryCommSub { position: relative; margin-top: 22px;
+	font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
+	font-size: 17px; letter-spacing: 5px; padding-left: 5px;
+	color: #eaf3ff; text-shadow: 0 0 10px rgba(111,199,255,0.9);
+	animation: mpStoryZoomIn 0.62s cubic-bezier(.2,1.5,.4,1) both; }
+.mpStoryCommOrnament { display: flex; align-items: center; width: 560px; max-width: 78vw;
+	margin: 0 auto 20px; transform: scaleX(0); transform-origin: 50% 50%;
+	animation: mpStoryLine 0.45s ease-out 0.12s forwards; }
+.mpStoryCommOrnament.below { margin: 20px auto 0; animation-delay: 0.3s; }
+.mpStoryCommOrnament .seg { flex: 1 1 auto; height: 1px; }
+.mpStoryCommOrnament .seg.left { background: linear-gradient(90deg, transparent, rgba(255,224,150,0.95)); }
+.mpStoryCommOrnament .seg.right { background: linear-gradient(90deg, rgba(255,224,150,0.95), transparent); }
+.mpStoryCommOrnament .dia { flex: 0 0 auto; width: 7px; height: 7px; margin: 0 12px;
+	transform: rotate(45deg); background: #ffe9a8; box-shadow: 0 0 8px rgba(255,224,150,0.9); }
+.mpStoryParty { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+	z-index: 10030; pointer-events: none; display: flex;
+	align-items: center; justify-content: center;
+	animation: mpStoryPartyBack 3s ease forwards; }
+.mpStoryPartyGlow { position: absolute; left: 50%; top: 47%; width: 620px; height: 220px;
+	transform: translate(-50%,-50%); border-radius: 50%; filter: blur(8px);
+	animation: mpStoryCommPulse 1.5s ease-in-out infinite; }
+.mpStoryParty.light .mpStoryPartyGlow { background: radial-gradient(circle, rgba(140,200,255,0.24) 0%, rgba(140,200,255,0.05) 55%, transparent 72%); }
+.mpStoryParty.full .mpStoryPartyGlow { background: radial-gradient(circle, rgba(255,198,64,0.28) 0%, rgba(255,198,64,0.06) 55%, transparent 72%); }
+.mpStoryPartyInner { position: relative; text-align: center; transform: translateY(-6vh); }
+.mpStoryPartyTitle { position: relative;
+	font-family: 'STZhongsong','Source Han Serif SC','Noto Serif SC','SimSun',serif;
+	font-size: 44px; font-weight: 700; letter-spacing: 14px; padding-left: 14px;
+	-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+	animation: mpStoryZoomIn 0.45s cubic-bezier(.2,1.5,.4,1) both; }
+.mpStoryParty.light .mpStoryPartyTitle { background: linear-gradient(180deg, #f4fcff 10%, #d5ecff 38%, #8fc1ee 62%, #46719e 96%);
+	filter: drop-shadow(0 2px 1px rgba(10,30,50,0.55)) drop-shadow(0 0 20px rgba(140,200,255,0.6)); }
+.mpStoryParty.full .mpStoryPartyTitle { background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
+	filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 20px rgba(255,196,80,0.6)); }
+.mpStoryParty .mpStoryCommOrnament { width: 420px; margin-bottom: 16px; }
+.mpStoryParty .mpStoryCommOrnament.below { margin: 16px auto 0; }
+.mpStoryParty.light .mpStoryCommOrnament .seg.left { background: linear-gradient(90deg, transparent, rgba(170,215,255,0.95)); }
+.mpStoryParty.light .mpStoryCommOrnament .seg.right { background: linear-gradient(90deg, rgba(170,215,255,0.95), transparent); }
+.mpStoryParty.light .mpStoryCommOrnament .dia { background: #cfe8ff; box-shadow: 0 0 8px rgba(170,215,255,0.9); }
 @keyframes mpStoryCommBack { 0%, 82% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
+@keyframes mpStoryPartyBack { 0%, 80% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
 @keyframes mpStoryZoomIn { 0% { transform: scale(0.55); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
 @keyframes mpStoryLine { to { transform: scaleX(1); } }
 @keyframes mpStoryCommPulse { 0%,100% { opacity: 0.55; transform: translate(-50%,-50%) scale(0.9); }
@@ -266,6 +298,8 @@ export class StorySyncController {
 	private npcHookInstalled = false;
 	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
+	/** Cached ig.Sound fanfares (quest-accept / light-party / full-party). */
+	private storySounds: { [key: string]: any } = Object.create(null);
 
 	private updateRegistered = false;
 	private questObserverInstalled = false;
@@ -290,6 +324,9 @@ export class StorySyncController {
 		this.main = main;
 		(window as any).__mpStory = this;
 		ensureStorySyncStyle();
+		// Pre-create the FF14 fanfare sounds: construction already asks the sound
+		// manager to fetch+decode the files, so the banner never plays silent.
+		try { this.getStorySound('accept'); this.getStorySound('light'); this.getStorySound('full'); } catch (_) { /* lazy-recreated on play */ }
 		// Read-only diagnostic (F8 console): `__mpstory()` dumps the live mode.
 		// Useful when a trigger is stuck "waiting" — the `members` set shows who
 		// the gather gate is still waiting for, and `event` shows the last seq.
@@ -2655,21 +2692,95 @@ export class StorySyncController {
 
 	/** 1.70.62: FF14-duty-commence-style big glowing text for every party member
 	 * (leader included). Pure overlay — no pointer interception, auto-fades after
-	 * the CSS animation (3.4s). */
+	 * the CSS animation (3.4s). Chinese-only layout: gold serif title between the
+	 * FF14 line/diamond ornaments, quest name below, quest-accept fanfare, then —
+	 * for parties of 4+ — the light/full party banner follows once this one has
+	 * faded out. */
 	private playCommencementBanner(): void {
 		try {
 			if (typeof document === 'undefined' || !document.body) return;
 			try { $('.mpStoryComm').remove(); } catch (_) { /* ignore */ }
 			const box = $('<div class="mpStoryComm"></div>');
 			box.append('<div class="mpStoryCommGlow"></div>');
-			box.append('<div class="mpStoryCommDuty">' + t('storySyncCommDuty') + '</div>');
-			box.append('<div class="mpStoryCommTitle">' + t('storySyncCommTitle') + '</div>');
-			box.append('<div class="mpStoryCommLine"></div>');
-			box.append('<div class="mpStoryCommSub">' + t('storySyncCommSub').replace('{quest}', this.questLabel(this.quest)) + '</div>');
+			const inner = $('<div class="mpStoryCommInner"></div>');
+			inner.append(this.partyOrnamentHtml(false));
+			inner.append('<div class="mpStoryCommTitle">' + t('storySyncCommTitle') + '</div>');
+			inner.append(this.partyOrnamentHtml(true));
+			inner.append('<div class="mpStoryCommSub">' + t('storySyncCommSub').replace('{quest}', this.questLabel(this.quest)) + '</div>');
+			box.append(inner);
 			$(document.body).append(box);
 			(window as any).setTimeout(() => {
 				try { box.remove(); } catch (_) { /* ignore */ }
 			}, 3500);
+			// FF14 quest-accept fanfare for EVERY party member (onStart ran on all
+			// clients at once).
+			this.playStorySound('accept');
+			// Parties of 4+: after the commencement banner has faded, follow up with
+			// the light/full party banner + the FF14 duty-enter jingle.
+			const count = this.members.length;
+			const quest = this.quest;
+			if (count >= 4) {
+				const kind = count >= 8 ? 'full' : 'light';
+				(window as any).setTimeout(() => {
+					try {
+						if (!this.active || this.quest !== quest) return; // sync ended meanwhile
+						this.playPartyBanner(kind);
+					} catch (_) { /* ignore */ }
+				}, 3700);
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Shared FF14-style horizontal ornament: gradient line - diamond - gradient line. */
+	private partyOrnamentHtml(below: boolean): string {
+		return '<div class="mpStoryCommOrnament' + (below ? ' below' : '') + '">'
+			+ '<span class="seg left"></span><span class="dia"></span><span class="seg right"></span></div>';
+	}
+
+	/** Second banner for parties of 4+: 轻锐小队 (4-7 players) / 满编小队 (8), with
+	 * the matching FF14 party-assembled jingle. */
+	private playPartyBanner(kind: 'light' | 'full'): void {
+		try {
+			if (typeof document === 'undefined' || !document.body) return;
+			try { $('.mpStoryParty').remove(); } catch (_) { /* ignore */ }
+			const full = kind === 'full';
+			const box = $('<div class="mpStoryParty ' + (full ? 'full' : 'light') + '"></div>');
+			box.append('<div class="mpStoryPartyGlow"></div>');
+			const inner = $('<div class="mpStoryPartyInner"></div>');
+			inner.append(this.partyOrnamentHtml(false));
+			inner.append('<div class="mpStoryPartyTitle">' + t(full ? 'storySyncPartyFull' : 'storySyncPartyLight') + '</div>');
+			inner.append(this.partyOrnamentHtml(true));
+			box.append(inner);
+			$(document.body).append(box);
+			this.playStorySound(full ? 'full' : 'light');
+			(window as any).setTimeout(() => {
+				try { box.remove(); } catch (_) { /* ignore */ }
+			}, 3100);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Lazily create + cache an engine sound (same idiom as the game's own GUI
+	 * sounds — see socialOverlay's comm ring). Returns null when the sound system
+	 * is not up yet; the caller then simply retries at play time. */
+	private getStorySound(key: 'accept' | 'light' | 'full'): any {
+		const paths: { [key: string]: string } = {
+			accept: 'media/sound/storysync/quest-accept.mp3',
+			light: 'media/sound/storysync/light-party.mp3',
+			full: 'media/sound/storysync/full-party.mp3',
+		};
+		let snd = this.storySounds[key];
+		if (!snd) {
+			snd = new (ig as any).Sound(paths[key], 1);
+			this.storySounds[key] = snd;
+		}
+		return snd;
+	}
+
+	/** Play one cached fanfare; a missing/blocked sound must never break a banner. */
+	private playStorySound(key: 'accept' | 'light' | 'full'): void {
+		try {
+			const snd = this.getStorySound(key);
+			if (snd && typeof snd.play === 'function') snd.play(false);
 		} catch (_) { /* ignore */ }
 	}
 

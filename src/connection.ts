@@ -47,7 +47,7 @@ export interface IConnection {
      * badges guard with `conn.getNetQuality?.()`. */
     getNetQuality?(): INetQuality;
 
-    identify(username: string): Promise<IIdentifyResult>;
+    identify(username: string, mirrorMode?: boolean): Promise<IIdentifyResult>;
     /** Round 19: `isolated` is the PVP-duel isolation tri-state forwarded to the
      * server (true = pin routing to solo:<user>:<map>; false = clear; absent =
      * leave the override unchanged). The connector ALSO makes it sticky: an
@@ -61,7 +61,7 @@ export interface IConnection {
     // ---- NEW sync system (whole-state broadcast) ----
     /** Stream our own full player state (pos/face/anim/hp/sp) each frame.
      * `dead`=1 while our player is dead: teammates despawn our mirror until respawn. */
-    updatePlayerState(state: { pos: Vec3, face: Vec2, anim: string, dead?: number, hp?: number, maxHp?: number, sp?: number, maxSp?: number, cg?: number, em?: number, cl?: string, cs?: number }): void;
+    updatePlayerState(state: { pos: Vec3, face: Vec2, anim: string, dead?: number, hp?: number, maxHp?: number, sp?: number, maxSp?: number, cg?: number, em?: number, cl?: string, cs?: number, xa?: string, xf?: string }): void;
     /** Solo-instance optimization: a ~1Hz minimal position beacon (a playerState
      * carrying only {pos}) that keeps the server's memberPos cache fresh while we
      * are the only member of our instance — for late-joiner spawn placement and
@@ -170,6 +170,13 @@ export interface IConnection {
      * client, so it unambiguously identifies the same plant for everyone. The server relays
      * it to the other same-instance members (sender excluded). */
     plantBreak(data: { map: string, mapId: number }): void;
+    /** 1.71.0 (dungeon puzzles): any client -> its instance — compact state of
+     * dungeon puzzle entities (boxes/platforms/switches/ice pillars) that changed
+     * locally. The server relays it to the other same-instance members. */
+    puzzleState(map: string, entries: Array<{ mi: number, p?: [number, number, number], on?: number, hits?: number, st?: number, anim?: string, ph?: number, act?: number, mv?: number, hd?: number, gone?: number }>): void;
+    /** 1.71.0: a same-instance client relayed dungeon puzzle state — apply it to
+     * our matching local entities by mapId. */
+    onPuzzleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
 
     updateEntityPosition(id: number, pos: Vec3): void;
     updateEntityAnimation(id: number, face: Vec2, anim: string): void;
@@ -288,6 +295,11 @@ export interface IConnection {
     /** Round 23: the server confirmed a save upload finished persisting (the client
      * shows the save-succeeded toast). `bytes` = the reassembled payload length. */
     onSaveSaved(callback: (slot: string, bytes: number) => void): void;
+    /** 1.71.0: ask the server to stream one of the five save mirrors (newest first,
+     * -1 = fall back to the current latest save). */
+    saveMirrorRestore(index: number): void;
+    /** 1.71.0: the server accepted/rejected a saveMirrorRestore request. */
+    onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number }) => void): void;
     /** Round 27 (item 5): the server rejected/dropped a save upload (rate-limited,
      * corrupt stream, or area-change storm suppression). The exit-to-title upload
      * dialog resolves FAILURE on this so the player exits instead of waiting for the

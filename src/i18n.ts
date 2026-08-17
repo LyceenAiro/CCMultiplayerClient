@@ -112,6 +112,15 @@ const enDict: { [key: string]: string } = {
     loginSubmit: 'Submit',
     loginRequired: 'Please enter a username',
     loginRecent: 'Recent',
+    // 1.71.0 — save mirror rollback
+    loginMirror: 'Rollback from Mirror',
+    mirrorTitle: 'Save Mirror Rollback',
+    mirrorEmpty: 'No save mirrors yet — the latest save is the only option.',
+    mirrorUseLatest: 'Use Latest Save',
+    mirrorNotFound: 'That snapshot no longer exists.',
+    mirrorNoSave: 'No save data found for this account.',
+    mirrorInvalid: 'Invalid snapshot selection.',
+    mirrorSendFailed: 'Could not send the restore request.',
     // ROUND 103 — new online character start-mode popup
     startModeTitle: 'Choose Your Start',
     startModeBody: 'This is a new online character. Start from the very beginning of the story, or jump to Rookie Harbor bridge?',
@@ -319,9 +328,11 @@ const enDict: { [key: string]: string } = {
     storySyncBarPlaying: 'Cutscene playing',
     storySyncBarCancel: 'Cancel Sync',
     // 1.70.62 — FF14-style duty-commence banner + resting star
-    storySyncCommDuty: 'DUTY COMMENCED',
+    // (Chinese-only layout per request: no English duty line.)
     storySyncCommTitle: 'STORY SYNC',
     storySyncCommSub: 'Quest: {quest}',
+    storySyncPartyLight: 'LIGHT PARTY',
+    storySyncPartyFull: 'FULL PARTY',
     storySyncStarTip: 'Story sync in progress',
 };
 
@@ -424,6 +435,15 @@ const zhDict: { [key: string]: string } = {
     loginSubmit: '登录',
     loginRequired: '请输入用户名',
     loginRecent: '最近登录',
+    // 1.71.0 — 存档镜像回溯
+    loginMirror: '镜像回溯',
+    mirrorTitle: '存档镜像回溯',
+    mirrorEmpty: '该账号还没有存档镜像，只能使用当前最新存档。',
+    mirrorUseLatest: '使用当前最新存档',
+    mirrorNotFound: '所选镜像已不存在。',
+    mirrorNoSave: '该账号没有存档数据。',
+    mirrorInvalid: '镜像选择无效。',
+    mirrorSendFailed: '镜像恢复请求发送失败。',
     // ROUND 103 — 新线上角色起始方式弹窗
     startModeTitle: '选择起始方式',
     startModeBody: '这是一个全新的线上角色。从故事最开始创建存档，还是直接进入新手港新手桥？',
@@ -630,10 +650,11 @@ const zhDict: { [key: string]: string } = {
     storySyncBarMember: '跟随队长观看',
     storySyncBarPlaying: '动画播放中',
     storySyncBarCancel: '取消同步',
-    // 1.70.62 — FF14式“任务开始”大字横幅 + 常驻星星
-    storySyncCommDuty: 'DUTY COMMENCED',
+    // 1.70.62 — FF14式“任务开始”大字横幅 + 常驻星星（纯中文排版）
     storySyncCommTitle: '任务同步开始',
     storySyncCommSub: '任务：{quest}',
+    storySyncPartyLight: '轻锐小队',
+    storySyncPartyFull: '满编小队',
     storySyncStarTip: '任务同步中',
 };
 

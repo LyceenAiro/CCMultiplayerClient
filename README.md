@@ -88,6 +88,14 @@ everything goes through `CCMultiplayerServer`.
   cutscene / element / combat-class / guard timing.
 - **Enemy sync** — host-authoritative, two cadences (15 Hz base + an
   option-driven hostile stream), plus enemy sounds / attacks / loot.
+- **Dungeon mechanism sync (1.71.0)** — push/pull boxes, sliding blocks,
+  floating platforms, switches, ice pillars and other puzzle entities sync
+  inside dungeons via a compact `puzzleState` relay + host snapshots.
+- **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
+  stays asleep when the instance host migrates.
+- **Story-leader action relay (1.71.0)** — external animations (sitting down,
+  poses) the story leader performs are replayed on every member's leader
+  mirror.
 - **Combat feedback** — enemy hits, guards & perfect guards, counter /
   guard-break FX, skill sound/FX replay, and party-wide charge time-stop.
 - **Death & respawn** — downed players become spectators; a full-party wipe
@@ -99,7 +107,12 @@ everything goes through `CCMultiplayerServer`.
 - **Friends** — request / accept / decline / remove, request management, and a
   name search; the official companions can be re-added as friends (auto-accept).
 - **Party bots** — the leader's follower bots are mirrored to members; offline
-  friends can follow as "mod bots".
+  friends can follow as "mod bots". In dungeons every network bot is culled
+  (vanilla rule: follower entities are hidden inside dungeons), and they return
+  automatically on leaving.
+- **Story-locked companions (1.71.0)** — companions are only unkickable when
+  the game's own `SET_MEMBER_LOCKED` flag is on, exactly like the vanilla
+  Social menu; once a story event unlocks them the normal kick works again.
 - **Room players** — see who is in your current map instance, plus a live online
   counter.
 - **Party chat** — press Enter for a chat input with history and speech-bubble
@@ -122,6 +135,10 @@ everything goes through `CCMultiplayerServer`.
 **Saves & persistence**
 - **Cloud saves** — your save is streamed from the server on login and restored;
   it uploads (chunked + rate-limited) on save and on exit-to-title.
+- **Save mirror rollback (1.71.0)** — the server keeps the last **five distinct
+  save images** per player. The login screen's **Rollback from Mirror** button
+  logs in with the save stream held, shows the five snapshots with timestamps,
+  and restores whichever one you pick.
 - **Anti-spam** — area-save throttling and a login-time upload suppression window.
 - **Local persistence** — server list, options, login history and chat history
   survive restarts (localStorage).
@@ -280,6 +297,8 @@ Then, per map membership:
 | `registerEntity` / `killEntity` | both | `{id,type,pos,settings}` / `{id}` | host-authoritative entities |
 | `updateEntityPosition` / `…Animation` / `…State` / `…Target` / `…Health` | both | `{id, …}` | mirror entity state |
 | `throwBall` | both | `{ballInfo, combatant, dir, party}` | projectiles |
+| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle entity snapshots |
+| `saveMirrorRestore` | C→S | `{index}` | 1.71.0 restore one of the five save mirrors |
 | `setHost` | S→C | `isHost` | host migration |
 
 ## Porting notes (1.1.0 → 1.4.2, on CCLoader v2)

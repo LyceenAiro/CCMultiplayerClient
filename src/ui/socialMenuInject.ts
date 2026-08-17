@@ -1712,22 +1712,15 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         return !!(data && (data._mpKick || data._mpLeave || data._mpBotKick || data._mpRegroup || data._mpRemove));
     }
 
-    /** 1.70.83: native companions that are (a) currently needed by an active
-     * story sync or (b) were added by a story cutscene are protected from the
-     * mod's kick path. Removing them desyncs the engine party from the main
-     * story (the reported Emilie kick dead-locked "Follow Schneider to the
-     * First Scholars HQ"). Mod/offline bots with the same display name stay
-     * kickable because their models carry _mpName. */
+    /** 1.71.0: kick protection follows the ORIGINAL game rule — the engine's
+     * own locked-flag. sc.PartyModel.setLocked is toggled by story events
+     * (SET_MEMBER_LOCKED), so a companion is only unkickable while the current
+     * story segment actually requires them; once a later event unlocks them the
+     * normal kick path works again. */
     function isStoryProtectedCompanion(party: any, name: string): boolean {
         try {
-            if (!name || !party || !party.models) return false;
-            const mdl = party.models[name];
-            if (!mdl || mdl._mpName) return false;
-            const opts: any = (sc as any).PARTY_OPTIONS;
-            if (!Array.isArray(opts) || opts.indexOf(name) === -1) return false;
-            if (mdl._mpStoryAdded) return true;
-            const ctl: any = (window as any).__mpStory;
-            if (ctl && typeof ctl.isActive === 'function' && ctl.isActive()) return true;
+            if (!name || !party || typeof party.isPartyMemberLocked !== 'function') return false;
+            return !!party.isPartyMemberLocked(name);
         } catch (_) { /* fail open to the old behaviour */ }
         return false;
     }
@@ -1765,7 +1758,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         return true;
     }
 
-    function rebuildSocialOptions(menu: any, isMp: boolean, inPartyWith: boolean, isLeader: boolean, isLocalBot: boolean, synced: boolean, host: boolean, full: boolean, botBlocked: boolean, followerOfRemoteLeader?: boolean): void {
+    function rebuildSocialOptions(menu: any, isMp: boolean, inPartyWith: boolean, isLeader: boolean, isLocalBot: boolean, synced: boolean, host: boolean, full: boolean, botBlocked: boolean, storyLocked: boolean, followerOfRemoteLeader?: boolean): void {
         const opts = menu && menu.options;
         if (!opts) return;
         // Clear EVERY button: gui child + buttongroup focus entry + array slot.
@@ -1808,7 +1801,10 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             const btn = add(t('optKick'), 0, '_mpBotKick');     // member can't durably kick a host-synced bot
             if (btn && typeof btn.setActive === 'function') btn.setActive(false);
         } else if (isLocalBot) {
-            add(t('optKick'), 0, '_mpBotKick');                  // kick a follower bot
+            const btn = add(t('optKick'), 0, '_mpBotKick');
+            // 1.71.0: mirror the vanilla Social menu — a story-locked companion
+            // renders a DISABLED kick (the native button key is "locked").
+            if (storyLocked && btn && typeof btn.setActive === 'function') btn.setActive(false);
         } else if (full) {
             const btn = add(t('partyFull'), 0);                // party at the 8-slot cap
             if (btn && typeof btn.setActive === 'function') btn.setActive(false);
@@ -2185,7 +2181,9 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                     // the bot's owner. The owner is exactly the local party leader
                     // (m.partyLeader === m.name); everyone else is a follower.
                     const followerOfRemoteLeader = inParty && !!m && m.partyLeader !== m.name;
-                    rebuildSocialOptions(this, isMp, inPartyWith, isLeader, isLocalBot, synced, hostFlag, partyIsFull(), !!botBlocked, followerOfRemoteLeader);
+                    const storyLocked = !isMp && !!party && typeof party.isPartyMemberLocked === 'function'
+                        && !!party.isPartyMemberLocked(key);
+                    rebuildSocialOptions(this, isMp, inPartyWith, isLeader, isLocalBot, synced, hostFlag, partyIsFull(), !!botBlocked, storyLocked, followerOfRemoteLeader);
                 }
             } catch (e) { /* ignore */ }
         },

@@ -374,7 +374,7 @@ export class SocketIoConnector implements IConnection {
 		return this.socket.connected;
 	}
 
-	public identify(username: string): Promise<IIdentifyResult> {
+	public identify(username: string, mirrorMode?: boolean): Promise<IIdentifyResult> {
 		return new Promise<IIdentifyResult>((resolve, reject) => {
 			this.socket.once('handshakeResponse', (data: {
                 success: boolean,
@@ -392,11 +392,13 @@ export class SocketIoConnector implements IConnection {
                 // version string so the client can show the "server updated" popup.
                 version?: string,
                 hpScale?: number,
+                // 1.71.0: save-mirror metadata (mirror-rollback mode only).
+                mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, isNew: !!data.isNew});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -433,6 +435,9 @@ export class SocketIoConnector implements IConnection {
 				// first connect AND every reconnect (both re-run this handshake).
 				version: MP_VERSION,
 				client: 'multiplayer',
+				// 1.71.0: mirror rollback mode — the server authenticates but holds
+				// the normal save stream until saveMirrorRestore picks a snapshot.
+				mirrorMode: !!mirrorMode,
 			});
 		});
 	}
@@ -977,6 +982,17 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('plantBreak', data);
 	}
 
+	// 1.71.0: dungeon puzzle-state relay (boxes/platforms/switches/ice pillars).
+	public puzzleState(map: string, entries: any[]): void {
+		this.syncEmit('puzzleState', { map, entries });
+	}
+	public onPuzzleState(callback: (data: { map: string, entries: any[] }) => void): void {
+		this.socket.on('puzzleState', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
+			callback({ map: data.map, entries: data.entries });
+		});
+	}
+
 	public updateEntityPosition(id: number, pos: Vec3): void {
 		this.socket.emit('updateEntityPosition', {id, pos});
 	}
@@ -1331,6 +1347,22 @@ export class SocketIoConnector implements IConnection {
 	}
 	public saveUpload(slot: string, data: string): void {
 		this.socket.emit('saveUpload', { slot, data });
+	}
+
+	// 1.71.0: save-mirror rollback. index = 0..4 (newest first) or -1 for the
+	// current latest save.
+	public saveMirrorRestore(index: number): void {
+		this.socket.emit('saveMirrorRestore', { index });
+	}
+	public onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number }) => void): void {
+		this.socket.on('saveMirrorRestoreResult', (data: any) => {
+			if (!data || typeof data.ok !== 'boolean') return;
+			callback({
+				ok: data.ok,
+				reason: typeof data.reason === 'string' ? data.reason : undefined,
+				index: typeof data.index === 'number' ? data.index : undefined,
+			});
+		});
 	}
 	/** Round 23: emit one chunked save-upload part (see saveUploadQueue). The server
 	 * reassembles parts in order and confirms with saveSaved when the stream ends. */

@@ -75,6 +75,10 @@ interface IEnemySnap {
 	                  // annotate.passive === VULNERABLE (the meerkat's 2s "charge light"
 	                  // red-flash window where a charged ball breaks it). The member's
 	                  // puppet mirrors this as the red BLINK_COLOR flash it never showed.
+	ss?: string;      // 1.71.0: current AI state name (e.g. a sleeping/passive state).
+	                  // Preserved across host handoff so respawned enemies stay in the
+	                  // same state instead of waking into IDLE/combat.
+	tos?: number;     // 1.71.0: targetOnSpawn flag (1/0). Preserved across host handoff.
 	sh?: IShieldSnap[]; // ROUND 66: the host enemy's ACTIVE shields (ADD_SHIELD state
 	                  // guards like the hedgehog's roll-up "full" shield). The member's
 	                  // puppet runs no AI, so these state-driven shields never attach
@@ -130,6 +134,12 @@ export class NetSync {
 	// ---- local death / respawn state (own player; both host and member) ----
 	private _mpDead = false;
 	private _mpDeadAt = 0;
+	/** 1.71.0: current SHOW_EXTERN_ANIM on the LOCAL player (sheet path + anim
+	 * name). Extern anims (sit down, poses, etc.) set currentAnim to an OBJECT,
+	 * so the normal string anim field streams '' — teammates never saw them.
+	 * Captured by the ACTION_STEP.SHOW_EXTERN_ANIM injection below. */
+	private _mpExternAnim: { sheet: string, name: string } | null = null;
+	private _mpExternAnimInstalled = false;
 	private _mpSpecHandle: any = null;
 	private _mpSpecEntity: any = null;
 	private _mpPlayerCamDetached = false;
@@ -629,6 +639,9 @@ export class NetSync {
 				const m = (window as any).__mpMain;
 				if (m && m.netSync) m.netSync.tick();
 			});
+			// 1.71.0: capture local-player SHOW_EXTERN_ANIM (sit/pose) steps so the
+			// playerState stream can relay them to teammates' mirrors.
+			try { this.installExternAnimHook(); } catch (e) { console.warn('[netsync] extern-anim hook failed', e); }
 			// SUPPRESS the engine's own player-death flow while connected. Engine
 			// facts (game.compiled.js): Combatant.update fires _onDeathHit when
 			// params.isDefeated() -> sc.combat.onCombatantDeathHit(a, b) -> for the
@@ -5132,6 +5145,30 @@ export class NetSync {
 	}
 
 	// ------------------------------------------------------------------ outbound
+
+	/** 1.71.0: records the LOCAL player's current SHOW_EXTERN_ANIM step (the
+	 * sitting/pose animations that set currentAnim to an object instead of a
+	 * string). The metadata is cleared as soon as the actor's currentAnim is a
+	 * plain string again. */
+	private installExternAnimHook(): void {
+		if (this._mpExternAnimInstalled) return;
+		const EA: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.SHOW_EXTERN_ANIM;
+		if (!EA || typeof EA.inject !== 'function') return;
+		this._mpExternAnimInstalled = true;
+		const self = this;
+		EA.inject({
+			start(this: any, actor: any) {
+				this.parent(actor);
+				try {
+					if (actor && actor === (ig.game as any).playerEntity && this.animSheet && this.animName) {
+						self._mpExternAnim = { sheet: String(this.animSheet.path || ''), name: String(this.animName || '') };
+					}
+				} catch (_) { /* diagnostic metadata only */ }
+			},
+		});
+		console.log('[netsync] SHOW_EXTERN_ANIM relay hook installed');
+	}
+
 	private tick(): void {
 		try {
 			// Connection check FIRST: death state must not survive a logout/disconnect
@@ -5407,6 +5444,21 @@ export class NetSync {
 		// No anim updates while dead: the mirror keeps its last pose instead of
 		// mirroring the corpse's local input-driven walk cycle.
 		const anim = this._mpDead ? '' : (typeof p.currentAnim === 'string' ? p.currentAnim : '');
+		// 1.71.0: extern animations (SHOW_EXTERN_ANIM, e.g. sitting on a chair) set
+		// currentAnim to an OBJECT. Relay the captured sheet+name so the remote
+		// mirror can run the same extern-anim step.
+		let xa = '';
+		let xf = '';
+		try {
+			if (this._mpExternAnim) {
+				if (!this._mpDead && p.currentAnim && typeof p.currentAnim !== 'string') {
+					xa = this._mpExternAnim.sheet;
+					xf = this._mpExternAnim.name;
+				} else {
+					this._mpExternAnim = null;
+				}
+			}
+		} catch (_) { /* extern metadata is cosmetic */ }
 		const face = p.face || { x: 0, y: 1 };
 		const params = p.params || {};
 		// Round 22 (opt 3): quantize pos to integers — matches the enemy block's
@@ -5416,6 +5468,9 @@ export class NetSync {
 			pos: { x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z) },
 			face: { x: face.x, y: face.y },
 			anim,
+			// 1.71.0 extern anim metadata (omitted from the wire while empty below).
+			xa,
+			xf,
 			// Death flag: teammates remove our mirror while we're dead (a corpse
 			// standing frozen in place reads as a bug — the player should visibly
 			// be GONE until respawn).
@@ -5553,7 +5608,7 @@ export class NetSync {
 			const includeState = (now - (this._mpTownStateAt || 0)) >= 1000;
 			const out: any = {
 				pos: snap.pos, face: snap.face, anim: snap.anim, dead: snap.dead,
-				cs: snap.cs, cg: snap.cg,
+				cs: snap.cs, cg: snap.cg, xa: snap.xa, xf: snap.xf,
 			};
 			if (includeState) {
 				out.hp = snap.hp; out.maxHp = snap.maxHp; out.sp = snap.sp; out.maxSp = snap.maxSp;
@@ -5619,6 +5674,7 @@ export class NetSync {
 		if (snap.em !== prev.em) return true;
 		if (snap.cl !== prev.cl) return true;
 		if (snap.anim !== prev.anim) return true;
+		if (snap.xa !== prev.xa || snap.xf !== prev.xf) return true;
 		if (snap.ggt !== prev.ggt) return true; // Round 27 (item 4): guard edge / defense change
 		if (snap.face && prev.face && (snap.face.x !== prev.face.x || snap.face.y !== prev.face.y)) return true;
 		if (snap.pos && prev.pos) {
@@ -6084,6 +6140,9 @@ export class NetSync {
 			hd: e._hidden ? 1 : 0,
 			psv: this._mpEnemyPassive(e) ? 1 : 0,
 			vul: this.readEnemyVulnerable(e) ? 1 : 0,
+			// 1.71.0: preserve AI state + targetOnSpawn across host handoff.
+			ss: typeof e.currentState === 'string' ? e.currentState : '',
+			tos: e.targetOnSpawn ? 1 : 0,
 			// ROUND 66: active shields (poise/state guards) — the puppet's native
 			// isShielded needs them to reduce the member's damage exactly like the host.
 			sh: this.encodeEnemyShields(e),
@@ -6393,6 +6452,9 @@ export class NetSync {
 		// the enemy holds a still frame — ship them so the member sees the change.
 		if ((a.psv || 0) !== (b.psv || 0)) return true;
 		if ((a.vul || 0) !== (b.vul || 0)) return true;
+		// 1.71.0: AI state / targetOnSpawn must survive handoff.
+		if ((a.ss || '') !== (b.ss || '')) return true;
+		if ((a.tos || 0) !== (b.tos || 0)) return true;
 		// ROUND 66: a shield attach/detach mid-windup (hedgehog roll-up) changes the
 		// damage the member's hit should deal — ship it immediately.
 		const ash = a.sh, bsh = b.sh;
@@ -8775,6 +8837,19 @@ export class NetSync {
 				this.syncGuardFx(ent, s.anim);
 				this.syncDashFx(ent, s.anim);
 			}
+			// 1.71.0: extern-anim relay (sit/pose). Applies only while the owner's
+			// currentAnim is an OBJECT (no normal string anim is streamed then).
+			if (typeof s.xa === 'string') {
+				const key = s.xa + '/' + (s.xf || '');
+				if (s.xa && s.xf && ent._mpLastExtern !== key) {
+					ent._mpLastExtern = key;
+					this.playExternAnim(ent, s.xa, s.xf);
+				} else if (!s.xa && ent._mpLastExtern) {
+					ent._mpLastExtern = '';
+					try { if (typeof ent.setAction === 'function') ent.setAction(null); } catch (_) { /* ignore */ }
+					try { ent.animationFixed = false; } catch (_) { /* ignore */ }
+				}
+			}
 			// Fix 3: element-mode switch burst — checked on every remote block, not just
 			// anim changes (the owner swaps elements without changing their anim).
 			// Round 22 (opt 3): em/cl are now omitted from the packet when unchanged —
@@ -9039,6 +9114,11 @@ export class NetSync {
 			// an actual flip, and cache the real type once to restore on emerge.
 			if (isFull) {
 				const psvNow = (s.psv || 0) === 1;
+				// 1.71.0: remember the host's AI state + targetOnSpawn for handoff.
+				try {
+					if (typeof s.ss === 'string') (e as any)._mpEnemyState = s.ss;
+					(e as any)._mpTargetOnSpawn = (s.tos || 0) === 1;
+				} catch (_) { /* ignore */ }
 				if (e._mpPassiveSynced !== psvNow) {
 					e._mpPassiveSynced = psvNow;
 					try {
@@ -9663,6 +9743,17 @@ export class NetSync {
 				const baseSettings = ig.merge(
 					{ skipHook: true, mapId, enemyInfo: { type } },
 					e.settings || {});
+				// 1.71.0: keep the enemy ASLEEP/passive across the handoff. The
+				// member-side puppet never carried the original settings, so without
+				// this a respawned enemy used the type default (targetOnSpawn / IDLE)
+				// and instantly woke into combat when the player stood nearby.
+				try {
+					baseSettings.enemyInfo = baseSettings.enemyInfo || {};
+					if (!engaged) baseSettings.enemyInfo.targetOnSpawn = false;
+					else if ((e as any)._mpTargetOnSpawn === true) baseSettings.enemyInfo.targetOnSpawn = true;
+					const st = typeof (e as any)._mpEnemyState === 'string' ? (e as any)._mpEnemyState : '';
+					if (st) baseSettings.enemyInfo.state = st;
+				} catch (_) { /* keep the merged defaults */ }
 				// Load is async — spawn only once the type is resident, else the enemy is
 				// invisible. If it's already cached this runs immediately.
 				new sc.EnemyType(type).load(() => {
@@ -9692,6 +9783,10 @@ export class NetSync {
 						if (engaged && !spawned._killed) {
 							const pl: any = ig.game.playerEntity;
 							try { if (pl && spawned.setTarget) spawned.setTarget(pl, true); } catch (_) { /* ignore */ }
+						} else if (!engaged && !spawned._killed) {
+							// 1.71.0: explicitly keep sleeping/passive enemies target-less.
+							try { spawned.targetOnSpawn = false; } catch (_) { /* ignore */ }
+							try { if (typeof spawned.setTarget === 'function') spawned.setTarget(null); } catch (_) { /* ignore */ }
 						}
 					} catch (err) {
 						console.warn('[netsync] promoteToHost respawn threw for ' + type, err);
@@ -9714,6 +9809,27 @@ export class NetSync {
 		}
 		console.log('[netsync] promoted to host: respawning ' + respawning + ' puppets as real AI enemies'
 			+ (anyEngaged ? ' (combat continues)' : ''));
+	}
+
+	/** 1.71.0: replays a SHOW_EXTERN_ANIM (sit/pose) on a remote mirror via the
+	 * engine's own action step, then holds the action so the pose stays pinned. */
+	private playExternAnim(entity: any, sheet: string, name: string): void {
+		try {
+			const action = new (ig as any).Action('mpExternAnim', [
+				{ type: 'SHOW_EXTERN_ANIM', anim: { sheet, name }, wait: false },
+				{ type: 'WAIT', time: -1 },
+			], false, false);
+			entity.setAction(action);
+		} catch (_) {
+			try {
+				const sheetObj = new (ig as any).AnimationSheet(sheet);
+				const animSet = sheetObj.anims && sheetObj.anims[name];
+				if (animSet) {
+					entity.setCurrentAnim(animSet, true, null, true);
+					entity.animationFixed = true;
+				}
+			} catch (__) { /* ignore */ }
+		}
 	}
 
 	/** Plays an animation on a locked mirror/puppet (setting `currentAnim` alone is inert

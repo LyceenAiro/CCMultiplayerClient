@@ -1,13 +1,16 @@
 {
 	"name": "multiplayer",
 	"displayName": "CrossCode Multiplayer",
-	"version": "1.70.83",
+	"version": "1.71.0",
 	"description": "A multiplayer mod for CrossCode. Adds online co-op by synchronizing players, enemies and projectiles over a socket.io relay server.",
 	"license": "MIT",
 	"author": "CCDirectLink, LyceenAiro",
 	"main": "dist/mod.js",
 	"assets": [
-		"data/enemies/multiplayer.json"
+		"data/enemies/multiplayer.json",
+		"media/sound/storysync/quest-accept.mp3",
+		"media/sound/storysync/light-party.mp3",
+		"media/sound/storysync/full-party.mp3"
 	],
 	"ccmodDependencies": {
 		"crosscode": "^1.4.2",

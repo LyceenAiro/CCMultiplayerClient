@@ -40,6 +40,7 @@ import { NetSync } from './sync/netSync';
 import { StorySyncController } from './sync/storySync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
+import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
@@ -54,7 +55,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.70.83';
+export const MP_VERSION = '1.71.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -283,6 +284,7 @@ export class Multiplayer {
 	/** Round 20: GHOST CHESTS sync module (party-aware chest visibility). Installed
 	 * once; the session handle is re-bound every connect (initializeListeners). */
 	public ghostChests?: IGhostChestsModule;
+	public puzzleSync?: IPuzzleSync;
 	/** netSync hook fired when this client is promoted to instance host (set in
 	 * initializeListeners; respawns puppet enemies as real AI-driven ones). */
 	public onPromotedToHost?: () => void;
@@ -369,8 +371,8 @@ export class Multiplayer {
 
 		this.initializeListeners();
 
-		console.log('[multiplayer] Logging in as ' + username);
-		const result = await this.connection.identify(username);
+		console.log('[multiplayer] Logging in as ' + username.name + (username.mirrorMode ? ' (mirror rollback)' : ''));
+		const result = await this.connection.identify(username.name, username.mirrorMode);
 
 		if (!result.success) {
 			throw new Error('[multiplayer] Could not login! Is the user already logged in?');
@@ -379,7 +381,7 @@ export class Multiplayer {
 		// Remember the logged-in account name (drives the in-game party name and
 		// per-account social scoping). Reset the logout latch so a second session on
 		// this same client process logs out cleanly again (installExitHooks' guard).
-		this.name = username;
+		this.name = username.name;
 		(this as any)._loggedOut = false;
 		this._isNewAccount = !!result.isNew;
 		(this as any)._disconnectHandled = false;
@@ -387,6 +389,13 @@ export class Multiplayer {
 		this._mpDisconnectTimer = null;
 		this._mpDisconnectPopupClose = null;
 		this.installExitHooks();
+
+		// 1.71.0: 镜像回溯 — the server identified us but held the save stream.
+		// Let the player pick one of the five mirrors; the chosen snapshot then
+		// streams through the normal saveDownload channel below.
+		if (username.mirrorMode) {
+			await this.showMirrorPicker(result.mirrors || []);
+		}
 
 		// Prime the social caches immediately so the menu shows real values on first
 		// open (don't wait for the 3s pump): online count, our own profile, friends.
@@ -1041,6 +1050,10 @@ export class Multiplayer {
 		this.connection.onChestState((opened) => {
 			try { this.ghostChests && this.ghostChests.onChestState(opened); } catch (_) { /* ignore */ }
 		});
+		// 1.71.0: dungeon puzzle-state sync (boxes/platforms/switches/ice pillars).
+		// The module is process-once; install() re-binds the listener to this socket.
+		if (!this.puzzleSync) this.puzzleSync = installPuzzleSync(() => this);
+		try { this.puzzleSync.install(); } catch (e) { console.warn('[multiplayer] puzzle sync install failed', e); }
 		// Round 17 (issue 1): the HOST's real enemy started an attack — relayed to the
 		// instance. Replay it on the matching member-side puppet toward the local player
 		// (puppets no longer run local AI; this keeps round-2 monster-attacks-members at
@@ -2267,6 +2280,20 @@ export class Multiplayer {
 			// parties sharing one room would fight over the instance bot roster. Bots
 			// stay leader-local (only the leader's own client shows them).
 			if (isSharedTownNow()) return;
+			// 1.71.0: the vanilla game hides follower bots inside dungeons. Publish
+			// an EMPTY roster on dungeon entry so members cull their copies too.
+			if (this.inDungeonNow()) {
+				if (this.partyBots.length) {
+					this.partyBots = [];
+					console.log('[multiplayer] dungeon entered — party bot roster cleared');
+				}
+				if (this._lastSentBots !== '') {
+					this._lastSentBots = '';
+					this._lastBotPublish = 0;
+					try { this.connection.partyBots([], {}); } catch (_) { /* ignore */ }
+				}
+				return;
+			}
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
@@ -2342,6 +2369,11 @@ export class Multiplayer {
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
 			this.partyBots = (bots || []).slice();
+			// 1.71.0: inside a dungeon the engine's own dungeonBlocked rule already
+			// hides follower entities. Keep currentParty membership intact (vanilla
+			// respawns the members when leaving the dungeon) — just never spawn or
+			// puppet copies here.
+			if (this.inDungeonNow()) return;
 			const roster = this.partyMembers || [];
 			// Remove bots the host dropped. Never touch real network members — only
 			// currentParty entries that are NOT in the roster AND not announced bots
@@ -2431,6 +2463,17 @@ export class Multiplayer {
 		try { return (ig.game && ig.game.mapName) || ''; } catch (_) { return ''; }
 	}
 
+	/** 1.71.0: the vanilla dungeon rule — sc.party keeps currentParty members but
+	 * hides their follower entities inside dungeons (dungeonBlocked). Network bots
+	 * must follow the same rule: never broadcast, never adopt, and cull any copy
+	 * while the local map is a dungeon. */
+	private inDungeonNow(): boolean {
+		try {
+			const map: any = (sc as any).map;
+			return !!(map && typeof map.isDungeon === 'function' && map.isDungeon());
+		} catch (_) { return false; }
+	}
+
 	/** True when this client is the party leader (owns the follower bots). */
 	private get isPartyLeader(): boolean {
 		return !!(this.name && this.partyLeader === this.name);
@@ -2484,6 +2527,7 @@ export class Multiplayer {
 	private adoptBot(name: string): void {
 		try {
 			if (!name || this.isPartyLeader) return;
+			if (this.inDungeonNow()) return; // 1.71.0: never spawn follower bots in a dungeon
 			if (!this.partyMembers || this.partyMembers.length <= 1) return;
 			if (this.partyMembers.indexOf(name) !== -1) return; // real member -> mirror, not bot
 			const g: any = (ig as any).game;
@@ -2568,6 +2612,12 @@ export class Multiplayer {
 			if (isSharedTownNow()) return;
 			if (!this.isPartyLeader) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
+			// 1.71.0: dungeons have no follower bots — keep streaming the EMPTY cull
+			// signal so a member who enters late still drops its stale copies.
+			if (this.inDungeonNow()) {
+				this.connection.botState({ map: ig.game.mapName || '', bots: [] });
+				return;
+			}
 			const party: any = (sc as any).party;
 			if (!party || !party.currentParty) return;
 			const roster = this.partyMembers || [];
@@ -2607,6 +2657,10 @@ export class Multiplayer {
 			this._mpLastBotStateAt = Date.now();
 			if (data.from === this.name) return;
 			if (this.isPartyLeader) return; // we run our own bots with full AI
+			// 1.71.0: dungeon maps never hold follower bots. The vanilla
+			// dungeonBlocked path already hides them and keeps currentParty intact,
+			// so simply ignore the stream until we leave.
+			if (this.inDungeonNow()) return;
 			// ROUND 107: local cutscene takes priority over the leader's bot stream.
 			if (this._mpBotCutsceneActive) return;
 			const party: any = (sc as any).party;
@@ -4682,6 +4736,22 @@ export class Multiplayer {
     border: 1px solid #7dffa8; border-radius: 4px;
     font-size: 14px; font-family: inherit; letter-spacing: 2px; }
 .mpLoginSubmit:hover { background: rgba(41, 148, 99, 0.95); box-shadow: 0 0 8px rgba(125,255,168,0.6); }
+.mpLoginMirror { width: 100%; margin-top: 6px; padding: 8px 14px; cursor: pointer;
+    background: rgba(92, 31, 40, 0.9); color: #ffe3e7;
+    border: 1px solid #ff8e9f; border-radius: 4px;
+    font-size: 13px; font-family: inherit; letter-spacing: 2px; }
+.mpLoginMirror:hover { background: rgba(124, 42, 54, 0.95); box-shadow: 0 0 8px rgba(255,142,159,0.6); }
+.mpMirrorBox { width: 440px; max-width: 94vw; max-height: 78vh; overflow: auto; }
+.mpMirrorBody { color: #dff3ff; }
+.mpMirrorList { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.mpMirrorBtn { padding: 8px 10px; cursor: pointer; text-align: left;
+    background: rgba(18, 50, 72, 0.9); color: #dff3ff;
+    border: 1px solid #6fc7ff; border-radius: 4px;
+    font-size: 12px; font-family: inherit; }
+.mpMirrorBtn:hover { background: rgba(46, 104, 142, 0.95); box-shadow: 0 0 8px rgba(111,199,255,0.6); }
+.mpMirrorFallback { background: rgba(31, 111, 74, 0.9); border-color: #7dffa8; color: #eafff2; }
+.mpMirrorEmpty { padding: 10px; font-size: 12px; color: #8fd6ff; }
+.mpMirrorHint { min-height: 14px; font-size: 12px; color: #ff9d9d; margin-top: 6px; }
 .mpLoginRecent { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(111,199,255,0.3); }
 .mpLoginRecentLabel { font-size: 11px; letter-spacing: 1px; color: #8fd6ff; margin-bottom: 6px; }
 .mpLoginChips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -4694,7 +4764,7 @@ export class Multiplayer {
 		document.head.appendChild(style);
 	}
 
-	private showLogin(): Promise<string> {
+	private showLogin(): Promise<{ name: string, mirrorMode: boolean }> {
 		return new Promise((resolve, reject) => {
 			this.ensureLoginStyle();
 
@@ -4708,6 +4778,7 @@ export class Multiplayer {
 			input.val(hist.last || '');
 			const hint = $('<div class="mpLoginHint"></div>');
 			const submit = $('<button type="submit" class="mpLoginSubmit">' + t('loginSubmit') + '</button>');
+			const mirror = $('<button type="button" class="mpLoginMirror">' + t('loginMirror') + '</button>');
 			const close = $('<button type="button" class="mpLoginClose" title="Close">&times;</button>');
 			const form = $('<form></form>');
 
@@ -4723,23 +4794,23 @@ export class Multiplayer {
 				// button underneath (the openAddFriendBox idiom).
 				try { (ig.interact as any).setBlockDelay(0.2); } catch (_) { /* ignore */ }
 			};
-			const commit = (name: string): void => {
+			const commit = (name: string, mirrorMode: boolean): void => {
 				persistLoginHistory(name);
 				cleanup();
-				resolve(name);
+				resolve({ name, mirrorMode });
 			};
 			const cancel = (): void => {
 				cleanup();
 				reject('cancelled'); // distinctive marker — startConnect must not alert
 			};
-			const submitName = (): void => {
+			const submitName = (mirrorMode: boolean): void => {
 				const name = String(input.val() || '').trim();
 				if (!name) {
 					hint.text(t('loginRequired'));
 					input.focus();
 					return; // do NOT settle — keep the panel open, focus in the input
 				}
-				commit(name);
+				commit(name, mirrorMode);
 			};
 
 			// Round 16: the old focus listener REMOVED the box on regained focus and
@@ -4771,7 +4842,7 @@ export class Multiplayer {
 			head.append(close);
 			box.append(head);
 
-			form.append(input).append(hint).append(submit);
+			form.append(input).append(hint).append(submit).append(mirror);
 			box.append(form);
 
 			// Recent users: one chip per previously-used name — clicking one submits
@@ -4784,7 +4855,7 @@ export class Multiplayer {
 				for (const r of recents) {
 					const chip = $('<button type="button" class="mpLoginChip"></button>');
 					chip.text(r);
-					chip.on('click', () => commit(r));
+					chip.on('click', () => commit(r, false));
 					chips.append(chip);
 				}
 				recentBox.append(chips);
@@ -4792,14 +4863,77 @@ export class Multiplayer {
 			}
 
 			form.submit(() => {
-				submitName();
+				submitName(false);
 				return false;
 			});
+			mirror.on('click', () => submitName(true));
 			close.on('click', () => cancel());
 
 			$(document.body).append(box);
 			ig.system.setFocusLost();
 			input.focus();
+		});
+	}
+
+	/** 1.71.0: 镜像回溯 picker — shown AFTER identify while the server holds the
+	 * normal save stream. Choosing an entry asks the server to stream that exact
+	 * snapshot through the usual saveDownload channel; -1 = latest save fallback. */
+	private showMirrorPicker(mirrors: Array<{ index: number, at: string, slot: string, bytes: number }>): Promise<void> {
+		return new Promise((resolve, reject) => {
+			this.ensureLoginStyle();
+			const box = $('<div class="mpLogin mpMirrorBox"></div>');
+			const head = $('<div class="mpLoginHead"></div>');
+			head.append('<span class="mpLoginTitle">' + t('mirrorTitle') + '</span>');
+			const body = $('<div class="mpMirrorBody"></div>');
+			const list = $('<div class="mpMirrorList"></div>');
+			let settled = false;
+			const cleanup = (): void => {
+				if (settled) return;
+				settled = true;
+				try { box.remove(); } catch (_) { /* ignore */ }
+			};
+			const fail = (msg: string): void => {
+				body.find('.mpMirrorHint').text(msg);
+			};
+			const pick = (index: number): void => {
+				if (settled) return;
+				try { this.connection.saveMirrorRestore(index); } catch (_) {
+					fail(t('mirrorSendFailed'));
+					return;
+				}
+				// Do not resolve yet — wait for the server result so a rejected
+				// index can be retried instead of hanging the save-download await.
+			};
+			const resultCb = (r: { ok: boolean, reason?: string, index?: number }): void => {
+				if (settled) return;
+				if (!r.ok) {
+					fail(r.reason === 'notFound' ? t('mirrorNotFound') : r.reason === 'noSave' ? t('mirrorNoSave') : t('mirrorInvalid'));
+					return;
+				}
+				cleanup();
+				resolve();
+			};
+			try { this.connection.onSaveMirrorRestoreResult(resultCb); } catch (_) { /* ignore */ }
+			if (mirrors.length) {
+				for (const m of mirrors.slice(0, 5)) {
+					const btn = $('<button type="button" class="mpMirrorBtn"></button>');
+					const when = (() => { try { const d = new Date(m.at); return isNaN(d.getTime()) ? m.at : d.toLocaleString(); } catch (_) { return m.at; } })();
+					btn.text('#' + (m.index + 1) + ' · ' + when + ' · ' + Math.max(1, Math.round((m.bytes || 0) / 1024)) + ' KB');
+					btn.on('click', () => pick(m.index));
+					list.append(btn);
+				}
+			} else {
+				list.append('<div class="mpMirrorEmpty">' + t('mirrorEmpty') + '</div>');
+			}
+			const fallback = $('<button type="button" class="mpMirrorBtn mpMirrorFallback"></button>').text(t('mirrorUseLatest'));
+			fallback.on('click', () => pick(-1));
+			const hint = $('<div class="mpMirrorHint"></div>');
+			body.append(list).append(fallback).append(hint);
+			box.append(head).append(body);
+			$(document.body).append(box);
+			// No outside-click dismissal: the save stream is already held, so the
+			// only way forward is choosing a mirror or the latest-save fallback.
+			console.log('[multiplayer] mirror picker: ' + mirrors.length + ' snapshots');
 		});
 	}
 

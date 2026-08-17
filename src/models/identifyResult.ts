@@ -10,4 +10,6 @@ interface IIdentifyResult {
      * fraction (config.json monsterHpPerPlayer, default 0.5 = +50% HP per extra
      * member). The HOST client applies it using its own party roster size. */
     hpScale?: number;
+    /** 1.71.0: save-mirror metadata in mirror-rollback mode (newest first). */
+    mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>;
 }
