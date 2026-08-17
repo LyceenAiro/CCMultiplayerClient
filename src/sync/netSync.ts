@@ -7609,9 +7609,15 @@ export class NetSync {
 				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
 				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
 			} catch (_) { /* ignore */ }
+			// 1.70.67 (snowman projectile crash): a player.ballHit(true) overlap on an
+			// IGNORE visual copy used to dereference combatant=null in
+			// getCombatantRoot(). The instance-level onProjectileHit override above
+			// returns false (never reaches that line); keeping combatant=puppet is
+			// the belt-and-braces fallback.
 			e.attackInfo = null;
 			e.hitProxy = null;
-			e.combatant = null;
+			e.onProjectileHit = function () { return false; };
+			e.combatant = puppet;
 			e.target = null;
 			e.behaviors = null;
 			e.grab = null;
