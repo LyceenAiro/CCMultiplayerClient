@@ -15,10 +15,11 @@ import { showMpToast } from '../ui/toasts';
  *    quest block in every local save with the snapshot, so mid-sync progress
  *    can NEVER persist from a crash/logout/save.
  *  - Story triggers are leader-authoritative: EventTrigger / LocationEvent
- *    ready-check waits until every remaining member's mirror is within 320px
- *    of the trigger, then the leader starts the engine event and relays
- *    {map, key, kind, type}; members replay the SAME local event while their
- *    own trigger starts are suppressed. Skip votes require every member's yes.
+ *    ready-check waits until every remaining member's mirror is within the
+ *    gather radius of the trigger, then the leader starts the engine event and
+ *    relays {map, key, kind, type}; members replay the SAME local event while
+ *    their own trigger starts are suppressed. Skip votes require every member's
+ *    yes. Story NPC dialogues use a much tighter ring around the NPC.
  *  - Exit matrix:
  *      complete   -> apply final state, keep completion, one native reward for
  *                    members who hadn't solved it, stop the save guard;
@@ -28,6 +29,10 @@ import { showMpToast } from '../ui/toasts';
 
 const GATHER_RADIUS = 480;
 const GATHER_Z_DELTA = 96;
+/** 1.70.81: story NPC dialogues need the whole party STANDING AT the NPC, not
+ * merely inside the same block. The 480px automatic-trigger radius covers most
+ * of a map block; NPC gather uses a much tighter ring around the character. */
+const NPC_GATHER_RADIUS = 160;
 const STATE_SEND_INTERVAL = 0.25;   // seconds — leader quest-state coalescing
 const STATE_HEARTBEAT = 1.5;        // seconds — periodic re-send for self-heal
 const NUDGE_PROMPT_COOLDOWN = 8000; // ms — don't spam the waiting popup
@@ -1529,13 +1534,16 @@ export class StorySyncController {
 
 	// -------------------------------------------------------- leader-side gather
 
-	/** Leaders: all remaining members must be within GATHER_RADIUS of the local
-	 * trigger (and roughly the same height) before the local event is allowed. */
-	private absentMembersFor(trig: any): string[] {
+	/** Leaders: all remaining members must be within the gather radius of the
+	 * local trigger (and roughly the same height) before the local event is
+	 * allowed. NPC dialogues use the tight NPC ring; automatic triggers use the
+	 * wide zone radius. */
+	private absentMembersFor(trig: any, kind: 'trigger' | 'location' | 'npc' = 'trigger'): string[] {
 		const absent: string[] = [];
 		const self = this.localName();
 		const tc = trig.coll && trig.coll.pos;
 		if (!tc) return this.members.filter((m) => m !== self);
+		const radius = kind === 'npc' ? NPC_GATHER_RADIUS : GATHER_RADIUS;
 		for (const name of this.members) {
 			if (name === self) continue;
 			const pl: any = this.main.players && this.main.players[name];
@@ -1544,7 +1552,7 @@ export class StorySyncController {
 			const dx = e.coll.pos.x - tc.x;
 			const dy = e.coll.pos.y - tc.y;
 			const dz = Math.abs((e.coll.pos.z || 0) - tc.z);
-			if (dx * dx + dy * dy > GATHER_RADIUS * GATHER_RADIUS || dz > GATHER_Z_DELTA) absent.push(name);
+			if (dx * dx + dy * dy > radius * radius || dz > GATHER_Z_DELTA) absent.push(name);
 		}
 		return absent;
 	}
@@ -1606,7 +1614,7 @@ export class StorySyncController {
 				const tc = trig && trig.coll && trig.coll.pos;
 				const pc = p && p.coll && p.coll.pos;
 				const near = !!(p && !p._killed && tc && pc
-					&& Math.pow(pc.x - tc.x, 2) + Math.pow(pc.y - tc.y, 2) <= GATHER_RADIUS * GATHER_RADIUS
+					&& Math.pow(pc.x - tc.x, 2) + Math.pow(pc.y - tc.y, 2) <= NPC_GATHER_RADIUS * NPC_GATHER_RADIUS
 					&& Math.abs((pc.z || 0) - (tc.z || 0)) <= GATHER_Z_DELTA);
 				if (!near) { this.hideTriggerBanner(); return; }
 				this.triggerBannerSeenAt = Date.now();
@@ -1618,7 +1626,7 @@ export class StorySyncController {
 				return;
 			}
 			const kind = this.triggerBannerKind;
-			const absent = this.absentMembersFor(trig);
+			const absent = this.absentMembersFor(trig, kind);
 			// Leader authority: as soon as everyone is inside, fire the engine event.
 			if (this.isLocalLeader()) {
 				if (!absent.length) {
