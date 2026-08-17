@@ -127,6 +127,10 @@ export function ensureStorySyncStyle(): void {
 	border-radius: 999px; padding: 3px 12px; cursor: pointer; font-size: 12px; white-space: nowrap; }
 .mpTriggerBanner button:hover { background: #1d79b7; }
 .mpTriggerBanner button:disabled { opacity: 0.5; cursor: default; }
+.mpTriggerBanner button.mpSkipVoteYes { background: #1f7a45; border-color: #5be36e; color: #eafff0; }
+.mpTriggerBanner button.mpSkipVoteYes:hover { background: #29965a; }
+.mpTriggerBanner button.mpSkipVoteNo { background: #5c1f28; border-color: #ff8e9f; color: #ffe3e7; }
+.mpTriggerBanner button.mpSkipVoteNo:hover { background: #7c2a36; }
 .mpStoryComm { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
 	z-index: 10030; pointer-events: none; text-align: center;
 	padding-top: calc(33vh - 130px); animation: mpStoryCommBack 3.4s ease forwards; }
@@ -209,8 +213,11 @@ export class StorySyncController {
 	private waitingPromptSince = 0;
 	private waitingOpen = false;
 
-	private skipRequested = false;
-	private skipPromptOpen = false;
+	private skipVoteSeq = 0;
+	private skipVoteFrom = '';
+	private skipVoteAnswers: { [name: string]: boolean } = Object.create(null);
+	private skipVoteBanner: JQuery | null = null;
+	private skipVoteSignature = '';
 	private skipLastHandled = 0;
 
 	private questMenu: any = null;
@@ -282,6 +289,7 @@ export class StorySyncController {
 					+ ' snapshot=' + !!self.snapshot
 					+ ' eventSeq=' + self.currentEventSeq
 					+ ' eventActive=' + self.currentEventActive
+					+ ' skipVote=' + self.skipVoteSeq
 					+ ' waiting=' + !!(self.waitingTrigger)
 					+ ' triggerBanner=' + self.triggerBannerKey);
 				if (self.active && q) {
@@ -343,6 +351,7 @@ export class StorySyncController {
 		try { c.onStorySyncNpcRequest((data) => this.onNpcRequest(data)); } catch (e) { console.error('[storysync] wire npcRequest failed', e); }
 		try { c.onStorySyncEnd((data) => this.onEnd(data)); } catch (e) { console.error('[storysync] wire end failed', e); }
 		try { c.onStorySyncSkipVote((data) => this.onSkipVoteRequested(data)); } catch (e) { console.error('[storysync] wire skipVote failed', e); }
+		try { c.onStorySyncSkipVoteUpdate((data) => this.onSkipVoteUpdate(data)); } catch (e) { console.error('[storysync] wire skipVoteUpdate failed', e); }
 		try { c.onStorySyncSkipResult((data) => this.onSkipVoteResult(data)); } catch (e) { console.error('[storysync] wire skipResult failed', e); }
 		try { c.onStorySyncNudge((data) => this.onNudged(data)); } catch (e) { console.error('[storysync] wire nudge failed', e); }
 		try { c.onStorySyncDialogNext((data) => this.onDialogNext(data)); } catch (e) { console.error('[storysync] wire dialogNext failed', e); }
@@ -770,8 +779,7 @@ export class StorySyncController {
 		this.currentEventSeq = 0;
 		this.currentEventActive = false;
 		this.currentEventPendingSince = 0;
-		this.skipRequested = false;
-		this.skipPromptOpen = false;
+		this.resetSkipVote();
 		this.passivePrompted = Object.create(null);
 		this.waitingTrigger = null;
 		this.waitingPromptSince = 0;
@@ -1299,7 +1307,7 @@ export class StorySyncController {
 			}
 			this.currentEventActive = true;
 			this.currentEventPendingSince = 0;
-			this.skipRequested = false;
+			this.resetSkipVote();
 			this.attachEventEnd(npc.eventCall);
 			try { this.conn.storySyncEvent(this.quest, map, key, 'npc', type); } catch (_) { /* ignore */ }
 		} catch (err) {
@@ -1317,7 +1325,7 @@ export class StorySyncController {
 				this.currentEventSeq = seq;
 				this.currentEventActive = true;
 				this.currentEventPendingSince = 0;
-				this.skipRequested = false;
+				this.resetSkipVote();
 				this.attachEventEnd(npc.eventCall);
 			}
 		} catch (err) {
@@ -1799,7 +1807,7 @@ export class StorySyncController {
 			// not resurrect a stale 2.5s pending grace for skip handling).
 			this.currentEventActive = true;
 			this.currentEventPendingSince = 0;
-			this.skipRequested = false;
+			this.resetSkipVote();
 			this.attachEventEnd(call);
 			try {
 				this.conn.storySyncEvent(this.quest, map, key, kind, type);
@@ -1848,14 +1856,13 @@ export class StorySyncController {
 			}
 		} catch (_) { /* ignore */ }
 		// Leader tells the server so an open no-timeout skip vote can be aborted
-		// for off-map/afk members instead of stranding their vote modal forever.
+		// for off-map/afk members instead of stranding their vote banner forever.
 		if (this.currentEventSeq && this.isLocalLeader()) {
 			try { this.conn.storySyncEventEnd(this.currentEventSeq); } catch (_) { /* ignore */ }
 		}
 		this.currentEventActive = false;
 		this.currentEventPendingSince = 0;
-		this.skipRequested = false;
-		this.skipPromptOpen = false;
+		this.resetSkipVote();
 		try { closeStoryWindows(); } catch (_) { /* ignore */ }
 	}
 
@@ -1866,7 +1873,7 @@ export class StorySyncController {
 		const mapNow = (ig.game as any).mapName || '';
 		const selfName = this.localName();
 		this.currentEventSeq = data.seq || 0;
-		this.skipRequested = false;
+		this.resetSkipVote();
 		try { closeStoryWindows(); } catch (_) { /* ignore */ }
 		this.waitingTrigger = null;
 		this.waitingPromptSince = 0;
@@ -1946,7 +1953,7 @@ export class StorySyncController {
 			this.currentEventSeq = seq;
 			this.currentEventActive = true;
 			this.currentEventPendingSince = 0;
-			this.skipRequested = false;
+			this.resetSkipVote();
 			this.attachEventEnd(call);
 			console.log('[storysync] member replaying story event seq=' + seq + ' kind=' + kind + ' key=' + this.triggerKey(trig));
 		} catch (err) {
@@ -1969,69 +1976,159 @@ export class StorySyncController {
 		try {
 			if (!this.active) return false;
 			if (!this.inSyncedStoryVideo()) return false;
-			if (!model || typeof model.isCutscene !== 'function' || !model.isCutscene()) return false;
+			if (!model || typeof model.isCutscene !== 'function') return false;
+			// 1.70.80: the engine routes BOTH cutscene skipping and blocking-story
+			// dialogue skipping through GameModel.skipCutscene. Requiring
+			// isCutscene() made the latter fall through to the NATIVE single-player
+			// skip, so the party vote never opened for dialogue-heavy scenes.
+			const inSkipableVideo = !!model.isCutscene()
+				|| !!(model.message && typeof model.message.isMenuMode === 'function' && model.message.isMenuMode());
+			if (!inSkipableVideo) return false;
 			if (model.skipBlock) return false;
 			if (!this.currentEventSeq) return false;
-			if (this.skipRequested || this.skipPromptOpen) return true; // swallow repeats
 			if (Date.now() - this.skipLastHandled < 1200) return true;
 			this.skipLastHandled = Date.now();
-			this.openSkipRequestPrompt();
+			this.requestSkipVote();
 			return true;
 		} catch (_) { return false; }
 	}
 
-	private openSkipRequestPrompt(): void {
-		this.skipRequested = true;
-		this.skipPromptOpen = true;
-		storyWindow(
-			t('storySyncSkipTitle'),
-			t('storySyncSkipConfirmBody').replace('{quest}', this.questLabel(this.quest)),
-			[
-				{
-					label: t('storySyncSkipConfirm'), kind: 'primary',
-					onClick: () => {
-						this.skipPromptOpen = false;
-						try { this.conn.storySyncSkipVote(this.currentEventSeq); } catch (_) { /* ignore */ }
-						showMpToast({ title: t('storySyncSkipVoteSent') });
-					},
-				},
-				{ label: t('storySyncSkipCancel'), kind: 'ghost', onClick: () => { this.skipPromptOpen = false; } },
-			],
-			false,
-		);
+	/** Any member (leader or member) pressing skip either opens a new ballot or —
+	 * when a ballot is already open and we haven't voted — sends our YES. */
+	private requestSkipVote(): void {
+		const seq = this.currentEventSeq;
+		const self = this.localName();
+		if (this.skipVoteSeq === seq) {
+			if (this.skipVoteAnswers[self] !== undefined) return; // already voted
+			this.skipVoteAnswers[self] = true;
+			this.renderSkipVoteBanner();
+			try { this.conn.storySyncSkipAnswer(seq, true); } catch (_) { /* ignore */ }
+			console.log('[storysync] joined open skip vote seq=' + seq + ' with YES');
+			return;
+		}
+		// Optimistic local ballot (we are instantly green); the server echo
+		// re-syncs the authoritative answers map for everyone.
+		this.skipVoteSeq = seq;
+		this.skipVoteFrom = self;
+		this.skipVoteAnswers = Object.create(null);
+		this.skipVoteAnswers[self] = true;
+		this.renderSkipVoteBanner();
+		try { this.conn.storySyncSkipVote(seq); } catch (_) { /* ignore */ }
+		console.log('[storysync] skip vote requested seq=' + seq);
 	}
 
-	private onSkipVoteRequested(data: { seq: number, from: string }): void {
-		if (!this.active || data.seq !== this.currentEventSeq) return;
-		if (data.from === this.localName()) return;
-		this.skipPromptOpen = true;
-		storyWindow(
-			t('storySyncSkipVoteTitle'),
-			t('storySyncSkipVoteBody').replace('{name}', data.from).replace('{quest}', this.questLabel(this.quest)),
-			[
-				{
-					label: t('storySyncSkipYes'), kind: 'primary',
-					onClick: () => {
-						this.skipPromptOpen = false;
-						try { this.conn.storySyncSkipAnswer(data.seq, true); } catch (_) { /* ignore */ }
-					},
-				},
-				{
-					label: t('storySyncSkipNo'), kind: 'danger',
-					onClick: () => {
-						this.skipPromptOpen = false;
-						try { this.conn.storySyncSkipAnswer(data.seq, false); } catch (_) { /* ignore */ }
-					},
-				},
-			],
-			false, // never time out — the user chose "votes never expire"
-		);
+	private mergeSkipVoteAnswers(answers: any): void {
+		if (!answers || typeof answers !== 'object') return;
+		for (const k in answers) {
+			if (answers[k] === true) this.skipVoteAnswers[k] = true;
+		}
+	}
+
+	private onSkipVoteRequested(data: { seq: number, from: string, answers?: { [name: string]: boolean } }): void {
+		if (!this.active || !data || data.seq !== this.currentEventSeq) return;
+		this.skipVoteSeq = data.seq;
+		this.skipVoteFrom = data.from || this.localName();
+		this.skipVoteAnswers = Object.create(null);
+		this.mergeSkipVoteAnswers(data.answers);
+		this.renderSkipVoteBanner();
+		console.log('[storysync] skip vote opened seq=' + data.seq + ' by=' + this.skipVoteFrom);
+	}
+
+	private onSkipVoteUpdate(data: { seq: number, answers?: { [name: string]: boolean } }): void {
+		if (!this.active || !data || data.seq !== this.currentEventSeq) return;
+		if (this.skipVoteSeq !== data.seq) {
+			this.skipVoteSeq = data.seq;
+			this.skipVoteFrom = this.localName();
+		}
+		this.mergeSkipVoteAnswers(data.answers);
+		this.renderSkipVoteBanner();
+	}
+
+	/** 1.70.80 top-of-screen vote banner (replaces the full-screen vote modal):
+	 * green diamonds = accepted, grey = not yet answered. The local player keeps
+	 * 接受 / 拒绝 buttons until they answer; any NO cancels the whole ballot. */
+	private renderSkipVoteBanner(): void {
+		try {
+			if (typeof document === 'undefined' || !document.body) return;
+			if (!this.active || !this.skipVoteSeq || this.skipVoteSeq !== this.currentEventSeq) {
+				this.hideSkipVoteBanner();
+				return;
+			}
+			const self = this.localName();
+			const ordered: string[] = Array.isArray(this.members) ? this.members.slice() : [];
+			// Roster drift protection: every answered name must have a diamond even
+			// if our local members copy is a moment behind a mid-way join.
+			for (const k in this.skipVoteAnswers) {
+				if (ordered.indexOf(k) === -1) ordered.push(k);
+			}
+			if (ordered.indexOf(this.skipVoteFrom) === -1 && this.skipVoteFrom) ordered.unshift(this.skipVoteFrom);
+			if (ordered.indexOf(self) === -1) ordered.push(self);
+			const rows: string[] = [];
+			for (const name of ordered) {
+				const on = this.skipVoteAnswers[name] === true;
+				rows.push('<span class="mpDiamond ' + (on ? 'on' : 'off') + '" title="' + name + '"></span>');
+			}
+			const requester = this.skipVoteFrom || self;
+			const text = requester === self ? t('storySyncSkipVoteBannerSelf') : t('storySyncSkipVoteBanner').replace('{name}', requester);
+			let html = '<span class="mpTriggerTag">' + t('storySyncSkipVoteTag') + '</span>'
+				+ '<span class="mpTriggerState">' + text + '</span>'
+				+ '<span class="mpTriggerRows">' + rows.join('') + '</span>';
+			const answered = this.skipVoteAnswers[self] !== undefined;
+			if (!answered) {
+				html += '<button class="mpSkipVoteYes">' + t('storySyncSkipYes') + '</button>'
+					+ '<button class="mpSkipVoteNo">' + t('storySyncSkipNo') + '</button>';
+			}
+			if (this.skipVoteSignature === html && this.skipVoteBanner && document.body.contains(this.skipVoteBanner[0])) return;
+			this.skipVoteSignature = html;
+			if (!this.skipVoteBanner || !document.body.contains(this.skipVoteBanner[0])) {
+				this.hideSkipVoteBanner();
+				this.skipVoteBanner = $('<div class="mpTriggerBanner mpSkipVoteBanner"></div>');
+				$(document.body).append(this.skipVoteBanner);
+			}
+			this.skipVoteBanner.html(html);
+			const selfRef = this;
+			const seq = this.skipVoteSeq;
+			this.skipVoteBanner.off('click', '.mpSkipVoteYes');
+			this.skipVoteBanner.off('click', '.mpSkipVoteNo');
+			this.skipVoteBanner.on('click', '.mpSkipVoteYes', () => {
+				try {
+					if (selfRef.skipVoteSeq !== seq) return;
+					if (selfRef.skipVoteAnswers[selfRef.localName()] !== undefined) return;
+					selfRef.skipVoteAnswers[selfRef.localName()] = true;
+					selfRef.renderSkipVoteBanner();
+					try { selfRef.conn.storySyncSkipAnswer(seq, true); } catch (_) { /* ignore */ }
+				} catch (_) { /* ignore */ }
+			});
+			this.skipVoteBanner.on('click', '.mpSkipVoteNo', () => {
+				try {
+					if (selfRef.skipVoteSeq !== seq) return;
+					if (selfRef.skipVoteAnswers[selfRef.localName()] !== undefined) return;
+					// Mark us as answered immediately (buttons disappear); the server
+					// result packet closes the banner for the whole party.
+					selfRef.skipVoteAnswers[selfRef.localName()] = false;
+					selfRef.renderSkipVoteBanner();
+					try { selfRef.conn.storySyncSkipAnswer(seq, false); } catch (_) { /* ignore */ }
+				} catch (_) { /* ignore */ }
+			});
+		} catch (_) { /* ignore */ }
+	}
+
+	private hideSkipVoteBanner(): void {
+		try {
+			if (this.skipVoteBanner) { this.skipVoteBanner.remove(); this.skipVoteBanner = null; }
+		} catch (_) { /* ignore */ }
+		this.skipVoteSignature = '';
+	}
+
+	private resetSkipVote(): void {
+		this.skipVoteSeq = 0;
+		this.skipVoteFrom = '';
+		this.skipVoteAnswers = Object.create(null);
+		this.hideSkipVoteBanner();
 	}
 
 	private onSkipVoteResult(data: { seq: number, pass: boolean, reason?: string, from?: string }): void {
-		this.skipRequested = false;
-		this.skipPromptOpen = false;
-		try { closeStoryWindows(); } catch (_) { /* ignore */ }
+		if (this.skipVoteSeq === data.seq) this.resetSkipVote();
 		if (data.seq !== this.currentEventSeq) {
 			console.log('[storysync] stale skip result seq=' + data.seq + ' current=' + this.currentEventSeq + ' — ignored');
 			return;
@@ -2117,8 +2214,7 @@ export class StorySyncController {
 				this.currentEventSeq = 0;
 				this.currentEventActive = false;
 				this.currentEventPendingSince = 0;
-				this.skipRequested = false;
-				this.skipPromptOpen = false;
+				this.resetSkipVote();
 				this.waitingTrigger = null;
 				this.waitingPromptSince = 0;
 				this.waitingOpen = false;

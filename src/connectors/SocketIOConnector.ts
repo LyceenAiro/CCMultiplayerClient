@@ -1601,9 +1601,18 @@ export class SocketIoConnector implements IConnection {
 			}
 		});
 	}
-	public onStorySyncSkipVote(callback: (data: { seq: number, from: string }) => void): void {
+	public onStorySyncSkipVote(callback: (data: { seq: number, from: string, answers?: { [name: string]: boolean } }) => void): void {
 		this.socket.on('storySyncSkipVote', (data: any) => {
-			if (data && typeof data.seq === 'number' && typeof data.from === 'string') callback({ seq: data.seq, from: data.from });
+			if (data && typeof data.seq === 'number' && typeof data.from === 'string') {
+				callback({ seq: data.seq, from: data.from, answers: data.answers && typeof data.answers === 'object' ? data.answers : undefined });
+			}
+		});
+	}
+	public onStorySyncSkipVoteUpdate(callback: (data: { seq: number, answers?: { [name: string]: boolean } }) => void): void {
+		this.socket.on('storySyncSkipVoteUpdate', (data: any) => {
+			if (data && typeof data.seq === 'number') {
+				callback({ seq: data.seq, answers: data.answers && typeof data.answers === 'object' ? data.answers : undefined });
+			}
 		});
 	}
 	public onStorySyncSkipResult(callback: (data: { seq: number, pass: boolean, reason?: string, from?: string }) => void): void {

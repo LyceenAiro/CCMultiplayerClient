@@ -292,6 +292,10 @@ const enDict: { [key: string]: string } = {
     storySyncTriggerBannerMember: 'Inside trigger zone · waiting for the leader…',
     storySyncNudgeSent: 'Nudge sent',
     storySyncNudgeTitle: '{name} is nudging you — go to the story trigger!',
+    // 1.70.80 — top-of-screen skip-vote banner (green = yes, grey = pending)
+    storySyncSkipVoteTag: 'SKIP VOTE',
+    storySyncSkipVoteBanner: '{name} wants to skip · waiting for votes…',
+    storySyncSkipVoteBannerSelf: 'You requested a skip · waiting for votes…',
     storySyncSkipTitle: 'Skip Cutscene?',
     storySyncSkipConfirmBody: 'Request to skip the current story cutscene?\n\nQuest: {quest}\nThe whole party must agree before it fast-forwards.',
     storySyncSkipConfirm: 'Request Skip',
@@ -596,6 +600,10 @@ const zhDict: { [key: string]: string } = {
     storySyncTriggerBannerMember: '已进入触发区域 · 等待队长播放…',
     storySyncNudgeSent: '催促已发送',
     storySyncNudgeTitle: '{name} 正在催促你——请前往剧情触发点！',
+    // 1.70.80 — 顶部跳过表决横幅（绿色棱形=已同意，灰色=尚未表决）
+    storySyncSkipVoteTag: '跳过表决',
+    storySyncSkipVoteBanner: '{name} 请求跳过剧情 · 等待全队表决…',
+    storySyncSkipVoteBannerSelf: '你发起了跳过请求 · 等待全队表决…',
     storySyncSkipTitle: '跳过动画？',
     storySyncSkipConfirmBody: '是否向全队请求跳过当前剧情动画？\n\n任务：{quest}\n必须全队同意后才会快进。',
     storySyncSkipConfirm: '请求跳过',

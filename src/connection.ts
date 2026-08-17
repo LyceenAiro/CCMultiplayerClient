@@ -488,8 +488,11 @@ export interface IConnection {
     /** The mode ended. reason = 'complete' | 'cancel' | 'leave' | 'leaderLeft' |
      * 'partyEnd'. 'complete' carries the final `state`. */
     onStorySyncEnd(cb: (data: { quest: string, reason: string, state?: any, by?: string, leader?: string }) => void): void;
-    /** Someone asked to skip the current synced animation (everyone votes). */
-    onStorySyncSkipVote(cb: (data: { seq: number, from: string }) => void): void;
+    /** Someone asked to skip the current synced animation (everyone votes).
+     * `answers` = authoritative map of YES votes so far (requester included). */
+    onStorySyncSkipVote(cb: (data: { seq: number, from: string, answers?: { [name: string]: boolean } }) => void): void;
+    /** A YES arrived for the open skip vote — `answers` is the full YES map. */
+    onStorySyncSkipVoteUpdate(cb: (data: { seq: number, answers?: { [name: string]: boolean } }) => void): void;
     /** Unanimous yes -> everyone fast-forwards locally; any no/abort -> cancel. */
     onStorySyncSkipResult(cb: (data: { seq: number, pass: boolean, reason?: string, from?: string }) => void): void;
     /** A teammate at the trigger urged us to come. */
