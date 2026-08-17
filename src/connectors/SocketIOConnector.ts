@@ -792,6 +792,9 @@ export class SocketIoConnector implements IConnection {
 			to: Array.isArray(to) ? to.filter((x) => typeof x === 'string' && x.length > 0 && x.length <= 32).slice(0, 8) : [],
 		});
 	}
+	public storySyncDialogNext(): void {
+		this.socket.emit('storySyncDialogNext', {});
+	}
 
 	// ---- round 23 wave 4 + ROUND 93: WORLD / PARTY / PRIVATE CHAT ----
 	public chat(text: string, channel: 'world' | 'party' | 'private' = 'party', target?: string): void {
@@ -1604,6 +1607,13 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('storySyncNudge', (data: any) => {
 			if (data && typeof data.from === 'string' && typeof data.quest === 'string') {
 				callback({ from: data.from, quest: data.quest, to: Array.isArray(data.to) ? data.to.filter((n: any) => typeof n === 'string') : [] });
+			}
+		});
+	}
+	public onStorySyncDialogNext(callback: (data: { from: string, quest: string }) => void): void {
+		this.socket.on('storySyncDialogNext', (data: any) => {
+			if (data && typeof data.from === 'string' && typeof data.quest === 'string') {
+				callback({ from: data.from, quest: data.quest });
 			}
 		});
 	}

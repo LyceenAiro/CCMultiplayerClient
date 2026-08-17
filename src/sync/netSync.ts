@@ -2500,10 +2500,60 @@ export class NetSync {
 				if (CombatProto && !CombatProto._mpGetEnemyTargetPatched) {
 					CombatProto._mpGetEnemyTargetPatched = true;
 					const origGetEnemyTarget = CombatProto.getEnemyTarget;
-					CombatProto.getEnemyTarget = function (this: any) {
+					CombatProto.getEnemyTarget = function (this: any, enemy: any) {
+						const player = ig.game && (ig.game as any).playerEntity;
+						const pool: any[] = [];
+						if (player && !player._killed) pool.push(player);
+						const partyAny: any = (sc as any).party;
+						const aiTargeting = partyAny && partyAny.ai && typeof partyAny.ai.targeting === 'number'
+							? partyAny.ai.targeting : 0;
+						try {
+							if (partyAny && Array.isArray(partyAny.currentParty)) {
+								for (let i = 0; i < partyAny.currentParty.length; i++) {
+									const ent = typeof partyAny.getPartyMemberEntityByIndex === 'function'
+										? partyAny.getPartyMemberEntityByIndex(i) : null;
+									if (ent && typeof this._addPartyMember === 'function') {
+										this._addPartyMember(pool, ent, aiTargeting > 0);
+									}
+								}
+							}
+						} catch (_) { /* keep the host in the pool */ }
 						const mirrors = mirrorTargets();
-						if (!mirrors.length) return origGetEnemyTarget.call(this);
-						const pool = [ig.game.playerEntity, ...mirrors];
+						if (enemy && mirrors.length) {
+							let peaceful = false;
+							try {
+								const et: any = enemy.enemyType || enemy;
+								const AG: any = (sc as any).ENEMY_AGGRESSION;
+								peaceful = !!(AG && et.aggression === AG.PEACEFUL);
+							} catch (_) { peaceful = false; }
+							if (!peaceful) {
+								let loseD = 320;
+								try {
+									const td0 = enemy.enemyType && enemy.enemyType.targetDetect;
+									if (td0 && td0.loseDistance > 0) loseD = td0.loseDistance;
+								} catch (_) { /* default 320 */ }
+								for (let mi = 0; mi < mirrors.length; mi++) {
+									const mir = mirrors[mi];
+									try {
+										const sameBlock = (ig.game as any).getLevelIdx(enemy.coll.pos.z)
+											=== (ig.game as any).getLevelIdx(mir.coll.pos.z);
+										if (!sameBlock) continue;
+										if (enemy.distanceTo(mir) > loseD) continue;
+										if (typeof this._addPartyMember === 'function') {
+											this._addPartyMember(pool, mir, aiTargeting > 0);
+										} else {
+											pool.push(mir);
+										}
+									} catch (_) { /* skip this mirror */ }
+								}
+							}
+						}
+						// Reproduce the vanilla strategy toggle (player vs party).
+						if (aiTargeting > 0 && pool.length > 1 && Math.random() < aiTargeting) pool.splice(0, 1);
+						else if (aiTargeting < 0 && pool.length > 1 && Math.random() < -aiTargeting) pool.length = 1;
+						if (!pool.length) {
+							try { return origGetEnemyTarget.call(this); } catch (_) { return player || null; }
+						}
 						return pool[Math.floor(Math.random() * pool.length)];
 					};
 					// ROUND 111 (PVP KO retarget crash): while sc.pvp.state === 3 the

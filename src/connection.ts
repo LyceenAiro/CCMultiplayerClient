@@ -233,6 +233,9 @@ export interface IConnection {
     storySyncSkipAnswer(seq: number, yes: boolean): void;
     /** Urge specific absent teammates to come to the waiting story trigger. */
     storySyncNudge(quest: string, to: string[]): void;
+    /** Any member -> party: advance the CURRENT synced story dialogue on every
+     * client (each side runs its own local message model). */
+    storySyncDialogNext(): void;
     /** ROUND 93 (chat channels): send a chat message. `channel` is 'world'
      * (global), 'party' (team) or 'private' (direct message to `target`). The
      * server relays it and never echoes to the sender. */
@@ -486,6 +489,8 @@ export interface IConnection {
     onStorySyncSkipResult(cb: (data: { seq: number, pass: boolean, reason?: string, from?: string }) => void): void;
     /** A teammate at the trigger urged us to come. */
     onStorySyncNudge(cb: (data: { from: string, quest: string, to: string[] }) => void): void;
+    /** A teammate advanced the synced story dialogue — advance ours too. */
+    onStorySyncDialogNext(cb: (data: { from: string, quest: string }) => void): void;
     /** Server asks the leader to re-broadcast the current quest state (a fresh
      * member just joined mid-sync). */
     onStorySyncResend(cb: (data: { quest: string }) => void): void;

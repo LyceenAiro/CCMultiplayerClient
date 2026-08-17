@@ -236,6 +236,8 @@ export class StorySyncController {
 	private triggersInstalled = false;
 	private modelSkipInstalled = false;
 	private cutsceneWrapperInstalled = false;
+	private messageHookInstalled = false;
+	private dialogApplyBypass = false;
 	private questModelHooksInstalled = false;
 	private eventStepsHooksInstalled = false;
 	private menuHooksInstalled = false;
@@ -320,6 +322,7 @@ export class StorySyncController {
 		try { c.onStorySyncSkipVote((data) => this.onSkipVoteRequested(data)); } catch (e) { console.error('[storysync] wire skipVote failed', e); }
 		try { c.onStorySyncSkipResult((data) => this.onSkipVoteResult(data)); } catch (e) { console.error('[storysync] wire skipResult failed', e); }
 		try { c.onStorySyncNudge((data) => this.onNudged(data)); } catch (e) { console.error('[storysync] wire nudge failed', e); }
+		try { c.onStorySyncDialogNext((data) => this.onDialogNext(data)); } catch (e) { console.error('[storysync] wire dialogNext failed', e); }
 		try { c.onStorySyncResend((data) => this.onResend(data)); } catch (e) { console.error('[storysync] wire resend failed', e); }
 		this.ensureUpdate();
 	}
@@ -943,6 +946,7 @@ export class StorySyncController {
 		this.installPlotSaveGuard();
 		this.installModelSkipHook();
 		this.installCutsceneWrapper();
+		this.installMessageHook();
 		this.installQuestModelHooks();
 		this.installTriggerHooks();
 		this.installEventStepHooks();
@@ -1012,6 +1016,56 @@ export class StorySyncController {
 				return orig.apply(this, arguments as any);
 			};
 			console.log('[storysync] Cutscene.startEvent wrapper installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.70.68 dialogue sync: any party member pressing "next" inside the current
+	 * synced story video advances the message on EVERY client. We only relay
+	 * while a dialogue is actually blocking (showMessage set blocking=true) and
+	 * there is no open CHOICE (choices branch the story — they stay local). */
+	private installMessageHook(): void {
+		try {
+			if (this.messageHookInstalled) return;
+			const MSG: any = (sc as any).MessageModel;
+			if (!MSG || typeof MSG.inject !== 'function') return;
+			this.messageHookInstalled = true;
+			MSG.inject({
+				onInteraction(this: any) {
+					const ctl: StorySyncController = (window as any).__mpStory;
+					if (ctl) {
+						if (ctl.dialogApplyBypass) return this.parent();
+						if (ctl.shouldRelayDialogNext(this)) {
+							this.parent();
+							try { ctl.conn.storySyncDialogNext(); } catch (_) { /* ignore */ }
+							return undefined;
+						}
+					}
+					return this.parent();
+				},
+			});
+			console.log('[storysync] message-onInteraction hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Called inside the wrapper for every local "next". */
+	public shouldRelayDialogNext(msg: any): boolean {
+		try {
+			if (!this.active || !this.inSyncedStoryVideo()) return false;
+			if (!msg || !msg.blocking) return false;
+			if (msg.hasChoice && msg.hasChoice()) return false;
+			return true;
+		} catch (_) { return false; }
+	}
+
+	private onDialogNext(data: { from: string, quest: string }): void {
+		try {
+			if (!this.active || data.quest !== this.quest || data.from === this.localName()) return;
+			if (!this.inSyncedStoryVideo()) return;
+			const msg: any = (sc as any).model && (sc as any).model.message;
+			if (!msg || !msg.blocking || (msg.hasChoice && msg.hasChoice())) return;
+			if (typeof msg.onInteraction !== 'function') return;
+			this.dialogApplyBypass = true;
+			try { msg.onInteraction(); } finally { this.dialogApplyBypass = false; }
 		} catch (_) { /* ignore */ }
 	}
 
