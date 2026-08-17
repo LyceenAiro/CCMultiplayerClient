@@ -74,8 +74,15 @@ function storyWindow(title: string, bodyHtml: string, buttons: IStorySyncButton[
 		close.on('click', () => { try { closeStoryWindows(); } catch (_) { /* ignore */ } });
 		box.append(close);
 	}
-	scrim.on('mousedown', () => {
+	scrim.on('mousedown', (e) => {
 		if (!dismissable) return; // choice-only: outside click must not leak a click
+		// 1.70.82: only a mousedown on the SCRIM itself (outside the box) may
+		// close the window. Events from inside the box bubble up to the scrim
+		// too, and removing the DOM on mousedown swallowed the button's click —
+		// "Cancel Story Sync" confirm never fired.
+		const t = e && e.target;
+		const insideBox = !!(t && t !== scrim[0] && ($(t).closest('.mpStoryBox').length > 0));
+		if (insideBox) return;
 		try { closeStoryWindows(); } catch (_) { /* ignore */ }
 	});
 	scrim.append(box);
@@ -667,7 +674,13 @@ export class StorySyncController {
 
 	/** Public cancel path (quest-menu button + HUD bar). */
 	public leaderCancelSync(confirm: boolean): void {
-		if (!this.active || !this.isLocalLeader()) return;
+		console.log('[storysync] leaderCancelSync confirm=' + confirm + ' active=' + this.active
+			+ ' storyLeader=' + this.isLocalLeader() + ' partyLeader=' + !!((this.main as any).isPartyLeader)
+			+ ' quest=' + this.quest);
+		if (!this.active || !this.isLocalLeader()) {
+			console.log('[storysync] leaderCancelSync ignored: active=' + this.active + ' storyLeader=' + this.isLocalLeader());
+			return;
+		}
 		if (!confirm) {
 			storyWindow(t('storySyncCancelTitle'), t('storySyncCancelConfirmBody'), [
 				{ label: t('storySyncCancelConfirm'), kind: 'danger', onClick: () => this.leaderCancelSync(true) },
@@ -675,6 +688,7 @@ export class StorySyncController {
 			], true);
 			return;
 		}
+		console.log('[storysync] sending cancel to server for quest=' + this.quest);
 		try { this.conn.storySyncCancel(this.quest); } catch (_) { /* ignore */ }
 		showMpToast({ title: t('storySyncCancelRequested') });
 	}
@@ -2444,6 +2458,9 @@ export class StorySyncController {
 
 	private onQuestUiButton(): void {
 		const inDetail = !!(this.questMenu && (sc as any).menu && (sc as any).menu.questDetailMode);
+		console.log('[storysync] quest-ui button pressed active=' + this.active + ' pending=' + this.isPendingStart
+			+ ' detail=' + inDetail + ' partyLeader=' + !!((this.main as any).isPartyLeader)
+			+ ' storyLeader=' + this.isLocalLeader());
 		let err = '';
 		if (!this.active && !this.isPendingStart) {
 			err = inDetail ? this.leaderRequestSync() : this.leaderRequestMainPlotSync();
