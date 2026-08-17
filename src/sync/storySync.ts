@@ -230,6 +230,20 @@ export class StorySyncController {
 	private leaderCameraBaseCount = 0;
 	private localHideApplied = false;
 	private localHideBaseAlpha = 1;
+
+	/** 1.70.79: capture the camera-stack depth BEFORE a story event starts.
+	 * NPC/EventTrigger starts push their own camera targets synchronously, so
+	 * recording the baseline later made end-cleanup keep the event target —
+	 * the member's view stayed on the last NPC/camera position. */
+	private prepareLeaderCameraBase(): void {
+		try {
+			if (this.leaderCameraBaseCount > 0) return;
+			const cam: any = (ig as any).camera;
+			if (!cam) return;
+			this.leaderCameraBaseCount = (typeof cam.getTargetCount === 'function')
+				? cam.getTargetCount() : (Array.isArray(cam.targets) ? cam.targets.length : 0);
+		} catch (_) { /* ignore */ }
+	}
 	private npcHookInstalled = false;
 	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
@@ -1274,6 +1288,7 @@ export class StorySyncController {
 			if (!map || !key) return;
 			const EV: any = (ig as any).EVENT_TYPE || {};
 			const type = EV.CUTSCENE || 2;
+			this.prepareLeaderCameraBase(); // 1.70.79: BEFORE the NPC pushes its own camera target
 			console.log('[storysync] starting authoritative NPC story key=' + key
 				+ ' name=' + (npc.name || '(none)') + ' map=' + map);
 			this.npcApplyBypass = true;
@@ -1295,6 +1310,7 @@ export class StorySyncController {
 	private memberReplayNpcEvent(npc: any, seq: number): void {
 		try {
 			console.log('[storysync] member replaying NPC story seq=' + seq + ' key=' + this.triggerKey(npc));
+			this.prepareLeaderCameraBase(); // 1.70.79: before the local NPC start pushes camera
 			this.npcApplyBypass = true;
 			try { npc.onInteraction(); } finally { this.npcApplyBypass = false; }
 			if (npc.eventCall) {
@@ -1668,8 +1684,9 @@ export class StorySyncController {
 				const ET: any = (ig as any).Camera && (ig as any).Camera.EntityTarget;
 				const TH: any = (ig as any).Camera && (ig as any).Camera.TargetHandle;
 				if (!ET || !TH) return;
-				this.leaderCameraBaseCount = (typeof cam.getTargetCount === 'function')
-					? cam.getTargetCount() : (Array.isArray(cam.targets) ? cam.targets.length : 0);
+				// Use the pre-event baseline captured by prepareLeaderCameraBase();
+				// only fall back to now if we were too late (defensive).
+				if (this.leaderCameraBaseCount <= 0) this.prepareLeaderCameraBase();
 				this.leaderCameraHandle = new TH(new ET(ent), 0, 0);
 				this.leaderCameraEntity = ent;
 				cam.pushTarget(this.leaderCameraHandle, 'FAST');
@@ -1758,6 +1775,7 @@ export class StorySyncController {
 			if (!map || !key) return;
 			const EV: any = (ig as any).EVENT_TYPE || {};
 			const type = kind === 'location' ? (EV.PARALLEL || 1) : (Number(trig.eventType) || EV.CUTSCENE || 2);
+			this.prepareLeaderCameraBase(); // 1.70.79: before the event pushes camera steps
 			console.log('[storysync] starting authoritative event kind=' + kind + ' key=' + key
 				+ ' name=' + (trig.name || '(none)') + ' type=' + type + ' map=' + map);
 			const token = { allow: true };
