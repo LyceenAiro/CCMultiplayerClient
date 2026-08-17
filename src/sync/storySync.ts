@@ -33,6 +33,10 @@ const STATE_HEARTBEAT = 1.5;        // seconds — periodic re-send for self-hea
 const NUDGE_PROMPT_COOLDOWN = 8000; // ms — don't spam the waiting popup
 const CHECK_LOCAL_TIMEOUT = 17000;  // ms — belt-and-braces vs the server's 15s
 const SUPPRESS_TOAST_COOLDOWN = 4000;
+/** Synthetic target for the MAIN-STORY sync mode. Not a static quest: the
+ * top-bar button syncs this while the quest LIST is open; a selected static
+ * quest is only synced from the quest DETAIL page (支线任务同步). */
+const PLOT_QUEST_ID = 'plot.main';
 
 interface IStorySyncButton {
 	label: string;
@@ -208,6 +212,7 @@ export class StorySyncController {
 	private questMenu: any = null;
 	private questMenuButton: any = null;
 	private questMenuHotkeyFn: (() => any) | null = null;
+	private questButtonSignature = '';
 	private hudBar: JQuery | null = null;
 	private hudBarSignature = '';
 	private hudStar: JQuery | null = null;
@@ -216,6 +221,9 @@ export class StorySyncController {
 	private questObserverInstalled = false;
 	private saveGuardInstalled = false;
 	private rawQuestSave: any = null;
+	private plotSaveGuardInstalled = false;
+	private rawVarsGetJson: any = null;
+	private mainPlotSnapshot: number | null = null;
 	private triggersInstalled = false;
 	private modelSkipInstalled = false;
 	private cutsceneWrapperInstalled = false;
@@ -341,7 +349,27 @@ export class StorySyncController {
 		try { return (sc as any).quests || null; } catch (_) { return null; }
 	}
 
+	private isPlotQuest(id: string): boolean {
+		return id === PLOT_QUEST_ID;
+	}
+
+	/** Main-story progress lives in the global var `plot.line` (the engine's
+	 * chapter index derives from it). CrossCode has no "accept" step for the
+	 * main story, so in plot mode every loaded save is eligible; the leader's
+	 * plotline is later streamed as the authoritative story position. */
+	private mainPlotLine(): number | null {
+		try {
+			if (!(ig as any).vars || typeof (ig as any).vars.get !== 'function') return null;
+			const v = Number((ig as any).vars.get('plot.line'));
+			return isFinite(v) ? v : null;
+		} catch (_) { return null; }
+	}
+
 	private questStatus(id: string): { available: boolean, active: boolean, solved: boolean } {
+		if (this.isPlotQuest(id)) {
+			const line = this.mainPlotLine();
+			return { available: line !== null, active: line !== null, solved: false };
+		}
 		const q = this.questManager();
 		if (!q || typeof q.isQuestActive !== 'function' || typeof q.isQuestSolved !== 'function') {
 			return { available: false, active: false, solved: false };
@@ -351,6 +379,7 @@ export class StorySyncController {
 
 	private questLabel(id: string): string {
 		try {
+			if (this.isPlotQuest(id)) return t('storySyncMainLabel');
 			const q = this.questManager();
 			if (!q || typeof q.getQuestName !== 'function') return id;
 			const lbl = q.getQuestName(id);
@@ -367,6 +396,10 @@ export class StorySyncController {
 	 * solved (shouldn't happen mid-sync — eligibility gates it). */
 	private serializeQuestState(id: string): any {
 		try {
+			if (this.isPlotQuest(id)) {
+				const line = this.mainPlotLine() || 0;
+				return { id, task: line, highest: line, finished: false, completed: [], labels: {} };
+			}
 			const q = this.questManager();
 			if (!q) return null;
 			const quest = typeof q.getStaticQuest === 'function' ? q.getStaticQuest(id) : null;
@@ -421,6 +454,34 @@ export class StorySyncController {
 		};
 	}
 
+	/** Main-story mode must ALSO protect `plot.line` from persisting during sync:
+	 * the global vars are serialized through ig.vars.getJson() on every save, so
+	 * wrap it once and substitute the pre-sync plotline while active/uncommitted. */
+	private installPlotSaveGuard(): void {
+		try {
+			if (this.plotSaveGuardInstalled) return;
+			const v: any = (ig as any).vars;
+			if (!v || typeof v.getJson !== 'function') return;
+			this.plotSaveGuardInstalled = true;
+			this.rawVarsGetJson = v.getJson;
+			const self = this;
+			v.getJson = function () {
+				try {
+					const out = self.rawVarsGetJson.call(v);
+					if (out && out.storage && self.active && !self.committed
+						&& self.isPlotQuest(self.quest) && self.mainPlotSnapshot !== null) {
+						out.storage.plot = out.storage.plot || {};
+						out.storage.plot.line = self.mainPlotSnapshot;
+					}
+					return out;
+				} catch (_) {
+					try { return self.rawVarsGetJson.call(v); } catch (__) { return null; }
+				}
+			};
+			console.log('[storysync] plot.line save guard installed');
+		} catch (_) { /* ignore */ }
+	}
+
 	private captureSnapshot(): boolean {
 		const q = this.questManager();
 		if (!q || typeof q.onStorageSave !== 'function') { this.snapshot = null; return false; }
@@ -431,17 +492,38 @@ export class StorySyncController {
 			(this.rawQuestSave || q.onStorageSave).call(q, box);
 			if (!box.quests) return false;
 			this.snapshot = this.plainClone(box.quests);
+			// Main-story mode additionally snapshots plot.line here (same moment).
+			if (this.isPlotQuest(this.quest)) {
+				const line = this.mainPlotLine();
+				if (line === null) return false;
+				this.mainPlotSnapshot = line;
+			}
 			return true;
 		} catch (err) {
 			console.error('[storysync] snapshot capture failed', err);
 			this.snapshot = null;
+			this.mainPlotSnapshot = null;
 			return false;
 		}
 	}
 
 	private restoreSnapshot(): void {
+		// Main-story plotline first, and unconditionally: quest data may be
+		// unavailable during a forced session teardown, but plot.line MUST go
+		// back to the player's own save regardless.
+		try {
+			if (this.isPlotQuest(this.quest) && this.mainPlotSnapshot !== null
+				&& (ig as any).vars && typeof (ig as any).vars.set === 'function') {
+				(ig as any).vars.set('plot.line', this.mainPlotSnapshot);
+				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+			}
+		} catch (_) { /* ignore */ }
 		const q = this.questManager();
-		if (!q || !this.snapshot || typeof q.onStoragePreLoad !== 'function') { this.snapshot = null; return; }
+		if (!q || !this.snapshot || typeof q.onStoragePreLoad !== 'function') {
+			this.snapshot = null;
+			this.mainPlotSnapshot = null;
+			return;
+		}
 		try {
 			q.onStoragePreLoad({ quests: this.plainClone(this.snapshot) });
 			try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
@@ -450,6 +532,7 @@ export class StorySyncController {
 			console.error('[storysync] snapshot restore failed', err);
 		} finally {
 			this.snapshot = null;
+			this.mainPlotSnapshot = null;
 		}
 	}
 
@@ -460,21 +543,34 @@ export class StorySyncController {
 	public leaderRequestSync(): string {
 		if (this.active) { return t('storySyncAlreadyActive'); }
 		if (this.isPendingStart) { return t('storySyncStillChecking'); }
+		const id = this.candidateQuestId();
+		if (!id) { return t('storySyncNoQuestSelected'); }
+		return this.beginLeaderSyncRequest(id);
+	}
+
+	/** Top-bar 剧情同步 (quest LIST page): sync the MAIN STORY itself. No static
+	 * quest needs to be accepted — every save's plot.line is always eligible. */
+	public leaderRequestMainPlotSync(): string {
+		if (this.active) { return t('storySyncAlreadyActive'); }
+		if (this.isPendingStart) { return t('storySyncStillChecking'); }
+		return this.beginLeaderSyncRequest(PLOT_QUEST_ID);
+	}
+
+	private beginLeaderSyncRequest(id: string): string {
 		const roster = Array.isArray(this.main.partyMembers) ? this.main.partyMembers : [];
 		if (roster.length < 2) { return t('storySyncNeedParty'); }
 		if (!(this.main as any).isPartyLeader) { return t('storySyncLeaderOnly'); }
-		const id = this.candidateQuestId();
-		if (!id) { return t('storySyncNoQuestSelected'); }
 		const st = this.questStatus(id);
 		if (!st.available) { return t('storySyncQuestEngineUnavailable'); }
-		if (!st.active || st.solved) { return t('storySyncLeaderQuestMustBeActive'); }
+		if (!this.isPlotQuest(id) && (!st.active || st.solved)) { return t('storySyncLeaderQuestMustBeActive'); }
 		this.pendingQuest = id;
 		this.pendingReqId = '';
 		this.pendingAt = Date.now();
 		this.isPendingStart = true;
 		this.installSaveGuard();
+		this.installPlotSaveGuard();
 		try { this.conn.storySyncRequest(id); } catch (e) { this.pendingStartReset(); return t('storySyncNetworkError'); }
-		console.log('[storysync] requested quest=' + id);
+		console.log('[storysync] requested ' + (this.isPlotQuest(id) ? 'MAIN STORY' : 'quest=' + id));
 		return '';
 	}
 
@@ -518,7 +614,8 @@ export class StorySyncController {
 		}
 		if (this.waitingOpen) return;
 		this.waitingOpen = true;
-		const handle = storyWindow(t('storySyncCheckingTitle'), t('storySyncCheckingBody').replace('{quest}', this.questLabel(this.pendingQuest)), [
+		const bodyKey = this.isPlotQuest(this.pendingQuest) ? 'storySyncCheckingBodyMain' : 'storySyncCheckingBody';
+		const handle = storyWindow(t('storySyncCheckingTitle'), t(bodyKey).replace('{quest}', this.questLabel(this.pendingQuest)), [
 			{ label: t('storySyncCheckingStash'), kind: 'ghost', onClick: () => { /* close only */ } },
 		], false);
 		// If the server's answer never arrives close the modal ourselves.
@@ -585,10 +682,12 @@ export class StorySyncController {
 		this.pendingStartReset();
 		try { closeStoryWindows(); } catch (_) { /* ignore */ }
 		this.installSaveGuard();
+		this.installPlotSaveGuard();
 		this.quest = data.quest;
 		this.leader = data.leader;
 		this.members = Array.isArray(data.members) ? data.members.slice() : [];
 		this.snapshot = null;
+		this.mainPlotSnapshot = null;
 		this.committed = false;
 		this.finishedSynced = false;
 		this.currentEventSeq = 0;
@@ -631,6 +730,7 @@ export class StorySyncController {
 	}
 
 	private lockQuestHud(): void {
+		if (this.isPlotQuest(this.quest)) return; // main story has no quest-star lock
 		const q = this.questManager();
 		if (!q || typeof q.isMarkedQuest !== 'function' || typeof q.markQuest !== 'function') return;
 		try {
@@ -668,6 +768,14 @@ export class StorySyncController {
 	private applySyncedState(state: any): void {
 		try {
 			if (!state || state.id !== this.quest) return;
+			// Main-story state: just move the plotline and let the engine's
+			// varsChanged pump recalculate the chapter/lore.
+			if (this.isPlotQuest(this.quest)) {
+				const line = Math.max(0, Number(state.task) || 0);
+				(ig as any).vars.set('plot.line', line);
+				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				return;
+			}
 			const q = this.questManager();
 			const quest = q && typeof q.getStaticQuest === 'function' ? q.getStaticQuest(this.quest) : null;
 			if (!q || !quest) return;
@@ -709,6 +817,7 @@ export class StorySyncController {
 	 * exactly one native QuestSolvedDialog + reward lands for unfinished members. */
 	private tryFinishSyncedQuest(state: any): void {
 		try {
+			if (this.isPlotQuest(this.quest)) return; // main story has no quest reward path
 			const q = this.questManager();
 			const quest = q && typeof q.getStaticQuest === 'function' ? q.getStaticQuest(this.quest) : null;
 			if (!q || !quest || q.isQuestSolved(this.quest)) return;
@@ -777,6 +886,7 @@ export class StorySyncController {
 			}
 			this.updateHudBar();
 			this.updateGameStar();
+			if (this.questMenu) { try { this.refreshQuestButton(); } catch (_) { /* ignore */ } }
 			this.updateWaitingPrompt();
 		} catch (_) { /* never break the frame */ }
 	}
@@ -784,6 +894,7 @@ export class StorySyncController {
 	private ensureEngineHooks(): void {
 		this.installQuestObserver();
 		this.installSaveGuard();
+		this.installPlotSaveGuard();
 		this.installModelSkipHook();
 		this.installCutsceneWrapper();
 		this.installQuestModelHooks();
@@ -892,7 +1003,9 @@ export class StorySyncController {
 
 	public lastLockToastAt = 0;
 	public isQuestLockedForMembers(): boolean {
-		return this.isLocalMember();
+		// Only the SIDE-quest sync mode locks the star/favorite mark. Main-story
+		// sync must leave the quest tab fully usable.
+		return this.isLocalMember() && !this.isPlotQuest(this.quest);
 	}
 
 	/** True when the member's LOCAL attempt to start a story cutscene must be
@@ -1429,6 +1542,7 @@ export class StorySyncController {
 				this.active = false;
 				this.committed = true;                            // save guard disarms
 				this.snapshot = null;
+				this.mainPlotSnapshot = null;
 				this.currentEventSeq = 0;
 				this.currentEventActive = false;
 				this.currentEventPendingSince = 0;
@@ -1592,11 +1706,21 @@ export class StorySyncController {
 	private refreshQuestButton(): void {
 		try {
 			if (!this.questMenuButton || typeof this.questMenuButton.setText !== 'function') return;
-			let label = t('storySyncEntryShort');
+			// 1.70.64: list page -> 剧情同步 (main story); quest DETAIL page ->
+			// 支线任务同步 (the static quest currently open).
+			const inDetail = !!(this.questMenu && (sc as any).menu && (sc as any).menu.questDetailMode);
+			const active = this.active || this.isPendingStart;
+			const sig = (inDetail ? 'D' : 'L') + '|' + (this.active ? (this.isLocalLeader() ? 'L' : 'M') : 'N') + '|' + (this.isPendingStart ? 'P' : '-');
+			if (this.questButtonSignature === sig) return; // engine repoints the hook position without us
+			this.questButtonSignature = sig;
+			let label = inDetail ? t('storySyncQuestEntryShort') : t('storySyncEntryShort');
 			if (this.active) label = this.isLocalLeader() ? t('storySyncCancelShort') : t('storySyncActiveShort');
 			else if (this.isPendingStart) label = t('storySyncCheckingShort');
 			this.questMenuButton.setText(label, false);
-			this.questMenuButton.setActive(this.active || this.isPendingStart || this.canStartNow());
+			this.questMenuButton.setActive(active || this.canStartNow());
+			// Width changed with the label: tell the native hotkey bar to re-lay
+			// out the top row (otherwise the buttons can overlap by a few pixels).
+			try { if ((sc as any).menu && typeof (sc as any).menu.updateHotkeys === 'function') (sc as any).menu.updateHotkeys(); } catch (_) { /* ignore */ }
 		} catch (_) { /* ignore */ }
 	}
 
@@ -1607,6 +1731,15 @@ export class StorySyncController {
 	private candidateQuestId(): string {
 		const q = this.questManager();
 		if (!q) return '';
+		// On the DETAIL page the open quest IS the target — this also works when
+		// the list selection was refreshed/cleared by the menu transition.
+		try {
+			if (this.questMenu && (sc as any).menu && (sc as any).menu.questDetailMode
+				&& this.questMenu.questDetailBox && this.questMenu.questDetailBox.currentQuest
+				&& this.questMenu.questDetailBox.currentQuest.id) {
+				return this.questMenu.questDetailBox.currentQuest.id;
+			}
+		} catch (_) { /* ignore */ }
 		// 1) The row the player just SELECTED in the quest list (what the original
 		// feature asks for), provided it is active for the leader.
 		// 2) Otherwise the task currently marked with ★ (the route the persistent
@@ -1633,7 +1766,11 @@ export class StorySyncController {
 	}
 
 	private onQuestUiButton(): void {
-		const err = !this.active && !this.isPendingStart ? this.leaderRequestSync() : '';
+		const inDetail = !!(this.questMenu && (sc as any).menu && (sc as any).menu.questDetailMode);
+		let err = '';
+		if (!this.active && !this.isPendingStart) {
+			err = inDetail ? this.leaderRequestSync() : this.leaderRequestMainPlotSync();
+		}
 		if (err) {
 			showMpToast({ title: err, subtitle: this.active ? this.questLabel(this.quest) : undefined });
 			return;
