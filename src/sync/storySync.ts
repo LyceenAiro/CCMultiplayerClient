@@ -110,24 +110,27 @@ export function ensureStorySyncStyle(): void {
 .mpStoryClose { position: absolute; top: 10px; right: 12px; background: none; border: none;
 	color: #8fd6ff; font-size: 20px; cursor: pointer; }
 @keyframes mpStoryFade { from { opacity: 0; } to { opacity: 1; } }
-.mpStoryBar { position: fixed; top: 54px; left: 50%; transform: translateX(-50%);
+.mpTriggerBanner { position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
 	z-index: 9996; display: flex; align-items: center; gap: 10px; max-width: 94vw;
-	padding: 6px 14px; background: rgba(6,18,30,0.9); border: 1px solid #6fc7ff;
-	border-radius: 999px; color: #dff3ff;
+	padding: 7px 14px; background: rgba(6,18,30,0.92); border: 1px solid #6fc7ff;
+	border-radius: 8px; color: #dff3ff;
 	font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
 	font-size: 13px; box-shadow: 0 0 12px rgba(111,199,255,0.35); }
-.mpStoryBar .mpStoryBarTag { color: #6fc7ff; font-weight: bold; }
-.mpStoryBar .mpStoryBarState { color: #ffd98c; }
-.mpStoryBar button { background: #155a86; color: #eaf7ff; border: 1px solid #6fc7ff;
-	border-radius: 999px; padding: 3px 12px; cursor: pointer; font-size: 12px; }
-.mpStoryBar button:hover { background: #1d79b7; }
-.mpStoryBar button.primary { background: #155a86; }
-.mpStoryBar button.danger { background: #5c1f28; border-color: #ff8e9f; }
+.mpTriggerBanner .mpTriggerTag { color: #6fc7ff; font-weight: bold; white-space: nowrap; }
+.mpTriggerBanner .mpTriggerState { color: #ffd98c; white-space: nowrap; }
+.mpTriggerBanner .mpTriggerRows { display: flex; align-items: center; gap: 6px; }
+.mpTriggerBanner .mpDiamond { width: 12px; height: 12px; transform: rotate(45deg);
+	display: inline-block; image-rendering: pixelated; }
+.mpTriggerBanner .mpDiamond.on { background: #5be36e; box-shadow: 0 0 6px rgba(91,227,110,0.8); }
+.mpTriggerBanner .mpDiamond.off { background: #66727a; box-shadow: none; }
+.mpTriggerBanner button { background: #155a86; color: #eaf7ff; border: 1px solid #6fc7ff;
+	border-radius: 999px; padding: 3px 12px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+.mpTriggerBanner button:hover { background: #1d79b7; }
+.mpTriggerBanner button:disabled { opacity: 0.5; cursor: default; }
 .mpStoryComm { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
-	z-index: 10030; pointer-events: none;
-	display: flex; align-items: center; justify-content: center;
-	flex-direction: column; text-align: center; animation: mpStoryCommBack 3.4s ease forwards; }
-.mpStoryCommGlow { position: absolute; left: 50%; top: 50%; width: 640px; height: 220px;
+	z-index: 10030; pointer-events: none; text-align: center;
+	padding-top: calc(33vh - 130px); animation: mpStoryCommBack 3.4s ease forwards; }
+.mpStoryCommGlow { position: absolute; left: 50%; top: calc(33vh - 130px); width: 640px; height: 220px;
 	transform: translate(-50%,-50%); border-radius: 50%;
 	background: radial-gradient(circle, rgba(255,198,64,0.28) 0%, rgba(255,198,64,0.06) 55%, transparent 72%);
 	filter: blur(6px); animation: mpStoryCommPulse 1.5s ease-in-out infinite; }
@@ -153,14 +156,15 @@ export function ensureStorySyncStyle(): void {
 @keyframes mpStoryCommPulse { 0%,100% { opacity: 0.55; transform: translate(-50%,-50%) scale(0.9); }
 	50% { opacity: 0.95; transform: translate(-50%,-50%) scale(1.05); } }
 .mpStoryStar { position: fixed; right: 14px; bottom: 14px; z-index: 9995;
-	width: 34px; height: 34px; pointer-events: auto; cursor: help;
-	background: radial-gradient(circle at 34% 30%, #fff3b0, #ffd13e 46%, #c98a00 82%);
-	clip-path: polygon(50% 0%, 61% 34%, 98% 35%, 69% 55%, 78% 93%, 50% 71%, 22% 93%, 31% 55%, 2% 35%, 39% 34%);
-	filter: drop-shadow(0 0 7px rgba(255,205,70,0.85));
-	animation: mpStarGleam 1.5s ease-in-out infinite; }
+	width: 40px; height: 40px; pointer-events: auto; cursor: help;
+	display: flex; align-items: center; justify-content: center;
+	filter: drop-shadow(0 0 6px rgba(255,205,70,0.8));
+	animation: mpStarGleam 1.6s ease-in-out infinite; }
+.mpStoryStar svg { width: 36px; height: 36px; image-rendering: pixelated;
+	shape-rendering: crispEdges; overflow: visible; }
 .mpStoryStar:hover { transform: scale(1.08); cursor: help; }
-@keyframes mpStarGleam { 0%,100% { box-shadow: none; } 50% {
-	box-shadow: 0 0 12px rgba(255,210,80,0.85), 0 0 0 3px rgba(255,190,40,0.25); } }
+@keyframes mpStarGleam { 0%,100% { filter: drop-shadow(0 0 6px rgba(255,205,70,0.8)); }
+	50% { filter: drop-shadow(0 0 13px rgba(255,220,90,0.95)); } }
 .mpStoryStar::after { content: attr(data-tip); position: absolute; right: 44px; top: 50%;
 	transform: translateY(-50%) translateX(-6px); background: rgba(6,18,30,0.96);
 	border: 1px solid #6fc7ff; border-radius: 6px; padding: 8px 12px; color: #dff3ff;
@@ -213,8 +217,12 @@ export class StorySyncController {
 	private questMenuButton: any = null;
 	private questMenuHotkeyFn: (() => any) | null = null;
 	private questButtonSignature = '';
-	private hudBar: JQuery | null = null;
-	private hudBarSignature = '';
+	private triggerBanner: JQuery | null = null;
+	private triggerBannerKey = '';
+	private triggerBannerSignature = '';
+	private triggerBannerTrig: any = null;
+	private triggerBannerSeenAt = 0;
+	private triggerBannerSent = false;
 	private hudStar: JQuery | null = null;
 
 	private updateRegistered = false;
@@ -249,12 +257,49 @@ export class StorySyncController {
 					+ ' snapshot=' + !!self.snapshot
 					+ ' eventSeq=' + self.currentEventSeq
 					+ ' eventActive=' + self.currentEventActive
-					+ ' waiting=' + !!(self.waitingTrigger));
+					+ ' waiting=' + !!(self.waitingTrigger)
+					+ ' triggerBanner=' + self.triggerBannerKey);
 				if (self.active && q) {
 					const st = self.serializeQuestState(self.quest);
 					console.log('[mpstory] local quest state:', JSON.stringify(st));
 				}
 			} catch (e) { console.warn('[mpstory] failed', e); }
+		};
+		// Trigger-zone diagnostic: list every EventTrigger/LocationEvent near the
+		// local player and why it is/isn't ready. Run it AT the silent story
+		// point when "everyone arrived but nothing played" and send the lines.
+		(window as any).__mpstorytrig = () => {
+			try {
+				const g: any = ig.game;
+				const player = g && g.playerEntity;
+				const ents: any[] = (g && g.entities) || [];
+				const ET: any = (ig.ENTITY as any).EventTrigger;
+				const LE: any = (ig.ENTITY as any).LocationEvent;
+				let n = 0;
+				for (const e of ents) {
+					if (!e || e._killed || !e.coll) continue;
+					const isT = ET && e instanceof ET;
+					const isL = LE && e instanceof LE;
+					if (!isT && !isL) continue;
+					const d = player && player.coll ? Math.round(Math.sqrt(
+						Math.pow(e.coll.pos.x - player.coll.pos.x, 2) + Math.pow(e.coll.pos.y - player.coll.pos.y, 2))) : -1;
+					if (d > 700) continue;
+					n++;
+					let cond = '-', end = '-', hasEvent = !!e.event, raw = !!e._mpStorySettings;
+					try { cond = e.startCondition ? String(e.startCondition.evaluate()) : '-'; } catch (_) { cond = 'throw'; }
+					try { end = e.endCondition ? String(e.endCondition.evaluate()) : '-'; } catch (_) { end = 'throw'; }
+					let tv = '-';
+					try { tv = e.triggerVar ? String((ig.vars as any).get(e.triggerVar)) : '-'; } catch (_) { tv = 'throw'; }
+					console.log('[mpstorytrig] ' + (isT ? 'EVENT-TRIGGER' : 'LOCATION-EVENT')
+						+ ' name=' + (e.name || '(none)') + ' mapId=' + e.mapId
+						+ ' dist=' + d + ' type=' + e.eventType
+						+ ' start=' + cond + ' end=' + end + ' var=' + tv
+						+ ' event=' + hasEvent + ' rawSettings=' + raw
+						+ ' pos=' + Math.round(e.coll.pos.x) + ',' + Math.round(e.coll.pos.y) + ' z=' + Math.round(e.coll.pos.z));
+				}
+				if (!n) console.log('[mpstorytrig] no story trigger within 700px of the player');
+				if (!self.active) console.log('[mpstorytrig] NOT in story-sync mode (this only works while syncing)');
+			} catch (e) { console.warn('[mpstorytrig] failed', e); }
 		};
 	}
 
@@ -884,9 +929,9 @@ export class StorySyncController {
 					showMpToast({ title: t('storySyncCheckTimeout') });
 				}
 			}
-			this.updateHudBar();
 			this.updateGameStar();
 			if (this.questMenu) { try { this.refreshQuestButton(); } catch (_) { /* ignore */ } }
+			this.updateTriggerBanner();
 			this.updateWaitingPrompt();
 		} catch (_) { /* never break the frame */ }
 	}
@@ -1068,26 +1113,29 @@ export class StorySyncController {
 		try {
 			if (!this.active) return false;
 			if (!trig || !trig.coll) return false;
+			this.triggerBannerSeenAt = Date.now();
 			const g: any = ig.game;
 			if (!g || typeof g.isEventStartReady !== 'function') return false;
 			let ready = false;
 			if (kind === 'trigger') {
-				if (!g.isEventStartReady()) return false;
+				if (!g.isEventStartReady()) {
+					this.clearTriggerBannerIf(trig, kind);
+					return false;
+				}
 				const running = trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning();
 				if (running) return false;
 				ready = trig.startCondition && trig.startCondition.evaluate() && !(trig.endCondition && trig.endCondition.evaluate())
 					&& !(trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) && !g.isTeleporting();
 			} else {
 				if (trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning()) return false;
-				if (trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) return false; // native once-per-map semantics
+				if (trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) { this.clearTriggerBannerIf(trig, kind); return false; }
 				ready = this.locationEventReady(trig);
 			}
-			if (!ready) return false;
-			if (this.isLocalLeader()) {
-				this.leaderTriggerReady(trig, kind);
-			} else {
-				this.memberTriggerReady(trig, kind);
+			if (!ready) {
+				this.clearTriggerBannerIf(trig, kind);
+				return false;
 			}
+			this.showTriggerBanner(trig, kind);
 			return true; // leader or member: the engine must not start it itself
 		} catch (_) { return false; }
 	}
@@ -1158,74 +1206,111 @@ export class StorySyncController {
 		return absent;
 	}
 
-	private leaderTriggerReady(trig: any, kind: 'trigger' | 'location'): void {
-		const key = this.triggerKey(trig);
-		const absent = this.absentMembersFor(trig);
-		console.log('[storysync] leader trigger ready kind=' + kind + ' key=' + key + ' absent=' + JSON.stringify(absent));
-		if (!absent.length) {
-			this.startAuthoritativeEvent(trig, kind);
-			return;
-		}
-		this.waitingTrigger = trig;
-		this.waitingPromptSince = this.waitingPromptSince || Date.now();
-	}
-
-	private memberTriggerReady(trig: any, kind: 'trigger' | 'location'): void {
+	/** Trigger-zone banner: replaces BOTH the old leader modal and the old
+	 * member toast. Shown while OUR player satisfies the trigger conditions;
+	 * auto-hides when we leave, the event starts, the map changes, or the mode
+	 * exits. The diamond row shows every REAL member (this.members — bots are
+	 * never part of the server roster): green = inside the zone, grey = outside. */
+	private showTriggerBanner(trig: any, kind: 'trigger' | 'location'): void {
 		const key = kind + ':' + this.triggerKey(trig);
-		const now = Date.now();
-		if (!this.passivePrompted[key] || now - this.passivePrompted[key] > 10000) {
-			this.passivePrompted[key] = now;
-			showMpToast({ title: t('storySyncWaitingLeader'), subtitle: this.questLabel(this.quest) });
-		}
+		if (this.triggerBannerKey === key && this.triggerBannerTrig === trig) return;
+		this.triggerBannerKey = key;
+		this.triggerBannerTrig = trig;
+		this.triggerBannerSignature = '';
+		this.triggerBannerSeenAt = Date.now();
+		console.log('[storysync] entered trigger zone kind=' + kind + ' key=' + this.triggerKey(trig)
+			+ ' name=' + (trig.name || '(none)') + ' eventType=' + trig.eventType);
 	}
 
-	private updateWaitingPrompt(): void {
+	private clearTriggerBannerIf(trig: any, kind: 'trigger' | 'location'): void {
+		if (!this.triggerBannerTrig) return;
+		const key = kind + ':' + this.triggerKey(trig);
+		if (this.triggerBannerKey !== key || this.triggerBannerTrig !== trig) return;
+		console.log('[storysync] left trigger zone kind=' + kind + ' key=' + this.triggerKey(trig));
+		this.hideTriggerBanner();
+	}
+
+	private hideTriggerBanner(): void {
+		try { if (this.triggerBanner) { this.triggerBanner.remove(); this.triggerBanner = null; } } catch (_) { /* ignore */ }
+		this.triggerBannerKey = '';
+		this.triggerBannerSignature = '';
+		this.triggerBannerTrig = null;
+		this.triggerBannerSeenAt = 0;
+		this.triggerBannerSent = false;
+	}
+
+	private updateTriggerBanner(): void {
 		try {
-			if (!this.active || !this.isLocalLeader() || !this.waitingTrigger || this.waitingTrigger._killed) {
-				if (this.waitingOpen) { closeStoryWindows(); this.waitingOpen = false; }
-				this.waitingTrigger = null;
-				this.waitingPromptSince = 0;
+			if (!this.active || !this.triggerBannerTrig) {
+				if (this.triggerBanner) this.hideTriggerBanner();
 				return;
 			}
-			const trig = this.waitingTrigger;
+			const trig = this.triggerBannerTrig;
+			// The trigger's update() stops being called (entity off screen / map
+			// change / trigger disabled): treat >1.5s of silence as "left zone".
+			if (Date.now() - this.triggerBannerSeenAt > 1500) {
+				this.hideTriggerBanner();
+				return;
+			}
+			const kind = this.triggerBannerKey.indexOf('location:') === 0 ? 'location' : 'trigger';
 			const absent = this.absentMembersFor(trig);
-			if (!absent.length) {
-				// Everyone arrived between frames — fire the event now.
-				this.waitingTrigger = null;
-				this.waitingPromptSince = 0;
-				if (this.waitingOpen) { try { closeStoryWindows(); } catch (_) { /* ignore */ } this.waitingOpen = false; }
-				this.startAuthoritativeEvent(trig, trig instanceof (ig.ENTITY as any).LocationEvent ? 'location' : 'trigger');
-				return;
+			// Leader authority: as soon as everyone is inside, fire the engine event.
+			if (this.isLocalLeader()) {
+				if (!absent.length) {
+					this.waitingTrigger = trig;
+					if (!this.triggerBannerSent) {
+						this.triggerBannerSent = true;
+						this.hideTriggerBanner();
+						this.startAuthoritativeEvent(trig, kind);
+					}
+					return;
+				}
 			}
-			if (this.waitingOpen) return;
-			const now = Date.now();
-			if (now - this.waitingPromptSince < NUDGE_PROMPT_COOLDOWN) return;
-			this.waitingPromptSince = now;
-			this.waitingOpen = true;
-			const names = absent.map((n) => '· ' + n).join('\n');
-			storyWindow(
-				t('storySyncGatherTitle'),
-				t('storySyncGatherBody').replace('{quest}', this.questLabel(this.quest)).replace('{names}', names),
-				[
-					{
-						label: t('storySyncGatherNudge'), kind: 'primary',
-						onClick: () => {
-							// The requester is already here; tell the absent members.
-							try { this.conn.storySyncNudge(this.quest, absent.slice()); } catch (_) { /* ignore */ }
-							showMpToast({ title: t('storySyncNudgeSent'), subtitle: absent.join('、') });
-						},
-					},
-					{ label: t('storySyncGatherClose'), kind: 'ghost', onClick: () => { this.waitingOpen = false; } },
-				],
-				true,
-			);
+			const self = this.localName();
+			const text = this.isLocalLeader() ? t('storySyncTriggerBannerLeader') : t('storySyncTriggerBannerMember');
+			const rows: string[] = [];
+			const ordered = Array.isArray(this.members) ? this.members.slice() : [];
+			for (const name of ordered) {
+				const on = name === self || absent.indexOf(name) === -1;
+				rows.push('<span class="mpDiamond ' + (on ? 'on' : 'off') + '" title="' + name + '"></span>');
+			}
+			const absentNames = absent.map((n) => '· ' + n).join('<br>');
+			let html = '<span class="mpTriggerTag">' + t('storySyncTriggerBannerTag') + '</span>'
+				+ '<span class="mpTriggerState">' + text + '</span>'
+				+ '<span class="mpTriggerRows">' + rows.join('') + '</span>';
+			if (absent.length) {
+				html += '<button class="mpTriggerNudge" title="' + t('storySyncGatherNudge') + '">'
+					+ t('storySyncGatherNudge') + '</button>';
+			}
+			if (this.triggerBannerSignature === html) return;
+			this.triggerBannerSignature = html;
+			if (!this.triggerBanner || !document.body.contains(this.triggerBanner[0])) {
+				this.triggerBanner = $('<div class="mpTriggerBanner"></div>');
+				$(document.body).append(this.triggerBanner);
+			}
+			this.triggerBanner.html(html);
+			const selfRef = this;
+			this.triggerBanner.off('click', '.mpTriggerNudge');
+			this.triggerBanner.on('click', '.mpTriggerNudge', () => {
+				try {
+					if (!absent.length) return;
+					selfRef.conn.storySyncNudge(selfRef.quest, absent.slice());
+					console.log('[storysync] nudge sent to ' + JSON.stringify(absent));
+				} catch (_) { /* ignore */ }
+			});
+			if (absentNames) this.triggerBanner.attr('data-absent', absentNames);
 		} catch (_) { /* ignore */ }
 	}
+
+	/** Leftover from the modal gather flow — now a no-op (kept as the tick
+	 * call site already routes through updateTriggerBanner). */
+	private updateWaitingPrompt(): void { }
 
 	// ------------------------------------------------- authoritative event start
 
 	private startAuthoritativeEvent(trig: any, kind: 'trigger' | 'location'): void {
 		try {
+			this.hideTriggerBanner();
 			const ev = this.triggerEventOf(trig);
 			if (!ev) {
 				showMpToast({ title: t('storySyncTriggerMissing') });
@@ -1237,6 +1322,8 @@ export class StorySyncController {
 			if (!map || !key) return;
 			const EV: any = (ig as any).EVENT_TYPE || {};
 			const type = kind === 'location' ? (EV.PARALLEL || 1) : (Number(trig.eventType) || EV.CUTSCENE || 2);
+			console.log('[storysync] starting authoritative event kind=' + kind + ' key=' + key
+				+ ' name=' + (trig.name || '(none)') + ' type=' + type + ' map=' + map);
 			const token = { allow: true };
 			(window as any).__mpStoryRun = token;
 			let call: any = null;
@@ -1311,6 +1398,7 @@ export class StorySyncController {
 		this.waitingTrigger = null;
 		this.waitingPromptSince = 0;
 		this.waitingOpen = false;
+		this.hideTriggerBanner();
 		if (data.from === selfName) {
 			// Leader echo carries the authoritative seq while the event already runs.
 			if (!this.currentEventActive) this.currentEventPendingSince = Date.now();
@@ -1551,6 +1639,7 @@ export class StorySyncController {
 				this.waitingTrigger = null;
 				this.waitingPromptSince = 0;
 				this.waitingOpen = false;
+				this.hideTriggerBanner();
 				this.leaderCompleteAt = 0;
 				this.finishedSynced = false;
 				try { closeStoryWindows(); } catch (_) { /* ignore */ }
@@ -1823,9 +1912,8 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
-	/** Bottom-right star shown for the ENTIRE sync; hovering it says the mode is
-	 * active (tooltip via CSS). Managed per-frame with the same change gate style
-	 * as the top bar. */
+	/** Bottom-right PIXEL four-point star shown for the ENTIRE sync; hovering it
+	 * says the mode is active (tooltip via CSS). Managed per-frame. */
 	private updateGameStar(): void {
 		try {
 			if (typeof document === 'undefined' || !document.body) return;
@@ -1834,45 +1922,13 @@ export class StorySyncController {
 				return;
 			}
 			if (!this.hudStar || !document.body.contains(this.hudStar[0])) {
-				this.hudStar = $('<div class="mpStoryStar" data-tip="' + t('storySyncStarTip') + '"></div>');
+				const svg = '<svg viewBox="0 0 11 11" shape-rendering="crispEdges">'
+					+ '<path fill="#fff3b0" d="M5 0h1v2h1v1h-1v1h1v1h-1v1h1v1h-1v1h1v1h-1v2h-1v-2h-1v-1h1v-1h-1v-1h1v-1h-1v-1h1v-1h-1v-1h1v-1h-1z"/>'
+					+ '<path fill="#ffd13e" d="M4 2h3v1h1v3h-1v1h-3v-1h-1v-3h1z"/>'
+					+ '<path fill="#fff7cf" d="M5 3h1v3h-1z"/></svg>';
+				this.hudStar = $('<div class="mpStoryStar" data-tip="' + t('storySyncStarTip') + '">' + svg + '</div>');
 				$(document.body).append(this.hudStar);
 			}
-		} catch (_) { /* ignore */ }
-	}
-
-	private hudBarHtml(): string | null {
-		if (!this.active) return null;
-		let state = this.isLocalLeader() ? t('storySyncBarLeader') : t('storySyncBarMember');
-		if (this.inSyncedStoryVideo()) state = t('storySyncBarPlaying');
-		let html = '<span class="mpStoryBarTag">' + t('storySyncBarTitle') + '</span>'
-			+ '<span>' + this.questLabel(this.quest) + '</span>'
-			+ '<span class="mpStoryBarState">' + state + '</span>';
-		if (this.isLocalLeader()) {
-			html += '<button class="mpStoryBarCancel">' + t('storySyncBarCancel') + '</button>';
-		}
-		return html;
-	}
-
-	private updateHudBar(): void {
-		try {
-			if (typeof document === 'undefined' || !document.body) return;
-			const html = this.hudBarHtml();
-			if (!html) {
-				if (this.hudBar) { this.hudBar.remove(); this.hudBar = null; }
-				this.hudBarSignature = '';
-				return;
-			}
-			if (!this.hudBar || !document.body.contains(this.hudBar[0])) {
-				this.hudBar = $('<div class="mpStoryBar"></div>');
-				$(document.body).append(this.hudBar);
-				this.hudBarSignature = '';
-			}
-			if (this.hudBarSignature === html) return; // per-frame pump: only rebuild on change
-			this.hudBarSignature = html;
-			this.hudBar.html(html);
-			const self = this;
-			this.hudBar.off('click', '.mpStoryBarCancel');
-			this.hudBar.on('click', '.mpStoryBarCancel', () => { try { self.leaderCancelSync(false); } catch (_) { /* ignore */ } });
 		} catch (_) { /* ignore */ }
 	}
 }
