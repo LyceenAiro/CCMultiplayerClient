@@ -14,8 +14,12 @@ export class OnTeleportListener {
 	 * progress for the whole window (same pending signature). The first recovery
 	 * re-attempts the SAME map the player was already entering instead of yanking
 	 * them to Rhombus Square; only a second consecutive no-progress wedge on the
-	 * same map escalates to Rhombus Square. */
+	 * same map escalates to Rhombus Square.
+	 * 1.70.73: image-only stalls (web startup loads many portrait/prop atlases
+	 * slowly) get a 20s window instead of 5s — force-dropping them mid-load was
+	 * creating half-loaded maps and the save-loss loop. */
 	private static readonly NO_PROGRESS_MS = 5000;
+	private static readonly NO_PROGRESS_IMAGE_MS = 20000;
 	private _lastProgressSig = '';
 	private _lastProgressAt = 0;
 	private _recoveredMap = '';
@@ -102,7 +106,11 @@ export class OnTeleportListener {
 							instance._lastProgressSig = sig;
 							instance._lastProgressAt = Date.now();
 						}
-						if (Date.now() - instance._lastProgressAt > OnTeleportListener.NO_PROGRESS_MS) {
+						const imageOnly = instance.stuckResourcesAreAllImages();
+						const noProgressMs = imageOnly
+							? OnTeleportListener.NO_PROGRESS_IMAGE_MS
+							: OnTeleportListener.NO_PROGRESS_MS;
+						if (Date.now() - instance._lastProgressAt > noProgressMs) {
 							instance._lastProgressSig = '';
 							instance._lastProgressAt = Date.now();
 							instance.recoverFromStuckTeleport();
@@ -115,6 +123,22 @@ export class OnTeleportListener {
 				}
 			} catch (e) { stuckTimer = 0; }
 		});
+	}
+
+	/** True while every pending loader key is an Image resource (cacheType
+	 * "Image"). Browser/electron web starts can legitimately need well over 5s
+	 * for the portrait/prop atlases — force-dropping those was corrupting maps. */
+	private stuckResourcesAreAllImages(): boolean {
+		try {
+			const res: any = (ig.game as any).currentLoadingResource;
+			if (!res || typeof res !== 'object' || !Array.isArray(res._unloaded) || res._unloaded.length === 0) {
+				return false;
+			}
+			for (const key of res._unloaded) {
+				if (typeof key !== 'string' || key.indexOf('Image') !== 0) return false;
+			}
+			return true;
+		} catch (_) { return false; }
 	}
 
 	/** A single concise signature of the current teleport's pending work:
@@ -181,6 +205,20 @@ export class OnTeleportListener {
 			const res: any = (ig.game as any).currentLoadingResource;
 			if (!(ig as any).loading) return; // not stuck in the loader
 			if (res && typeof res === 'object' && Array.isArray(res._unloaded) && res._unloaded.length) {
+				// 1.70.73: image-only stall — do NOT erase the pending images. Give
+				// up on the OLD loader cleanly (cancel its draw interval, mark it
+				// done, clear the shared resource queue) so the recovery teleport can
+				// build a fresh loader; the old image requests may still finish in
+				// the background and only update an already-abandoned loader.
+				if (this.stuckResourcesAreAllImages()) {
+					console.warn('[multiplayer] image loader stalled — abandoning it WITHOUT dropping resources: '
+						+ JSON.stringify(res._unloaded));
+					try { if (res._intervalId) { clearInterval(res._intervalId); res._intervalId = 0; } } catch (_) { /* ignore */ }
+					try { res.done = true; } catch (_) { /* ignore */ }
+					try { if (Array.isArray(ig.resources)) ig.resources.length = 0; } catch (_) { /* ignore */ }
+					(ig as any).loading = false;
+					return;
+				}
 				console.warn('[multiplayer] force-finishing wedged loader; dropping stuck resources: '
 					+ JSON.stringify(res._unloaded));
 				res._unloaded.length = 0;
