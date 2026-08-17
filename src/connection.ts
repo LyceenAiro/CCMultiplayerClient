@@ -217,7 +217,10 @@ export interface IConnection {
     storySyncState(quest: string, state: any, map?: string): void;
     /** Leader -> everyone: the story event just started on the leader (members
      * replay the same local engine event; key = entity mapId string). */
-    storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number): void;
+    storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number): void;
+    /** Any member clicked a story NPC — ask the whole party to raise the NPC
+     * gather banner (the event itself starts later via storySyncEvent). */
+    storySyncNpcRequest(quest: string, map: string, key: string): void;
     /** Leader-only: the authoritative engine event finished — invalidate any
      * open skip vote so nobody's no-timeout vote modal strands forever. */
     storySyncEventEnd(seq: number): void;
@@ -479,7 +482,9 @@ export interface IConnection {
     /** Leader's quest state (server-stamped sender for the echo check). */
     onStorySyncState(cb: (data: { from: string, quest: string, state: any, map?: string }) => void): void;
     /** Leader started a story event — members replay it locally. */
-    onStorySyncEvent(cb: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number, seq: number }) => void): void;
+    onStorySyncEvent(cb: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number, seq: number }) => void): void;
+    /** A teammate clicked a story NPC — raise the gather banner on our side. */
+    onStorySyncNpcRequest(cb: (data: { from: string, quest: string, map: string, key: string }) => void): void;
     /** The mode ended. reason = 'complete' | 'cancel' | 'leave' | 'leaderLeft' |
      * 'partyEnd'. 'complete' carries the final `state`. */
     onStorySyncEnd(cb: (data: { quest: string, reason: string, state?: any, by?: string, leader?: string }) => void): void;

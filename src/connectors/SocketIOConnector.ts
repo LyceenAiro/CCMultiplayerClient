@@ -768,8 +768,15 @@ export class SocketIoConnector implements IConnection {
 	public storySyncState(quest: string, state: any, map?: string): void {
 		this.socket.emit('storySyncState', { quest, state, map: typeof map === 'string' ? map : '' });
 	}
-	public storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number): void {
-		this.socket.emit('storySyncEvent', { quest, map, key, kind: kind === 'location' ? 'location' : 'trigger', type });
+	public storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number): void {
+		this.socket.emit('storySyncEvent', {
+			quest, map, key,
+			kind: kind === 'location' || kind === 'npc' ? kind : 'trigger',
+			type,
+		});
+	}
+	public storySyncNpcRequest(quest: string, map: string, key: string): void {
+		this.socket.emit('storySyncNpcRequest', { quest, map, key });
 	}
 	public storySyncEventEnd(seq: number): void {
 		this.socket.emit('storySyncEventEnd', { seq });
@@ -1558,7 +1565,7 @@ export class SocketIoConnector implements IConnection {
 			}
 		});
 	}
-	public onStorySyncEvent(callback: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number, seq: number }) => void): void {
+	public onStorySyncEvent(callback: (data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number, seq: number }) => void): void {
 		this.socket.on('storySyncEvent', (data: any) => {
 			if (data && typeof data.quest === 'string' && typeof data.map === 'string' && typeof data.key === 'string') {
 				callback({
@@ -1566,10 +1573,18 @@ export class SocketIoConnector implements IConnection {
 					quest: data.quest,
 					map: data.map,
 					key: data.key,
-					kind: data.kind === 'location' ? 'location' : 'trigger',
+					kind: data.kind === 'location' ? 'location' : data.kind === 'npc' ? 'npc' : 'trigger',
 					type: Number(data.type) || 1,
 					seq: Number(data.seq) || 0,
 				});
+			}
+		});
+	}
+	public onStorySyncNpcRequest(callback: (data: { from: string, quest: string, map: string, key: string }) => void): void {
+		this.socket.on('storySyncNpcRequest', (data: any) => {
+			if (data && typeof data.from === 'string' && typeof data.quest === 'string'
+				&& typeof data.map === 'string' && typeof data.key === 'string') {
+				callback({ from: data.from, quest: data.quest, map: data.map, key: data.key });
 			}
 		});
 	}

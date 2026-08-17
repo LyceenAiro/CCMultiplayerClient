@@ -221,11 +221,14 @@ export class StorySyncController {
 	private triggerBannerKey = '';
 	private triggerBannerSignature = '';
 	private triggerBannerTrig: any = null;
+	private triggerBannerKind: 'trigger' | 'location' | 'npc' = 'trigger';
 	private triggerBannerSeenAt = 0;
 	private triggerBannerSent = false;
 	private triggerZoneLog: { [key: string]: number } = Object.create(null);
 	private leaderCameraHandle: any = null;
 	private leaderCameraEntity: any = null;
+	private npcHookInstalled = false;
+	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
 
 	private updateRegistered = false;
@@ -320,6 +323,7 @@ export class StorySyncController {
 		try { c.onStorySyncStartFailed((data) => this.onStartFailed(data)); } catch (e) { console.error('[storysync] wire startFailed failed', e); }
 		try { c.onStorySyncState((data) => this.onState(data)); } catch (e) { console.error('[storysync] wire state failed', e); }
 		try { c.onStorySyncEvent((data) => this.onEvent(data)); } catch (e) { console.error('[storysync] wire event failed', e); }
+		try { c.onStorySyncNpcRequest((data) => this.onNpcRequest(data)); } catch (e) { console.error('[storysync] wire npcRequest failed', e); }
 		try { c.onStorySyncEnd((data) => this.onEnd(data)); } catch (e) { console.error('[storysync] wire end failed', e); }
 		try { c.onStorySyncSkipVote((data) => this.onSkipVoteRequested(data)); } catch (e) { console.error('[storysync] wire skipVote failed', e); }
 		try { c.onStorySyncSkipResult((data) => this.onSkipVoteResult(data)); } catch (e) { console.error('[storysync] wire skipResult failed', e); }
@@ -955,6 +959,7 @@ export class StorySyncController {
 		this.installModelSkipHook();
 		this.installCutsceneWrapper();
 		this.installMessageHook();
+		this.installNpcHook();
 		this.installQuestModelHooks();
 		this.installTriggerHooks();
 		this.installEventStepHooks();
@@ -1170,6 +1175,119 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.70.71: gate STORY NPC interactions the same way as automatic triggers.
+	 * Trade/shop/arena/quest NPC events stay native; only SIMPLE dialogue NPCs
+	 * (and xeno callback dialogues) enter the gather flow. */
+	private installNpcHook(): void {
+		try {
+			if (this.npcHookInstalled) return;
+			const NPC: any = (ig.ENTITY as any).NPC;
+			if (!NPC || typeof NPC.inject !== 'function') return;
+			this.npcHookInstalled = true;
+			NPC.inject({
+				onInteraction(this: any) {
+					const ctl: StorySyncController = (window as any).__mpStory;
+					if (ctl) {
+						if (ctl.npcApplyBypass) return this.parent();
+						if (ctl.maybeGateNpcInteraction(this)) return undefined;
+					}
+					return this.parent();
+				},
+			});
+			console.log('[storysync] NPC interaction gate installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	public maybeGateNpcInteraction(npc: any): boolean {
+		try {
+			if (!this.active || !npc || npc._killed) return false;
+			if (npc.eventCall && typeof npc.eventCall.isRunning === 'function' && npc.eventCall.isRunning()) return false;
+			const st = npc.npcStates && npc.npcStates[npc.activeStateIdx];
+			if (!st) return false;
+			const EV_TYPE: any = (sc as any).NPC_EVENT_TYPE;
+			const isStory = st.npcEventObj && st.npcEventType === (EV_TYPE ? EV_TYPE.SIMPLE : 0)
+				&& st.npcEventObj instanceof (ig as any).Event;
+			const xenoStory = !!(npc.xenoDialog && typeof npc.xenoDialog.getCallbackEvent === 'function'
+				&& npc.xenoDialog.getCallbackEvent());
+			if (!isStory && !xenoStory) return false;
+			const map = (ig.game as any).mapName || '';
+			const key = this.triggerKey(npc);
+			if (!map || !key) return false;
+			this.showTriggerBanner(npc, 'npc');
+			try { this.conn.storySyncNpcRequest(this.quest, map, key); } catch (_) { /* ignore */ }
+			console.log('[storysync] story NPC interaction waiting for party: ' + key);
+			return true;
+		} catch (_) { return false; }
+	}
+
+	private onNpcRequest(data: { from: string, quest: string, map: string, key: string }): void {
+		try {
+			if (!this.active || data.quest !== this.quest || data.from === this.localName()) return;
+			if (((ig.game as any).mapName || '') !== data.map) return;
+			const npc = this.findNpc(data.key);
+			if (npc) this.showTriggerBanner(npc, 'npc');
+			else console.log('[storysync] npc gather request for a map/npc we cannot see (key=' + data.key + ')');
+		} catch (_) { /* ignore */ }
+	}
+
+	private findNpc(key: string): any {
+		try {
+			const NPC: any = (ig.ENTITY as any).NPC;
+			const entities: any[] = (ig.game as any).entities || [];
+			for (let i = 0; i < entities.length; i++) {
+				const e = entities[i];
+				if (!e || e._killed || !(NPC && e instanceof NPC)) continue;
+				if (this.triggerKey(e) === key) return e;
+				if (e.name && String(e.name) === key) return e;
+			}
+		} catch (_) { /* ignore */ }
+		return null;
+	}
+
+	/** Leader-side: everyone is at the story NPC — run the ORIGINAL NPC
+	 * interaction (native blocking event + enterCutscene) and relay it. */
+	private startAuthoritativeNpcEvent(npc: any): void {
+		try {
+			const map = (ig.game as any).mapName || '';
+			const key = this.triggerKey(npc);
+			if (!map || !key) return;
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			const type = EV.CUTSCENE || 2;
+			console.log('[storysync] starting authoritative NPC story key=' + key
+				+ ' name=' + (npc.name || '(none)') + ' map=' + map);
+			this.npcApplyBypass = true;
+			try { npc.onInteraction(); } finally { this.npcApplyBypass = false; }
+			if (!npc.eventCall) {
+				showMpToast({ title: t('storySyncTriggerStartFailed') });
+				return;
+			}
+			this.currentEventActive = true;
+			this.currentEventPendingSince = 0;
+			this.skipRequested = false;
+			this.attachEventEnd(npc.eventCall);
+			try { this.conn.storySyncEvent(this.quest, map, key, 'npc', type); } catch (_) { /* ignore */ }
+		} catch (err) {
+			console.warn('[storysync] authoritative NPC event start failed', err);
+		}
+	}
+
+	private memberReplayNpcEvent(npc: any, seq: number): void {
+		try {
+			console.log('[storysync] member replaying NPC story seq=' + seq + ' key=' + this.triggerKey(npc));
+			this.npcApplyBypass = true;
+			try { npc.onInteraction(); } finally { this.npcApplyBypass = false; }
+			if (npc.eventCall) {
+				this.currentEventSeq = seq;
+				this.currentEventActive = true;
+				this.currentEventPendingSince = 0;
+				this.skipRequested = false;
+				this.attachEventEnd(npc.eventCall);
+			}
+		} catch (err) {
+			console.warn('[storysync] member NPC replay failed', err);
+		}
+	}
+
 	/** Returns true when the controller consumed the frame (the caller skips its
 	 * native update). Ready-check mirrors the engine's own trigger predicates. */
 	public maybeGateTrigger(trig: any, kind: 'trigger' | 'location'): boolean {
@@ -1282,11 +1400,12 @@ export class StorySyncController {
 	 * auto-hides when we leave, the event starts, the map changes, or the mode
 	 * exits. The diamond row shows every REAL member (this.members — bots are
 	 * never part of the server roster): green = inside the zone, grey = outside. */
-	private showTriggerBanner(trig: any, kind: 'trigger' | 'location'): void {
+	private showTriggerBanner(trig: any, kind: 'trigger' | 'location' | 'npc'): void {
 		const key = kind + ':' + this.triggerKey(trig);
 		if (this.triggerBannerKey === key && this.triggerBannerTrig === trig) return;
 		this.triggerBannerKey = key;
 		this.triggerBannerTrig = trig;
+		this.triggerBannerKind = kind;
 		this.triggerBannerSignature = '';
 		this.triggerBannerSeenAt = Date.now();
 		// 1.70.69: keep ONE console line per trigger for the whole session (nearby
@@ -1313,8 +1432,10 @@ export class StorySyncController {
 		this.triggerBannerKey = '';
 		this.triggerBannerSignature = '';
 		this.triggerBannerTrig = null;
+		this.triggerBannerKind = 'trigger';
 		this.triggerBannerSeenAt = 0;
 		this.triggerBannerSent = false;
+		this.triggerZoneLog = Object.create(null);
 	}
 
 	private updateTriggerBanner(): void {
@@ -1324,13 +1445,25 @@ export class StorySyncController {
 				return;
 			}
 			const trig = this.triggerBannerTrig;
+			// NPC banners have no per-frame trigger update: keep them alive only
+			// while the LOCAL player stays near the NPC (leave -> banner disappears).
+			if (this.triggerBannerKind === 'npc') {
+				const p = (ig.game as any).playerEntity;
+				const tc = trig && trig.coll && trig.coll.pos;
+				const pc = p && p.coll && p.coll.pos;
+				const near = !!(p && !p._killed && tc && pc
+					&& Math.pow(pc.x - tc.x, 2) + Math.pow(pc.y - tc.y, 2) <= GATHER_RADIUS * GATHER_RADIUS
+					&& Math.abs((pc.z || 0) - (tc.z || 0)) <= GATHER_Z_DELTA);
+				if (!near) { this.hideTriggerBanner(); return; }
+				this.triggerBannerSeenAt = Date.now();
+			}
 			// The trigger's update() stops being called (entity off screen / map
 			// change / trigger disabled): treat >1.5s of silence as "left zone".
 			if (Date.now() - this.triggerBannerSeenAt > 1500) {
 				this.hideTriggerBanner();
 				return;
 			}
-			const kind = this.triggerBannerKey.indexOf('location:') === 0 ? 'location' : 'trigger';
+			const kind = this.triggerBannerKind;
 			const absent = this.absentMembersFor(trig);
 			// Leader authority: as soon as everyone is inside, fire the engine event.
 			if (this.isLocalLeader()) {
@@ -1339,7 +1472,8 @@ export class StorySyncController {
 					if (!this.triggerBannerSent) {
 						this.triggerBannerSent = true;
 						this.hideTriggerBanner();
-						this.startAuthoritativeEvent(trig, kind);
+						if (kind === 'npc') this.startAuthoritativeNpcEvent(trig);
+						else this.startAuthoritativeEvent(trig, kind);
 					}
 					return;
 				}
@@ -1515,7 +1649,7 @@ export class StorySyncController {
 
 	// ---------------------------------------------------------------- event relay
 
-	private onEvent(data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location', type: number, seq: number }): void {
+	private onEvent(data: { from: string, quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number, seq: number }): void {
 		if (!this.active || data.quest !== this.quest) return;
 		const mapNow = (ig.game as any).mapName || '';
 		const selfName = this.localName();
@@ -1534,6 +1668,16 @@ export class StorySyncController {
 		if (mapNow !== data.map) {
 			showMpToast({ title: t('storySyncEventOffMap'), subtitle: this.questLabel(this.quest) });
 			console.log('[storysync] story event relayed from another map (' + data.map + '), we are on ' + mapNow);
+			return;
+		}
+		if (data.kind === 'npc') {
+			const npc = this.findNpc(data.key);
+			if (!npc) {
+				console.warn('[storysync] matching story NPC not found for event key=' + data.key);
+				showMpToast({ title: t('storySyncEventMissingTrigger') });
+				return;
+			}
+			this.memberReplayNpcEvent(npc, data.seq);
 			return;
 		}
 		const trig = this.findTrigger(data.key, data.kind);
