@@ -1131,6 +1131,7 @@ export class StorySyncController {
 			const EV: any = (ig as any).EVENT_TYPE || {};
 			if (type === EV.PARALLEL) return false;
 			if (ev && ev._mpStoryQuestSolvedEvent) return false;
+			if (ev && ev._mpBlockerEvent) return false; // 1.70.76: local gate scenes always play
 			if ((window as any).__mpStoryRun && (window as any).__mpStoryRun.allow) return false;
 			const now = Date.now();
 			if (now - this.lastSuppressToastAt > SUPPRESS_TOAST_COOLDOWN) {
@@ -1160,16 +1161,18 @@ export class StorySyncController {
 				init: stash,
 				update(this: any) {
 					const ctl: StorySyncController = (window as any).__mpStory;
-					// 1.70.74: blocker/entry-gate scenes play natively on EVERY client
-					// (solo gate behavior). Run the engine update under the same
-					// allow-token used for remote replays, so the member-side
-					// Cutscene.startEvent wrapper cannot suppress the local gate.
+					// 1.70.76: blocker/entry-gate scenes are started DIRECTLY per client.
+					// No gather, no broadcast, no leader authority. The direct start
+					// also bypasses the member-side Cutscene.startEvent suppression by
+					// carrying the allow-token, so the gate really plays everywhere.
 					if (ctl && ctl.shouldPlayBlockerLocally(this)) {
-						const prev = (window as any).__mpStoryRun;
-						(window as any).__mpStoryRun = { allow: true };
-						try { this.parent(); } finally {
-							if (prev === undefined) delete (window as any).__mpStoryRun;
-							else (window as any).__mpStoryRun = prev;
+						if (!ctl.startBlockerLocally(this)) {
+							const prev = (window as any).__mpStoryRun;
+							(window as any).__mpStoryRun = { allow: true };
+							try { this.parent(); } finally {
+								if (prev === undefined) delete (window as any).__mpStoryRun;
+								else (window as any).__mpStoryRun = prev;
+							}
 						}
 						return;
 					}
@@ -1325,6 +1328,7 @@ export class StorySyncController {
 			let hasPlot = false;
 			let hasTeleport = false;
 			let hasRunner = false;
+			let hasArMsg = false;
 			const walk = (v: any): void => {
 				if (v === null || v === undefined) return;
 				if (Array.isArray(v)) { for (const x of v) walk(x); return; }
@@ -1332,6 +1336,7 @@ export class StorySyncController {
 				if (typeof v.type === 'string') {
 					if (v.type === 'TELEPORT') hasTeleport = true;
 					if (v.type === 'SET_NPC_RUNNERS' || v.type === 'RESET_NPC_RUNNERS') hasRunner = true;
+					if (v.type === 'SHOW_AR_MSG') hasArMsg = true;
 					if (v.type === 'CHANGE_VAR_NUMBER'
 						&& v.varName && String(v.varName).indexOf('plot.line') === 0) hasPlot = true;
 				}
@@ -1343,7 +1348,10 @@ export class StorySyncController {
 				'BeforeTrailBuldingEnter2', 'ApolloBlocker', 'ApollBarrier1', 'ApollBarrier2',
 				'runAwayBlocker', 'BeforeDoorScene']);
 			if (BLOCKER_NAMES.has(name)) return true;
-			if (/block|barrier|before|runaway/i.test(name)) return true;
+			// SHOW_AR_MSG is the engine's "Access denied"-style HUD warning used
+			// by entry gates — never a party story beat.
+			if (hasArMsg) return true;
+			if (/block|barrier|before|runaway|gate|deny|forbid|access/i.test(name)) return true;
 			if (hasRunner && name && /npc|runner|gate|before|block|barrier/i.test(name)) return true;
 			return false;
 		} catch (_) { return false; }
@@ -1356,6 +1364,44 @@ export class StorySyncController {
 			if (!this.active || !trig) return false;
 			if (trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning()) return false;
 			return this.isBlockerTrigger(trig);
+		} catch (_) { return false; }
+	}
+
+	/** 1.70.76: actually START the blocker locally, directly from the trigger's
+	 * own loaded/raw event. Returns true when the controller launched it; false
+	 * means the trigger was not ready (the caller then falls back to a native
+	 * update under the allow-token, which is a no-op for the same reason). */
+	public startBlockerLocally(trig: any): boolean {
+		try {
+			if (!this.active || !this.isBlockerTrigger(trig)) return false;
+			const g: any = ig.game;
+			if (!g || typeof g.isEventStartReady !== 'function' || !g.isEventStartReady()) return false;
+			if (!trig.startCondition || !trig.startCondition.evaluate()) return false;
+			if (trig.endCondition && trig.endCondition.evaluate()) return false;
+			if (trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) return false;
+			if (g.isTeleporting && g.isTeleporting()) return false;
+			const ev = this.triggerEventOf(trig);
+			if (!ev) return false;
+			try { ev._mpBlockerEvent = true; } catch (_) { /* ignore */ }
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			const type = Number(trig.eventType) || EV.CUTSCENE || 2;
+			const prev = (window as any).__mpStoryRun;
+			(window as any).__mpStoryRun = { allow: true };
+			let call: any = null;
+			try {
+				call = (sc as any).Cutscene.startEvent(type, ev, trig.name || ('mpBlocker:' + this.triggerKey(trig)));
+			} finally {
+				if (prev === undefined) delete (window as any).__mpStoryRun;
+				else (window as any).__mpStoryRun = prev;
+			}
+			if (!call) return false;
+			trig.eventCall = call;
+			if (trig.triggerVar) {
+				try { (ig.vars as any).set(trig.triggerVar, true); } catch (_) { /* ignore */ }
+			}
+			console.log('[storysync] blocker cutscene played LOCALLY (no relay): key='
+				+ this.triggerKey(trig) + ' name=' + (trig.name || '(none)') + ' type=' + type);
+			return true;
 		} catch (_) { return false; }
 	}
 
