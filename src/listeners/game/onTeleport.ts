@@ -15,11 +15,10 @@ export class OnTeleportListener {
 	 * re-attempts the SAME map the player was already entering instead of yanking
 	 * them to Rhombus Square; only a second consecutive no-progress wedge on the
 	 * same map escalates to Rhombus Square.
-	 * 1.70.73: image-only stalls (web startup loads many portrait/prop atlases
-	 * slowly) get a 20s window instead of 5s — force-dropping them mid-load was
-	 * creating half-loaded maps and the save-loss loop. */
+	 * 1.70.75: image-only stalls use the same 5s window again (if 5s produced
+	 * nothing, waiting 20s changes nothing) — but they are STILL abandoned
+	 * cleanly instead of having their resources dropped, see forceUnstickLoader. */
 	private static readonly NO_PROGRESS_MS = 5000;
-	private static readonly NO_PROGRESS_IMAGE_MS = 20000;
 	private _lastProgressSig = '';
 	private _lastProgressAt = 0;
 	private _recoveredMap = '';
@@ -106,11 +105,7 @@ export class OnTeleportListener {
 							instance._lastProgressSig = sig;
 							instance._lastProgressAt = Date.now();
 						}
-						const imageOnly = instance.stuckResourcesAreAllImages();
-						const noProgressMs = imageOnly
-							? OnTeleportListener.NO_PROGRESS_IMAGE_MS
-							: OnTeleportListener.NO_PROGRESS_MS;
-						if (Date.now() - instance._lastProgressAt > noProgressMs) {
+						if (Date.now() - instance._lastProgressAt > OnTeleportListener.NO_PROGRESS_MS) {
 							instance._lastProgressSig = '';
 							instance._lastProgressAt = Date.now();
 							instance.recoverFromStuckTeleport();
