@@ -224,6 +224,8 @@ export class StorySyncController {
 	private triggerBannerSeenAt = 0;
 	private triggerBannerSent = false;
 	private triggerZoneLog: { [key: string]: number } = Object.create(null);
+	private leaderCameraHandle: any = null;
+	private leaderCameraEntity: any = null;
 	private hudStar: JQuery | null = null;
 
 	private updateRegistered = false;
@@ -339,6 +341,11 @@ export class StorySyncController {
 	public currentQuest(): string { return this.quest; }
 	public isLocalLeader(): boolean { return this.active && this.leader === this.localName(); }
 	public isLocalMember(): boolean { return this.active && this.leader !== this.localName(); }
+	/** 1.70.70: true while a synced story video is actually running (used by
+	 * netSync's mirror-fade decision-maker to hide every non-leader character). */
+	public storyEventActive(): boolean { return this.active && this.inSyncedStoryVideo(); }
+	/** The authoritative story host's username (the one mirror that stays visible). */
+	public storyLeader(): string { return this.leader; }
 
 	private localName(): string {
 		try { return (this.main && this.main.name) || ''; } catch (_) { return ''; }
@@ -937,6 +944,7 @@ export class StorySyncController {
 			if (this.questMenu) { try { this.refreshQuestButton(); } catch (_) { /* ignore */ } }
 			this.updateTriggerBanner();
 			this.updateWaitingPrompt();
+			this.updateLeaderCamera();
 		} catch (_) { /* never break the frame */ }
 	}
 
@@ -1372,6 +1380,55 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.70.70 camera focus: while a synced story video is running, the camera
+	 * stays glued to the STORY LEADER (on members: their leader mirror; on the
+	 * leader themselves: their own player entity). The handle is kept on TOP of
+	 * ig.camera.targets every frame, so a cutscene camera step can't pull the
+	 * view off the leader; the story video end removes the handle and the
+	 * normal camera stack resumes. */
+	private updateLeaderCamera(): void {
+		try {
+			const cam: any = (ig as any).camera;
+			if (!cam || typeof cam.pushTarget !== 'function') { this.clearLeaderCamera(); return; }
+			if (!this.storyEventActive()) { this.clearLeaderCamera(); return; }
+			let ent: any = null;
+			if (this.isLocalLeader()) {
+				ent = (ig.game as any).playerEntity;
+			} else {
+				const pl = this.main.players && this.main.players[this.leader];
+				ent = pl && pl.entity;
+			}
+			if (!ent || ent._killed || !ent.coll) { this.clearLeaderCamera(); return; }
+			if (this.leaderCameraEntity !== ent || !this.leaderCameraHandle) {
+				this.clearLeaderCamera();
+				const ET: any = (ig as any).Camera && (ig as any).Camera.EntityTarget;
+				const TH: any = (ig as any).Camera && (ig as any).Camera.TargetHandle;
+				if (!ET || !TH) return;
+				this.leaderCameraHandle = new TH(new ET(ent), 0, 0);
+				this.leaderCameraEntity = ent;
+				cam.pushTarget(this.leaderCameraHandle, 'FAST');
+			}
+			const h = this.leaderCameraHandle;
+			if (h && !cam.isActiveTarget(h)) {
+				// An engine camera step pushed another target on top this frame.
+				// Re-assert leader focus immediately.
+				try { cam.removeTarget(h, 0); } catch (_) { /* ignore */ }
+				cam.pushTarget(h, 'FAST');
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	private clearLeaderCamera(): void {
+		try {
+			const h = this.leaderCameraHandle;
+			this.leaderCameraHandle = null;
+			this.leaderCameraEntity = null;
+			if (h && (ig as any).camera && typeof (ig as any).camera.removeTarget === 'function') {
+				(ig as any).camera.removeTarget(h, 'NORMAL');
+			}
+		} catch (_) { /* ignore */ }
+	}
+
 	/** Leftover from the modal gather flow — now a no-op (kept as the tick
 	 * call site already routes through updateTriggerBanner). */
 	private updateWaitingPrompt(): void { }
@@ -1710,6 +1767,7 @@ export class StorySyncController {
 				this.waitingPromptSince = 0;
 				this.waitingOpen = false;
 				this.hideTriggerBanner();
+				this.clearLeaderCamera();
 				this.leaderCompleteAt = 0;
 				this.finishedSynced = false;
 				try { closeStoryWindows(); } catch (_) { /* ignore */ }

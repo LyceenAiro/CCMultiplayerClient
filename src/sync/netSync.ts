@@ -7058,7 +7058,28 @@ export class NetSync {
 					targetAlpha = Math.max(0, Math.min(1, (e._mpFadeOutUntil - nowMs) / dur));
 					hideStatus = true;
 				}
-				// Capture the mirror's base coll type once (the same _mpBaseCollType
+				// 1.70.70: during a story-sync video only the STORY LEADER's character
+				// stays visible (not the map-instance host - the leader is the story
+				// authority). Every other remote mirror becomes 100% transparent
+				// (alpha 0) and walk-through; the leader mirror overrides the usual
+				// 0.25 cutscene fade back to full alpha. Normal rules resume on the
+				// next frame after the video ends.
+				let storyHideMirror = false;
+				let storyShowLeader = false;
+				try {
+					const story: any = (window as any).__mpStory;
+					if (story && typeof story.storyEventActive === 'function' && story.storyEventActive()) {
+						const leader = typeof story.storyLeader === 'function' ? String(story.storyLeader() || '') : '';
+						if (leader && name !== leader) storyHideMirror = true;
+						else if (leader && name === leader) storyShowLeader = true;
+					}
+				} catch (_) { /* ignore */ }
+				if (storyHideMirror) {
+					targetAlpha = 0;
+					hideStatus = true;
+				} else if (storyShowLeader) {
+					targetAlpha = 1;
+				}// Capture the mirror's base coll type once (the same _mpBaseCollType
 				// pattern refreshTownCollision used — it captures it there too, so this
 				// just reads it back if already set). Captured BEFORE any write this
 				// function makes so a mid-grace first frame can't latch IGNORE as base.
@@ -7074,7 +7095,7 @@ export class NetSync {
 				// A mirror staged with playPuppetDeath must stay walk-through for its
 				// ~500ms FX window (its coll was deliberately flipped to IGNORE there).
 				const dying = !!((e as any)._mpDying);
-				const noPlayerCollide = !!(inTown || fade || grace || transition || dying);
+				const noPlayerCollide = !!(inTown || fade || grace || transition || dying || storyHideMirror);
 				const targetColl = noPlayerCollide ? (ig as any).COLLTYPE.IGNORE : e._mpBaseCollType;
 				// ROUND 108 (collision re-assert fix): the cache stores the last TARGET
 				// we wrote, so a frame with an unchanged target used to skip the write.
@@ -7099,7 +7120,8 @@ export class NetSync {
 					e._mpBaseStatusVisible = true;
 				}
 				const statusVisible = !hideStatus && e._mpBaseStatusVisible !== false;
-				const hpAlpha = inTown ? 0 : (fade ? 0.25 : (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1));
+				let hpAlpha = inTown ? 0 : (fade ? 0.25 : (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1));
+								if (storyHideMirror) hpAlpha = 0; else if (storyShowLeader) hpAlpha = (typeof e._mpBaseHpAlpha === 'number' ? e._mpBaseHpAlpha : 1);
 				const cached = this._mpMirrorFadeCache.get(e);
 				if (!cached || cached.alpha !== targetAlpha || cached.coll !== targetColl
 					|| cached.ignore !== noPlayerCollide
