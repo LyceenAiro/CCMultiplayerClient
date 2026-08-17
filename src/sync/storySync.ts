@@ -85,10 +85,10 @@ export function ensureStorySyncStyle(): void {
 	stylesInstalled = true;
 	const style = document.createElement('style');
 	style.textContent = `
-.mpStoryScrim { position: fixed; inset: 0; z-index: 10010;
-	background: rgba(0,0,0,0.62); animation: mpStoryFade 0.15s ease-out; }
-.mpStoryBox { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
-	width: min(680px, 92vw); background: rgba(6,18,30,0.96);
+.mpStoryScrim { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+	z-index: 10010; background: rgba(0,0,0,0.62); animation: mpStoryFade 0.15s ease-out; }
+.mpStoryBox { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+	width: 680px; max-width: 92vw; background: rgba(6,18,30,0.96);
 	border: 1px solid #6fc7ff; border-radius: 6px; padding: 20px 24px 18px;
 	color: #eaf7ff; font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
 	box-shadow: 0 0 24px rgba(111,199,255,0.4), inset 0 0 30px rgba(13,42,66,0.7); }
@@ -119,7 +119,8 @@ export function ensureStorySyncStyle(): void {
 .mpStoryBar button:hover { background: #1d79b7; }
 .mpStoryBar button.primary { background: #155a86; }
 .mpStoryBar button.danger { background: #5c1f28; border-color: #ff8e9f; }
-.mpStoryComm { position: fixed; inset: 0; z-index: 10030; pointer-events: none;
+.mpStoryComm { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+	z-index: 10030; pointer-events: none;
 	display: flex; align-items: center; justify-content: center;
 	flex-direction: column; text-align: center; animation: mpStoryCommBack 3.4s ease forwards; }
 .mpStoryCommGlow { position: absolute; left: 50%; top: 50%; width: 640px; height: 220px;
@@ -206,7 +207,7 @@ export class StorySyncController {
 
 	private questMenu: any = null;
 	private questMenuButton: any = null;
-	private questMenuGroup: any = null;
+	private questMenuHotkeyFn: (() => any) | null = null;
 	private hudBar: JQuery | null = null;
 	private hudBarSignature = '';
 	private hudStar: JQuery | null = null;
@@ -1529,42 +1530,61 @@ export class StorySyncController {
 	public questMenuOpened(menu: any): void {
 		try {
 			this.questMenu = menu;
-			this.attachQuestBarButton(menu, true);
+			this.attachQuestBarButton(menu);
 		} catch (_) { /* ignore */ }
 	}
 
 	public questMenuClosed(menu: any): void {
 		try {
-			if (this.questMenuGroup && (sc as any).menu && (sc as any).menu.buttonInteract) {
-				try { (sc as any).menu.buttonInteract.removeParallelGroup(this.questMenuGroup); } catch (_) { /* ignore */ }
+			// 1.70.62: our button lives in the ENGINE's top hotkey bar (the row
+			// that shows 设为常用 / 排序 / 帮助). Unregister it from both the
+			// global-button list and the hotkey-callback list — BUT keep the
+			// ButtonGui itself: the hotkey bar detaches the hook on hide and re-
+			// attaches the same hook on the next open (creating a new one each
+			// time would stack duplicates).
+			if (this.questMenuButton && (sc as any).menu && (sc as any).menu.buttonInteract) {
+				try { (sc as any).menu.buttonInteract.removeGlobalButton(this.questMenuButton); } catch (_) { /* ignore */ }
 			}
-			this.questMenuGroup = null;
+			if (this.questMenuHotkeyFn && (sc as any).menu && Array.isArray((sc as any).menu.hotkeysCallbacks)) {
+				const arr = (sc as any).menu.hotkeysCallbacks;
+				for (let i = arr.length; i--;) {
+					if (arr[i] === this.questMenuHotkeyFn) { arr.splice(i, 1); break; }
+				}
+			}
+			this.questMenuHotkeyFn = null;
 			this.questMenu = null;
-			// Keep questMenuButton: it is a child of the menu and gets re-mounted as
-			// a parallel button group on the next showMenu (re-adding it would stack
-			// duplicates on every open).
 		} catch (_) { /* ignore */ }
 	}
 
-	private attachQuestBarButton(menu: any, attachGroup: boolean): void {
+	private attachQuestBarButton(menu: any): void {
 		try {
 			if (!this.questMenuButton) {
 				const BT: any = (sc as any).BUTTON_TYPE;
 				const btn = new (sc as any).ButtonGui(t('storySyncEntryShort'), 0, true, BT ? BT.SMALL : undefined);
 				btn.keepMouseFocus = true;
-				btn.setAlign((ig as any).GUI_ALIGN.X_RIGHT, (ig as any).GUI_ALIGN.Y_TOP);
-				btn.setPos(8, 4);
 				const self = this;
 				btn.onButtonPress = function () { self.onQuestUiButton(); };
-				menu.addChildGui(btn);
+				// Do NOT set a position: sc.MainMenu.TopBar._positionHotKeys aligns
+				// every hotkey button X_RIGHT / Y_TOP itself, in callback order.
+				// Our callback is unshifted BEFORE the engine's, so it renders
+				// immediately to the LEFT of 设为常用 (hotkeyTask).
 				this.questMenuButton = btn;
 			}
-			if (attachGroup && (sc as any).menu && (sc as any).menu.buttonInteract && !this.questMenuGroup) {
-				const group = new (sc as any).ButtonGroup();
-				group.addFocusGui(this.questMenuButton, 0, 0);
-				(sc as any).menu.buttonInteract.addParallelGroup(group);
-				this.questMenuGroup = group;
+			const menuModel: any = (sc as any).menu;
+			if (!menuModel || !Array.isArray(menuModel.hotkeysCallbacks)) return;
+			// Idempotent per-open registration.
+			if (!this.questMenuHotkeyFn) {
+				const self = this;
+				this.questMenuHotkeyFn = function () { return self.questMenuButton; };
 			}
+			if (menuModel.hotkeysCallbacks.indexOf(this.questMenuHotkeyFn) === -1) {
+				menuModel.hotkeysCallbacks.unshift(this.questMenuHotkeyFn);
+			}
+			if (menuModel.buttonInteract
+				&& (!this.questMenuButton.buttonInteract || this.questMenuButton.buttonInteract !== menuModel.buttonInteract)) {
+				menuModel.buttonInteract.addGlobalButton(this.questMenuButton, null); // visible via hotkey bar; mouse-only, no key stolen
+			}
+			menuModel.commitHotkeys(true);
 			this.refreshQuestButton();
 		} catch (_) { /* ignore */ }
 	}
