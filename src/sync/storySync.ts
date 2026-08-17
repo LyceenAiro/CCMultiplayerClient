@@ -1343,11 +1343,15 @@ export class StorySyncController {
 				for (const k in v) walk(v[k]);
 			};
 			walk(steps);
-			if (hasPlot || hasTeleport) return false;
 			const BLOCKER_NAMES = new Set(['BeforeEnteringTheMine', 'BeforeTrailBuldingEnter',
 				'BeforeTrailBuldingEnter2', 'ApolloBlocker', 'ApollBarrier1', 'ApollBarrier2',
 				'runAwayBlocker', 'BeforeDoorScene']);
+			// 1.70.77: known gate names take precedence. BeforeEnteringTheMine
+			// contains a plot/teleport branch (the "yes, enter the dungeon" choice),
+			// but it is still an entry gate — it must play locally, not as a party
+			// story beat, otherwise one player's choice teleports/affects everyone.
 			if (BLOCKER_NAMES.has(name)) return true;
+			if (hasPlot || hasTeleport) return false;
 			// SHOW_AR_MSG is the engine's "Access denied"-style HUD warning used
 			// by entry gates — never a party story beat.
 			if (hasArMsg) return true;
