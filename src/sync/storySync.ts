@@ -228,6 +228,8 @@ export class StorySyncController {
 	private leaderCameraHandle: any = null;
 	private leaderCameraEntity: any = null;
 	private leaderCameraBaseCount = 0;
+	private localHideApplied = false;
+	private localHideBaseAlpha = 1;
 	private npcHookInstalled = false;
 	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
@@ -950,6 +952,7 @@ export class StorySyncController {
 			this.updateTriggerBanner();
 			this.updateWaitingPrompt();
 			this.updateLeaderCamera();
+			this.updateLocalPlayerStoryHide();
 		} catch (_) { /* never break the frame */ }
 	}
 
@@ -1710,6 +1713,31 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.70.78: while a synced story video plays, MEMBERS hide their OWN local
+	 * player (alpha 0) — the only visible character is the leader's. The leader
+	 * client keeps its own player visible. Restores the previous alpha when the
+	 * video ends (or the mode exits). */
+	private updateLocalPlayerStoryHide(): void {
+		try {
+			const shouldHide = this.storyEventActive() && this.isLocalMember();
+			const p = (ig.game as any).playerEntity;
+			if (shouldHide) {
+				if (p && p.animState && !p._killed) {
+					if (!this.localHideApplied) {
+						this.localHideApplied = true;
+						this.localHideBaseAlpha = (typeof p.animState.alpha === 'number') ? p.animState.alpha : 1;
+					}
+					p.animState.alpha = 0;
+				}
+			} else if (this.localHideApplied) {
+				this.localHideApplied = false;
+				if (p && p.animState) {
+					try { p.animState.alpha = this.localHideBaseAlpha; } catch (_) { /* ignore */ }
+				}
+			}
+		} catch (_) { /* ignore */ }
+	}
+
 	/** Leftover from the modal gather flow — now a no-op (kept as the tick
 	 * call site already routes through updateTriggerBanner). */
 	private updateWaitingPrompt(): void { }
@@ -1769,11 +1797,15 @@ export class StorySyncController {
 			const prev = call.onEnd;
 			const self = this;
 			call.onEnd = function (eventCall: any) {
-				try { self.onSyncedEventEnded(); } catch (_) { /* ignore */ }
+				// 1.70.78: run the ENGINE's end first (native enterGame / camera
+				// pops), THEN our cleanup — resetting actions before the engine's
+				// end would get overwritten by the native onEventEnd bookkeeping.
+				let r: any = undefined;
 				if (prev) {
-					try { return prev.call(this, eventCall); } catch (_) { /* ignore */ }
+					try { r = prev.call(this, eventCall); } catch (_) { /* ignore */ }
 				}
-				return undefined;
+				try { self.onSyncedEventEnded(); } catch (_) { /* ignore */ }
+				return r;
 			};
 		} catch (_) { /* ignore */ }
 	}
@@ -1782,6 +1814,21 @@ export class StorySyncController {
 		if (this.currentEventActive || this.currentEventPendingSince) {
 			console.log('[storysync] synced story event ended (seq=' + this.currentEventSeq + ')');
 		}
+		// 1.70.78: the player may have been walking when the cutscene grabbed
+		// them; a half-finished NAVIGATE/MOVE action can survive event end and
+		// keep dragging the character. Cancel + null the action and zero the
+		// movement inputs so the player regains control immediately.
+		try {
+			const p = (ig.game as any).playerEntity;
+			if (p) {
+				if (typeof p.cancelAction === 'function') { try { p.cancelAction(); } catch (_) { /* ignore */ } }
+				if (typeof p.setAction === 'function') { try { p.setAction(null); } catch (_) { /* ignore */ } }
+				if (p.coll) {
+					try { p.coll.accelDir.x = 0; p.coll.accelDir.y = 0; } catch (_) { /* ignore */ }
+					try { p.coll.vel.x = 0; p.coll.vel.y = 0; } catch (_) { /* ignore */ }
+				}
+			}
+		} catch (_) { /* ignore */ }
 		// Leader tells the server so an open no-timeout skip vote can be aborted
 		// for off-map/afk members instead of stranding their vote modal forever.
 		if (this.currentEventSeq && this.isLocalLeader()) {
