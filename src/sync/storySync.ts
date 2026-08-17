@@ -227,6 +227,7 @@ export class StorySyncController {
 	private triggerZoneLog: { [key: string]: number } = Object.create(null);
 	private leaderCameraHandle: any = null;
 	private leaderCameraEntity: any = null;
+	private leaderCameraBaseCount = 0;
 	private npcHookInstalled = false;
 	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
@@ -1159,6 +1160,19 @@ export class StorySyncController {
 				init: stash,
 				update(this: any) {
 					const ctl: StorySyncController = (window as any).__mpStory;
+					// 1.70.74: blocker/entry-gate scenes play natively on EVERY client
+					// (solo gate behavior). Run the engine update under the same
+					// allow-token used for remote replays, so the member-side
+					// Cutscene.startEvent wrapper cannot suppress the local gate.
+					if (ctl && ctl.shouldPlayBlockerLocally(this)) {
+						const prev = (window as any).__mpStoryRun;
+						(window as any).__mpStoryRun = { allow: true };
+						try { this.parent(); } finally {
+							if (prev === undefined) delete (window as any).__mpStoryRun;
+							else (window as any).__mpStoryRun = prev;
+						}
+						return;
+					}
 					if (ctl && ctl.maybeGateTrigger(this, 'trigger')) return;
 					this.parent();
 				},
@@ -1205,11 +1219,12 @@ export class StorySyncController {
 			const st = npc.npcStates && npc.npcStates[npc.activeStateIdx];
 			if (!st) return false;
 			const EV_TYPE: any = (sc as any).NPC_EVENT_TYPE;
-			const isStory = st.npcEventObj && st.npcEventType === (EV_TYPE ? EV_TYPE.SIMPLE : 0)
+			// 1.70.74: only QUEST-type NPCs join the story gather. Ordinary SIMPLE
+			// dialogue NPCs keep playing locally per player — nobody else is
+			// forced to read a normal conversation.
+			const isQuest = st.npcEventObj && st.npcEventType === (EV_TYPE ? EV_TYPE.QUEST : 2)
 				&& st.npcEventObj instanceof (ig as any).Event;
-			const xenoStory = !!(npc.xenoDialog && typeof npc.xenoDialog.getCallbackEvent === 'function'
-				&& npc.xenoDialog.getCallbackEvent());
-			if (!isStory && !xenoStory) return false;
+			if (!isQuest) return false;
 			const map = (ig.game as any).mapName || '';
 			const key = this.triggerKey(npc);
 			if (!map || !key) return false;
@@ -1331,6 +1346,16 @@ export class StorySyncController {
 			if (/block|barrier|before|runaway/i.test(name)) return true;
 			if (hasRunner && name && /npc|runner|gate|before|block|barrier/i.test(name)) return true;
 			return false;
+		} catch (_) { return false; }
+	}
+
+	/** 1.70.74: blocker triggers are NOT story beats — they play locally on
+	 * whichever client reaches them (nobody else is forced to read them). */
+	public shouldPlayBlockerLocally(trig: any): boolean {
+		try {
+			if (!this.active || !trig) return false;
+			if (trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning()) return false;
+			return this.isBlockerTrigger(trig);
 		} catch (_) { return false; }
 	}
 
@@ -1590,6 +1615,8 @@ export class StorySyncController {
 				const ET: any = (ig as any).Camera && (ig as any).Camera.EntityTarget;
 				const TH: any = (ig as any).Camera && (ig as any).Camera.TargetHandle;
 				if (!ET || !TH) return;
+				this.leaderCameraBaseCount = (typeof cam.getTargetCount === 'function')
+					? cam.getTargetCount() : (Array.isArray(cam.targets) ? cam.targets.length : 0);
 				this.leaderCameraHandle = new TH(new ET(ent), 0, 0);
 				this.leaderCameraEntity = ent;
 				cam.pushTarget(this.leaderCameraHandle, 'FAST');
@@ -1609,8 +1636,26 @@ export class StorySyncController {
 			const h = this.leaderCameraHandle;
 			this.leaderCameraHandle = null;
 			this.leaderCameraEntity = null;
-			if (h && (ig as any).camera && typeof (ig as any).camera.removeTarget === 'function') {
-				(ig as any).camera.removeTarget(h, 'NORMAL');
+			const cam: any = (ig as any).camera;
+			if (h && cam && typeof cam.removeTarget === 'function') {
+				try { cam.removeTarget(h, 'FAST'); } catch (_) { /* ignore */ }
+			}
+			// 1.70.74: our per-frame re-assert kept the leader handle on TOP, so
+			// the engine's own camera push/pop pairs (NPC onEventStart/End,
+			// RESET_CAMERA) can pop OUR handle and leave their target behind.
+			// After removing our handle, pop every target the video pushed on
+			// top of the pre-story stack — the final transition lands back on
+			// the local player's normal camera.
+			if (cam && typeof cam.popTarget === 'function' && this.leaderCameraBaseCount > 0
+				&& Array.isArray(cam.targets)) {
+				const base = this.leaderCameraBaseCount;
+				this.leaderCameraBaseCount = 0;
+				let guard = 16;
+				while (cam.targets.length > base && guard-- > 0) {
+					try { cam.popTarget('FAST'); } catch (_) { break; }
+				}
+			} else {
+				this.leaderCameraBaseCount = 0;
 			}
 		} catch (_) { /* ignore */ }
 	}
