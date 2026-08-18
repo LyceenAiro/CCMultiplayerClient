@@ -2,13 +2,13 @@ import { Multiplayer } from '../multiplayer';
 
 /**
  * 1.71.0 — dungeon interaction-mechanism sync.
- * 1.71.2 — box push/pull ownership + interpolation, PushPullDest relay.
+ * 1.71.2 — box push/pull ownership + interpolation.
+ * 1.71.3 — PushPullDest progress is personal save state.
  *
  * CrossCode dungeon puzzles are mostly var-driven, but each client owns its own
  * ig.vars, so the ENGINE never shares puzzle state across machines. This module
  * scans the live puzzle entities on dungeon maps and relays their compact state:
  *   - push/pull boxes, wave boxes, sliding blocks (position + anim + phased),
- *   - push/pull destinations (the plates boxes lock into and ride down/up),
  *   - water blocks / ice pillars (state + remaining hits),
  *   - OL/dynamic/extract platforms (position),
  *   - one-time / multi-hit / floor / bounce / group switches (on/off + hits),
@@ -21,6 +21,13 @@ import { Multiplayer } from '../multiplayer';
  * else. Remote positions are lerped per-frame so 10Hz snapshots glide instead
  * of stuttering. The instance host still sends a 1Hz full snapshot for late
  * joiners / silent drift, but skips boxes that are currently owned remotely.
+ *
+ * 1.71.3: "box already pushed onto the switch / plate half-lowered" is saved
+ * per player (vanilla var `map.entity<destMapId>_placed`). Cross-syncing it
+ * made an already-solved box fight an unsolved player's copy until the box
+ * vanished. PushPullDest entities are therefore NEVER networked, and a box
+ * whose own destination is already placed in THIS save neither sends nor
+ * receives position — every player solves that particular box themselves.
  */
 
 const PUZZLE_SCAN_INTERVAL = 0.1;   // seconds — change scan
@@ -45,10 +52,6 @@ interface IPuzzleEntry {
 	own?: string;
 	/** 1.71.2: local claim timestamp for same-time grab arbitration. */
 	ot?: number;
-	/** 1.71.2: PushPullDest placed flag. */
-	pl?: number;
-	/** 1.71.2: PushPullDest delayed-lower flag. */
-	dl?: number;
 }
 
 interface IPuzzlePacket {
@@ -84,6 +87,11 @@ class PuzzleSync implements IPuzzleSync {
 	private ownedLast = new Map<number, boolean>();
 	private ownHeartbeat = new Map<number, number>();
 	private interp = new Map<number, { e: any, tx: number, ty: number, tz: number }>();
+	/** 1.71.3: mapIds of push/pull boxes whose PushPullDest is ALREADY PLACED in
+	 * THIS client's save. That progress is per-player save state — solved boxes
+	 * neither send nor receive network position (a solved player's lowered
+	 * plate/box must never overwrite an unsolved player's still-raised puzzle). */
+	private placedBoxIds = new Set<number>();
 
 	constructor(private getMain: () => Multiplayer | undefined) {
 		(window as any).__mppuzzle = () => this.dump();
@@ -111,7 +119,7 @@ class PuzzleSync implements IPuzzleSync {
 		const g: any = ig.game;
 		if (!g || !g.playerEntity || g.isTeleporting()) return;
 		if (!this.inDungeon()) {
-			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size) {
+			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size || this.placedBoxIds.size) {
 				this.seen.clear();
 				this.lastSig.clear();
 				this.lastMap = '';
@@ -119,6 +127,7 @@ class PuzzleSync implements IPuzzleSync {
 				this.remoteOwners.clear();
 				this.ownedLast.clear();
 				this.ownHeartbeat.clear();
+				this.placedBoxIds.clear();
 			}
 			return;
 		}
@@ -132,6 +141,7 @@ class PuzzleSync implements IPuzzleSync {
 			this.remoteOwners.clear();
 			this.ownedLast.clear();
 			this.ownHeartbeat.clear();
+			this.placedBoxIds.clear();
 		}
 		this.expireRemoteOwners((g.entities as any[]) || []);
 		this.scanTimer -= ig.system.tick;
@@ -139,15 +149,20 @@ class PuzzleSync implements IPuzzleSync {
 		if (hostFull) this.lastFullAt = Date.now();
 		if (this.scanTimer > 0 && !hostFull) return;
 		this.scanTimer = PUZZLE_SCAN_INTERVAL;
+		const entities = (g.entities as any[]) || [];
+		this.refreshPlacedBoxIds(entities);
 		const myName = (m.name || '').trim();
 		const entries: IPuzzleEntry[] = [];
 		const nowSeen = new Set<number>();
-		for (const e of (g.entities as any[]) || []) {
+		for (const e of entities) {
 			const mi = e && e.mapId;
 			if (!e || e._killed || typeof mi !== 'number' || !mi) continue;
 			if (!this.isPuzzleEntity(e)) continue;
 			nowSeen.add(mi);
 			const push = this.isPushPull(e);
+			// Solved-in-this-save boxes are personal save state: never ship them,
+			// but keep them in `seen` so they don't turn into a `gone` packet.
+			if (push && this.placedBoxIds.has(mi)) continue;
 			// A box that belongs to someone else right now is a FOLLOWER copy:
 			// never ship its stale position (that is exactly the rollback the
 			// gripping player complained about), and never ship `gone` for it.
@@ -190,6 +205,7 @@ class PuzzleSync implements IPuzzleSync {
 		for (const mi of this.seen) {
 			if (nowSeen.has(mi)) continue;
 			if (this.remoteOwners.has(mi)) continue;
+			if (this.placedBoxIds.has(mi)) continue;
 			this.lastSig.delete(mi);
 			entries.push({ mi, gone: 1 });
 		}
@@ -208,19 +224,25 @@ class PuzzleSync implements IPuzzleSync {
 		try {
 			const m = this.getMain();
 			this.updateMyName(m);
+			const entities = (g.entities as any[]) || [];
+			this.refreshPlacedBoxIds(entities);
 			const byId = new Map<number, any>();
-			for (const e of (g.entities as any[]) || []) {
+			for (const e of entities) {
 				if (e && typeof e.mapId === 'number' && e.mapId && !e._killed) byId.set(e.mapId, e);
 			}
 			for (const s of data.entries) {
 				if (!s || typeof s.mi !== 'number') continue;
 				const e = byId.get(s.mi);
 				if (!e) continue;
+				const push = this.isPushPull(e);
+				// Personal save progress wins: a solved-in-this-save box must keep
+				// its lowered plate position and must never follow another client's
+				// still-unsolved copy (and vice versa).
+				if (push && this.placedBoxIds.has(s.mi)) continue;
 				if (s.gone) {
 					try { if (typeof e.kill === 'function') e.kill(true); } catch (_) { /* ignore */ }
 					continue;
 				}
-				const push = this.isPushPull(e);
 				if (push) this.applyOwnership(e, s);
 				this.applyEntry(e, s, push);
 			}
@@ -275,7 +297,11 @@ class PuzzleSync implements IPuzzleSync {
 	private isPuzzleEntity(e: any): boolean {
 		const E: any = (ig.ENTITY as any);
 		if (!E) return false;
-		const kinds = [E.PushPullBlock, E.WavePushPullBlock, E.SlidingBlock, E.PushPullDest,
+		// NOTE (1.71.3): PushPullDest is deliberately NOT listed here — its
+		// raised/lowered height is a per-player SAVE mechanism. A solved player's
+		// lowered plate must never be broadcast over an unsolved player's raised
+		// one, and the box that belongs to it is excluded via placedBoxIds.
+		const kinds = [E.PushPullBlock, E.WavePushPullBlock, E.SlidingBlock,
 			E.WaterBlock, E.OLPlatform, E.DynamicPlatform, E.ExtractPlatform, E.OneTimeSwitch,
 			E.MultiHitSwitch, E.FloorSwitch, E.Switch, E.BounceSwitch, E.BounceBlock,
 			E.GroupSwitch, E.RotateBlocker, E.Blocker];
@@ -283,6 +309,24 @@ class PuzzleSync implements IPuzzleSync {
 			if (k && e instanceof k) return true;
 		}
 		return false;
+	}
+
+	/** Which push/pull boxes are already PLACED in this client's own save? The
+	 * PushPullDest keeps `placedData.id` = the box mapId it saved (vanilla var
+	 * `map.entity<mapId>_placed`). Those boxes are local-only from now on. */
+	private refreshPlacedBoxIds(entities: any[]): void {
+		const E: any = (ig.ENTITY as any);
+		const next = new Set<number>();
+		try {
+			if (E && E.PushPullDest) {
+				for (const e of entities) {
+					if (!e || e._killed || !(e instanceof E.PushPullDest)) continue;
+					const id = e.placedData && e.placedData.id;
+					if (typeof id === 'number' && id) next.add(id);
+				}
+			}
+		} catch (_) { /* keep the previous set */ }
+		this.placedBoxIds = next;
 	}
 
 	private isPushPull(e: any): boolean {
@@ -402,10 +446,6 @@ class PuzzleSync implements IPuzzleSync {
 		if (e.pushPullable && typeof e.pushPullable.active === 'boolean') s.act = e.pushPullable.active ? 1 : 0;
 		if (typeof e.moving === 'boolean') s.mv = e.moving ? 1 : 0;
 		if (e._hidden) s.hd = 1;
-		// PushPullDest plate state (1.71.2): the plate's z rides `p`, but these
-		// flags keep the receiver from re-evaluating its own unplaced var state.
-		if (typeof e.placed === 'boolean') s.pl = e.placed ? 1 : 0;
-		if (typeof e.delayed === 'boolean') s.dl = e.delayed ? 1 : 0;
 		return s;
 	}
 
@@ -476,20 +516,6 @@ class PuzzleSync implements IPuzzleSync {
 			if (typeof s.anim === 'string' && s.anim && typeof e.setCurrentAnim === 'function') {
 				try { e.setCurrentAnim(s.anim, true, null, true); } catch (_) { /* ignore */ }
 			}
-		}
-		// PushPullDest plate (1.71.2): mirror placed/delayed so the receiver treats
-		// the plate as resolved instead of waiting for its own local box to arrive.
-		if (typeof s.pl === 'number' && typeof e.placed === 'boolean') {
-			try {
-				const want = s.pl === 1;
-				if (e.placed !== want) {
-					e.placed = want;
-					if (want && !e.placedData) e.placedData = { id: 0 };
-				}
-			} catch (_) { /* ignore */ }
-		}
-		if (typeof s.dl === 'number' && typeof e.delayed === 'boolean') {
-			try { e.delayed = s.dl === 1; } catch (_) { /* ignore */ }
 		}
 		if (typeof s.hd === 'number') {
 			try {

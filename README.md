@@ -92,10 +92,13 @@ everything goes through `CCMultiplayerServer`.
   floating platforms, switches, ice pillars and other puzzle entities sync
   inside dungeons via a compact `puzzleState` relay + host snapshots.
 - **Dungeon box authority & smoothing (1.71.2)** — only one player can grip a
-  push/pull box; the gripping client is the sole position authority, other
-  players' boxes follow with per-frame interpolation, and push/pull destination
-  plates (the "box sinks down and becomes a step" plates) lower in sync so the
-  box never vanishes.
+  push/pull box; the gripping client is the sole position authority, and other
+  players' boxes follow with per-frame interpolation.
+- **Dungeon box progress is personal (1.71.3)** — "box pushed onto the switch /
+  plate half-lowered" is each player's own save progress (`map.entity…_placed`):
+  `PushPullDest` plates are never networked, and a box that is already placed in
+  YOUR save neither sends nor receives position, so one player's solved puzzle
+  can never overwrite (or delete) another player's unsolved copy.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original
@@ -306,7 +309,7 @@ Then, per map membership:
 | `registerEntity` / `killEntity` | both | `{id,type,pos,settings}` / `{id}` | host-authoritative entities |
 | `updateEntityPosition` / `…Animation` / `…State` / `…Target` / `…Health` | both | `{id, …}` | mirror entity state |
 | `throwBall` | both | `{ballInfo, combatant, dir, party}` | projectiles |
-| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle snapshots; 1.71.2 adds `own`/`ot` box-grip ownership + `pl`/`dl` plate state |
+| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle snapshots; 1.71.2 adds `own`/`ot` box-grip ownership; 1.71.3 stops relaying PushPullDest / solved-box progress (personal save state) |
 | `saveMirrorRestore` | C→S | `{index}` | 1.71.0 restore one of the five save mirrors |
 | `setHost` | S→C | `isHost` | host migration |
 
