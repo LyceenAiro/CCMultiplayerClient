@@ -55,7 +55,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.71.3';
+export const MP_VERSION = '1.71.4';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -4779,7 +4779,7 @@ export class Multiplayer {
 			const hint = $('<div class="mpLoginHint"></div>');
 			const submit = $('<button type="submit" class="mpLoginSubmit">' + t('loginSubmit') + '</button>');
 			const mirror = $('<button type="button" class="mpLoginMirror">' + t('loginMirror') + '</button>');
-			const close = $('<button type="button" class="mpLoginClose" title="Close">&times;</button>');
+			const close = $('<button type="button" class="mpLoginClose" title="' + t('loginClose') + '">&times;</button>');
 			const form = $('<form></form>');
 
 			let settled = false;
@@ -4884,6 +4884,9 @@ export class Multiplayer {
 			const box = $('<div class="mpLogin mpMirrorBox"></div>');
 			const head = $('<div class="mpLoginHead"></div>');
 			head.append('<span class="mpLoginTitle">' + t('mirrorTitle') + '</span>');
+			const close = $('<button type="button" class="mpLoginClose" title="' + t('loginClose') + '">&times;</button>');
+			close.on('click', () => cancel());
+			head.append(close);
 			const body = $('<div class="mpMirrorBody"></div>');
 			const list = $('<div class="mpMirrorList"></div>');
 			let settled = false;
@@ -4903,6 +4906,24 @@ export class Multiplayer {
 				}
 				// Do not resolve yet — wait for the server result so a rejected
 				// index can be retried instead of hanging the save-download await.
+			};
+			const cancel = (): void => {
+				if (settled) return;
+				cleanup();
+				// 1.71.4: close = abandon the login entirely. The server is holding
+				// the save stream, so emit logout, close the socket and reset the
+				// half-connected session; rejecting with 'cancelled' makes
+				// startConnect skip launchGame and stay on the title screen.
+				try { this.connection.logout(); } catch (_) { /* ignore */ }
+				try {
+					const sock: any = this.connection as any;
+					if (sock && sock.socket && typeof sock.socket.close === 'function') sock.socket.close();
+				} catch (_) { /* ignore */ }
+				try { this.clearMultiplayerState(); } catch (_) { /* ignore */ }
+				try { ig.system.regainFocus(); } catch (_) { /* ignore */ }
+				try { (ig.interact as any).setBlockDelay(0.2); } catch (_) { /* ignore */ }
+				console.log('[multiplayer] mirror picker cancelled — disconnected');
+				reject('cancelled');
 			};
 			const resultCb = (r: { ok: boolean, reason?: string, index?: number }): void => {
 				if (settled) return;
@@ -4932,7 +4953,8 @@ export class Multiplayer {
 			box.append(head).append(body);
 			$(document.body).append(box);
 			// No outside-click dismissal: the save stream is already held, so the
-			// only way forward is choosing a mirror or the latest-save fallback.
+			// ways out are choosing a mirror, the latest-save fallback, or the ×
+			// close button (logout + disconnect, back to the title screen).
 			console.log('[multiplayer] mirror picker: ' + mirrors.length + ' snapshots');
 		});
 	}

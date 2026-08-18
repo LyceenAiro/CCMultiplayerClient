@@ -124,8 +124,10 @@ export function ensureStorySyncStyle(): void {
 @keyframes mpStoryFade { from { opacity: 0; } to { opacity: 1; } }
 .mpTriggerBanner { position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
 	z-index: 9996; display: flex; align-items: center; gap: 10px; max-width: 94vw;
-	padding: 7px 14px; background: rgba(6,18,30,0.92); border: 1px solid #6fc7ff;
-	border-radius: 8px; color: #dff3ff;
+	padding: 8px 20px; background: rgba(6,18,30,0.92); border: 1px solid #6fc7ff;
+	/* 1.71.3: full pill ends — the left and right sides are complete semicircles
+	   instead of a slightly-rounded rectangle. */
+	border-radius: 999px; color: #dff3ff;
 	font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
 	font-size: 13px; box-shadow: 0 0 12px rgba(111,199,255,0.35); }
 .mpTriggerBanner .mpTriggerTag { color: #6fc7ff; font-weight: bold; white-space: nowrap; }

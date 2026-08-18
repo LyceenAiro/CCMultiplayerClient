@@ -99,6 +99,10 @@ everything goes through `CCMultiplayerServer`.
   `PushPullDest` plates are never networked, and a box that is already placed in
   YOUR save neither sends nor receives position, so one player's solved puzzle
   can never overwrite (or delete) another player's unsolved copy.
+- **Dungeon platform authority (1.71.4)** — OL/dynamic/extract platform positions
+  are host-authoritative: members apply the host's positions but never echo their
+  own half-finished transition back, so the Temple Chamber 1 pillars sink/rise to
+  their final height instead of oscillating at ~80%.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original
@@ -151,6 +155,9 @@ everything goes through `CCMultiplayerServer`.
   save images** per player. The login screen's **Rollback from Mirror** button
   logs in with the save stream held, shows the five snapshots with timestamps,
   and restores whichever one you pick.
+- **Mirror picker close (1.71.4)** — the rollback picker has a **×** button that
+  logs out, closes the socket and returns to the title screen without entering
+  the game.
 - **Anti-spam** — area-save throttling and a login-time upload suppression window.
 - **Local persistence** — server list, options, login history and chat history
   survive restarts (localStorage).

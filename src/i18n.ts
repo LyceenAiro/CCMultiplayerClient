@@ -110,6 +110,7 @@ const enDict: { [key: string]: string } = {
     loginTitle: 'Multiplayer Login',
     loginUserPh: 'Username',
     loginSubmit: 'Submit',
+    loginClose: 'Close',
     loginRequired: 'Please enter a username',
     loginRecent: 'Recent',
     // 1.71.0 — save mirror rollback
@@ -433,6 +434,7 @@ const zhDict: { [key: string]: string } = {
     loginTitle: '多人联机登录',
     loginUserPh: '用户名',
     loginSubmit: '登录',
+    loginClose: '关闭',
     loginRequired: '请输入用户名',
     loginRecent: '最近登录',
     // 1.71.0 — 存档镜像回溯

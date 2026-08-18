@@ -160,6 +160,13 @@ class PuzzleSync implements IPuzzleSync {
 			if (!this.isPuzzleEntity(e)) continue;
 			nowSeen.add(mi);
 			const push = this.isPushPull(e);
+			// 1.71.3 (pillar/OL-platform echo loop): moving platforms are var-driven
+			// on every client — once the switch variable arrives each client moves its
+			// own platform natively. Only the map-instance HOST ships platform
+			// POSITIONS (authoritative self-heal); members must not echo their own
+			// half-finished transition back, which made the Temple Chamber 1 pillars
+			// oscillate at ~80% and never reach their final height.
+			if (!m.host && this.isMovingPlatform(e)) continue;
 			// Solved-in-this-save boxes are personal save state: never ship them,
 			// but keep them in `seen` so they don't turn into a `gone` packet.
 			if (push && this.placedBoxIds.has(mi)) continue;
@@ -334,6 +341,16 @@ class PuzzleSync implements IPuzzleSync {
 		if (!E) return false;
 		return (E.PushPullBlock && e instanceof E.PushPullBlock)
 			|| (E.WavePushPullBlock && e instanceof E.WavePushPullBlock);
+	}
+
+	/** Var-driven moving platforms (OL/Dynamic/Extract): their positions are
+	 * host-authoritative; members never echo them (see tick). */
+	private isMovingPlatform(e: any): boolean {
+		const E: any = (ig.ENTITY as any);
+		if (!E) return false;
+		return (E.OLPlatform && e instanceof E.OLPlatform)
+			|| (E.DynamicPlatform && e instanceof E.DynamicPlatform)
+			|| (E.ExtractPlatform && e instanceof E.ExtractPlatform);
 	}
 
 	private isLocalGripping(e: any): boolean {
