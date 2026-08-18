@@ -117,6 +117,11 @@ everything goes through `CCMultiplayerServer`.
   players' quest KILL subtasks. In normal multiplayer a kill only counts when
   the enemy died on the map YOU are on; in story-sync mode any party member's
   kill is relayed to the whole party regardless of map.
+- **Real gravity after box release (1.71.8)** — when a teammate lets go of a
+  box, the map-instance host no longer keeps it frozen at the network height:
+  engine gravity resumes immediately, so Temple Chamber 1's upper-left box can
+  be pushed off its ledge and actually falls to the lower floor instead of
+  being pulled back up to the ledge.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original

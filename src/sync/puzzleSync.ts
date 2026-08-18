@@ -9,6 +9,10 @@ import { Multiplayer } from '../multiplayer';
  *          state is monotonic (once triggered, never reverted by a peer).
  * 1.71.6 — follower box z-physics is frozen while network-driven so a box
  *          pulled off a raised platform can't fall into the pit on peers.
+ * 1.71.8 — when remote box ownership ends, the instance host hands the box
+ *          back to REAL gravity before applying the release packet, so a box
+ *          pushed off a ledge (Temple Chamber 1's upper-left box) can fall to
+ *          the lower floor instead of being re-frozen at the ledge height.
  *
  * CrossCode dungeon puzzles are mostly var-driven, but each client owns its own
  * ig.vars, so the ENGINE never shares puzzle state across machines. This module
@@ -296,7 +300,11 @@ class PuzzleSync implements IPuzzleSync {
 				console.log('[puzzlesync] ' + (e.constructor && e.constructor.name || e.type || '?')
 					+ ' mapId=' + e.mapId + ' dist=' + d + ' sig=' + this.signature(s)
 					+ (owner ? ' remoteOwner=' + owner.name : '')
-					+ (this.isLocalGripping(e) ? ' localGrip' : ''));
+					+ (this.isLocalGripping(e) ? ' localGrip' : '')
+					+ (this.isPushPull(e) && e.coll
+						? ' z=' + Math.round(e.coll.pos.z) + ' base=' + Math.round(e.coll.baseZPos || 0)
+							+ ' grav=' + (e.coll.zGravityFactor || 0)
+							+ (this.followers.has(e.mapId || 0) ? ' FROZEN' : '') : ''));
 			}
 			console.log('[puzzlesync] ' + n + ' puzzle entities nearby, dungeon=' + this.inDungeon()
 				+ ', remoteOwners=' + this.remoteOwners.size + ', interp=' + this.interp.size);
@@ -378,6 +386,16 @@ class PuzzleSync implements IPuzzleSync {
 			const p = e && e.pushPullable;
 			if (!p) return false;
 			return !!(p.gripDir || p.dragState === 2 || p.dragState === 3 || p.dragState === 4);
+		} catch (_) { return false; }
+	}
+
+	/** 1.71.8: true on the map-instance host. Used to decide whether a box whose
+	 * remote grip just ended should return to local gravity (host) or stay a
+	 * network follower (everyone else, who still follows the host's fall). */
+	private isInstanceHost(): boolean {
+		try {
+			const m = this.getMain();
+			return !!(m && m.host);
 		} catch (_) { return false; }
 	}
 
@@ -496,6 +514,37 @@ class PuzzleSync implements IPuzzleSync {
 				e.pushPullable.setActive(true);
 			}
 		} catch (_) { /* ignore */ }
+		// 1.71.8: this client is the box authority again (the remote grip ended).
+		// Stop the network z-freeze and hand the box back to engine gravity. The
+		// release packet's position is applied right after this call; applyEntry
+		// deliberately does NOT re-freeze the box on the instance host, so it can
+		// fall off the ledge instead of hovering at the old ledge height forever.
+		this.restoreBoxGravity(e);
+	}
+
+	/** 1.71.8: undo the follower z-freeze (`zGravityFactor=0`) and let the coll
+	 * recompute its real ground. `zBaseUncertain` is the same flag the vanilla
+	 * magnet path uses after a forced move — it makes the next coll update re-trace
+	 * the ground instead of trusting a stale baseZPos from the frozen ledge. */
+	private restoreBoxGravity(e: any): void {
+		try {
+			if (!e) return;
+			(e as any)._mpPuzzleFollow = false;
+			if (typeof e.mapId === 'number' && e.mapId) {
+				this.followers.delete(e.mapId);
+				this.interp.delete(e.mapId);
+			}
+			const c = e.coll;
+			if (!c) return;
+			if (typeof c.zGravityFactor === 'number') c.zGravityFactor = 1;
+			try { if (c.vel) c.vel.z = 0; } catch (_) { /* ignore */ }
+			// Only the new box authority (the instance host) should force a ground
+			// re-trace. A non-host re-freezes in applyEntry right after this, and a
+			// one-frame local gravity pass could fight the host's fall snapshots.
+			if (this.isInstanceHost()) {
+				try { if (c._collData) c._collData.zBaseUncertain = true; } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	private expireRemoteOwners(entities: any[]): void {
@@ -546,12 +595,18 @@ class PuzzleSync implements IPuzzleSync {
 		// locally; the owner's own `act` field says "still grabbable on THEIR
 		// client", which must not re-enable grabbing here.
 		const followerLocked = push && !localOwner && !!ownerRec;
+		// 1.71.8: a box stays a network-follower while somebody else owns it, OR
+		// while this client is a non-host listening to host snapshots. The host
+		// itself must NOT be re-frozen by the ex-owner's release packet — it just
+		// became the box authority and needs real gravity to let the box fall
+		// down from a ledge (restoreRemoteState already restored the physics).
+		const boxShouldFollow = push && !localOwner && (!!ownerRec || !this.isInstanceHost());
 
 		if (s.p && e.coll && !skipBoxPos) {
 			this.setInterpTarget(e, s.p[0], s.p[1], s.p[2]);
 			// 1.71.6: this box is a network follower — freeze its local z-physics
 			// until the LOCAL player grabs it (prepareLocalGrip restores gravity).
-			if (push && !localOwner) {
+			if (boxShouldFollow) {
 				try { (e as any)._mpPuzzleFollow = true; } catch (_) { /* ignore */ }
 				this.followers.set(e.mapId || 0, e);
 			}
