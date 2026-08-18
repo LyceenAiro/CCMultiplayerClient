@@ -7,6 +7,8 @@ import { Multiplayer } from '../multiplayer';
  * 1.71.4 — platform positions are host-authoritative (no member echoes).
  * 1.71.5 — unowned boxes are host-authoritative; permanent OneTimeSwitch
  *          state is monotonic (once triggered, never reverted by a peer).
+ * 1.71.6 — follower box z-physics is frozen while network-driven so a box
+ *          pulled off a raised platform can't fall into the pit on peers.
  *
  * CrossCode dungeon puzzles are mostly var-driven, but each client owns its own
  * ig.vars, so the ENGINE never shares puzzle state across machines. This module
@@ -91,6 +93,10 @@ class PuzzleSync implements IPuzzleSync {
 	private ownedLast = new Map<number, boolean>();
 	private ownHeartbeat = new Map<number, number>();
 	private interp = new Map<number, { e: any, tx: number, ty: number, tz: number }>();
+	/** 1.71.6: push boxes that are currently FOLLOWERS (their position comes from
+	 * the network). Their local z-physics is frozen every frame so the engine
+	 * can't drop them into a pit the peer's copy already left behind. */
+	private followers = new Map<number, any>();
 	/** 1.71.3: mapIds of push/pull boxes whose PushPullDest is ALREADY PLACED in
 	 * THIS client's save. That progress is per-player save state — solved boxes
 	 * neither send nor receive network position (a solved player's lowered
@@ -123,7 +129,7 @@ class PuzzleSync implements IPuzzleSync {
 		const g: any = ig.game;
 		if (!g || !g.playerEntity || g.isTeleporting()) return;
 		if (!this.inDungeon()) {
-			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size || this.placedBoxIds.size) {
+			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size || this.placedBoxIds.size || this.followers.size) {
 				this.seen.clear();
 				this.lastSig.clear();
 				this.lastMap = '';
@@ -132,6 +138,7 @@ class PuzzleSync implements IPuzzleSync {
 				this.ownedLast.clear();
 				this.ownHeartbeat.clear();
 				this.placedBoxIds.clear();
+				this.followers.clear();
 			}
 			return;
 		}
@@ -146,6 +153,7 @@ class PuzzleSync implements IPuzzleSync {
 			this.ownedLast.clear();
 			this.ownHeartbeat.clear();
 			this.placedBoxIds.clear();
+			this.followers.clear();
 		}
 		this.expireRemoteOwners((g.entities as any[]) || []);
 		this.scanTimer -= ig.system.tick;
@@ -433,6 +441,35 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.71.6: the local player is about to grab a follower box. Hand z-physics
+	 * back to the engine (gravity 1 = grounded native value; deferredUpdate will
+	 * keep it there) and, if the frozen network z is above the stale baseZPos,
+	 * trust the visible position as the new ground so the grip aligns on top
+	 * instead of in the pit. */
+	private prepareLocalGrip(e: any): void {
+		try {
+			if (!e) return;
+			(e as any)._mpPuzzleFollow = false;
+			if (e.mapId) this.followers.delete(e.mapId);
+			const c = e.coll;
+			if (!c) return;
+			if (typeof c.zGravityFactor === 'number') c.zGravityFactor = 1;
+			try { if (c.vel) c.vel.z = 0; } catch (_) { /* ignore */ }
+			const z = c.pos.z;
+			const b = c.baseZPos;
+			if (typeof z === 'number' && typeof b === 'number' && z > b + 1) {
+				c.baseZPos = z;
+				try {
+					const g: any = ig.game;
+					if (g && typeof g.getLevelIdx === 'function') {
+						const lvl = g.getLevelIdx(Math.round(z));
+						if (typeof lvl === 'number') c.level = lvl;
+					}
+				} catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* ignore */ }
+	}
+
 	/** 1.71.5 safety net: a network-written box z can lag below its own baseZPos
 	 * (e.g. the Temple Chamber 1 box echoed from the pit while the platform under
 	 * it had already risen). Vanilla PushPullable aligns the PLAYER to the box's
@@ -512,6 +549,12 @@ class PuzzleSync implements IPuzzleSync {
 
 		if (s.p && e.coll && !skipBoxPos) {
 			this.setInterpTarget(e, s.p[0], s.p[1], s.p[2]);
+			// 1.71.6: this box is a network follower — freeze its local z-physics
+			// until the LOCAL player grabs it (prepareLocalGrip restores gravity).
+			if (push && !localOwner) {
+				try { (e as any)._mpPuzzleFollow = true; } catch (_) { /* ignore */ }
+				this.followers.set(e.mapId || 0, e);
+			}
 		}
 		// WaterBlock: state transitions have real effects (freeze/break).
 		const WB: any = (ig.ENTITY as any).WaterBlock;
@@ -618,7 +661,7 @@ class PuzzleSync implements IPuzzleSync {
 	/** Per-frame glide toward the latest network position (runs every frame via
 	 * simplify.registerUpdate, unlike the 10Hz scan). */
 	private interpolate(): void {
-		if (!this.interp.size) return;
+		if (!this.interp.size && !this.followers.size) return;
 		const g: any = ig.game;
 		if (!g || !g.playerEntity || g.isTeleporting()) return;
 		const t = Math.min(1, (ig.system.tick || 0) * PUZZLE_LERP_RATE);
@@ -639,6 +682,19 @@ class PuzzleSync implements IPuzzleSync {
 			}
 			try { c.setPos(c.pos.x + dx * t, c.pos.y + dy * t, c.pos.z + dz * t); } catch (_) { /* ignore */ }
 			if (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1 && Math.abs(dz) < 0.1) this.interp.delete(mi);
+		}
+		// 1.71.6: follower boxes are network puppets for the vertical axis. Freeze
+		// z every frame (the engine's deferredUpdate can re-enable gravity when
+		// z==baseZPos, so re-assert here) until the LOCAL player grabs the box —
+		// prepareLocalGrip removes it from this map and restores gravity.
+		for (const [mi, e] of this.followers) {
+			if (!e || e._killed || !e.coll) { this.followers.delete(mi); continue; }
+			if (this.isPushPull(e) && this.isLocalGripping(e)) { this.followers.delete(mi); continue; }
+			try {
+				const c: any = e.coll;
+				if (typeof c.zGravityFactor === 'number') c.zGravityFactor = 0;
+				if (c.vel) c.vel.z = 0;
+			} catch (_) { /* ignore */ }
 		}
 	}
 
@@ -661,6 +717,7 @@ class PuzzleSync implements IPuzzleSync {
 				try {
 					if (self.isRemoteOwned(this.entity)) return;
 					self.dropInterp(this.entity);
+					self.prepareLocalGrip(this.entity);
 					self.reconcileBoxGround(this.entity);
 					if (this.entity && typeof this.entity._mpPuzzleGripAt !== 'number') {
 						this.entity._mpPuzzleGripAt = Date.now();

@@ -109,6 +109,10 @@ everything goes through `CCMultiplayerServer`.
   `OneTimeSwitch`es (the Temple Chamber 1 attack switch) stay ON once any peer
   reports them on — a late joiner's stale "not triggered" state can no longer
   revert the party's solved mechanism or leave an unattackable switch behind.
+- **Follower box vertical freeze (1.71.6)** — while a box's position is
+  network-driven, its local z-physics is frozen; pulling a mechanism-raised box
+  off its platform keeps it on the peer's real floor instead of dropping it into
+  the pit (most visible on guest clients).
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original
