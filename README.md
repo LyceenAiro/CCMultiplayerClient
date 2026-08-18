@@ -113,6 +113,10 @@ everything goes through `CCMultiplayerServer`.
   network-driven, its local z-physics is frozen; pulling a mechanism-raised box
   off its platform keeps it on the peer's real floor instead of dropping it into
   the pit (most visible on guest clients).
+- **Quest kill-progress sync (1.71.7)** — real enemy defeats now advance the
+  players' quest KILL subtasks. In normal multiplayer a kill only counts when
+  the enemy died on the map YOU are on; in story-sync mode any party member's
+  kill is relayed to the whole party regardless of map.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original
@@ -327,6 +331,7 @@ Then, per map membership:
 | `updateEntityPosition` / `…Animation` / `…State` / `…Target` / `…Health` | both | `{id, …}` | mirror entity state |
 | `throwBall` | both | `{ballInfo, combatant, dir, party}` | projectiles |
 | `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle snapshots; 1.71.2 adds `own`/`ot` box-grip ownership; 1.71.3 stops relaying PushPullDest / solved-box progress (personal save state) |
+| `questKill` | C→S/S→C | `{enemy, map}` | 1.71.7 quest kill-progress relay: story-sync parties cross maps; otherwise same instance only |
 | `saveMirrorRestore` | C→S | `{index}` | 1.71.0 restore one of the five save mirrors |
 | `setHost` | S→C | `isHost` | host migration |
 

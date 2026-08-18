@@ -938,6 +938,14 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('loot', loot);
 	}
 
+	// 1.71.7 (quest kill-progress sync): plain socket.emit (NOT syncEmit) on purpose —
+	// in story-sync mode a member can be the SOLE player of their own map instance, yet
+	// the kill must still reach the whole party across maps. The server decides the
+	// route (party-wide when the party's story sync is active, else same instance).
+	public questKill(kill: { enemy: string, map: string }): void {
+		this.socket.emit('questKill', { enemy: kill.enemy, map: kill.map });
+	}
+
 	// Round 33 (item 2b): HOST -> all — one of the host's real enemies played a sound;
 	// members replay it positioned on their same-uid puppet (member puppets run no AI, so
 	// they are silent without this relay).
@@ -1184,6 +1192,14 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('loot', (data: any) => {
 			if (data && typeof data.uid === 'number' && Array.isArray(data.drops)) {
 				callback(data);
+			}
+		});
+	}
+	/** 1.71.7: a relayed real enemy defeat for quest KILL progress. Server validated. */
+	public onQuestKill(callback: (kill: { enemy: string, map: string }) => void): void {
+		this.socket.on('questKill', (data: any) => {
+			if (data && typeof data.enemy === 'string' && data.enemy.length > 0 && typeof data.map === 'string') {
+				callback({ enemy: data.enemy, map: data.map });
 			}
 		});
 	}

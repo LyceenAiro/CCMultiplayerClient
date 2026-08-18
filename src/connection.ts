@@ -143,6 +143,17 @@ export interface IConnection {
      * resolveItemDrops). uid = the dead enemy's uid; credit = the granted credits
      * (0 when none); boosterState = the enemy's booster state (number, default 0). */
     emitLoot(loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }): void;
+    /** 1.71.7 (quest kill-progress sync): the map-instance HOST just completed a REAL
+     * enemy death chain (`sc.combat.notifyCombatantDefeated` ran locally, so the
+     * killer's own quest KILL progress is already native). The server routes this:
+     *  - story-sync party  -> every other ONLINE party member, regardless of map
+     *    (cross-map party relay like storySyncState);
+     *  - any other mode    -> the sender's instance only, i.e. kills count only for
+     *    players currently on the same map as the killed enemy.
+     * `enemy` = the engine's `enemyName` (the quest KILL subtask key); `map` = the
+     * map the enemy died on (receivers compare it against their own map as a second
+     * fence in non-sync mode). */
+    questKill(kill: { enemy: string, map: string }): void;
     /** Round 33 (item 2b): HOST -> all — one of the host's real enemies played a sound
      * (any action step). Member puppets run NO local AI, so without this relay they are
      * completely silent. The host relays the sound's path + playback params; each member
@@ -369,6 +380,10 @@ export interface IConnection {
      * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
      * via broadcastHostState. */
     onLoot(callback: (loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }) => void): void;
+    /** 1.71.7: a same-instance player (non-sync mode) or any story-sync party member
+     * relayed a real enemy defeat for quest KILL progress. Server-stamped/validated;
+     * `map` is the map the enemy died on. */
+    onQuestKill(callback: (kill: { enemy: string, map: string }) => void): void;
     /** Round 33 (item 2b): the host relayed an enemy sound (see emitEnemySound). Replay
      * it locally positioned on the same-uid puppet (or globally when `global`). */
     onEnemySound(callback: (s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }) => void): void;

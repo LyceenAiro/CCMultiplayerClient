@@ -594,6 +594,12 @@ export class NetSync {
 		// loot fairness; member side only; the host already got its loot from the real
 		// death chain).
 		conn.onLoot((loot) => this.applyLoot(loot));
+		// 1.71.7 (quest kill-progress): a real enemy defeat happened somewhere.
+		// The server already scoped it (same instance in normal play; whole party in
+		// story-sync mode); we apply it to the LOCAL player's quest KILL subtasks via
+		// the engine's own QuestModel combat-event path. Non-sync receivers re-check
+		// the kill map against their current map as a second fence.
+		conn.onQuestKill((kill) => this.applyQuestKill(kill));
 		// ROUND 33 (item 2b): the host relayed an enemy's sound — replay it on our
 		// matching puppet so enemies aren't silent for the member.
 		conn.onEnemySound((s) => this.applyEnemySound(s));
@@ -4279,6 +4285,24 @@ export class NetSync {
 				? enemy.boosterState : 0;
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
+			// 1.71.7 (quest kill-progress): relay the ENGINE's enemyName so every
+			// entitled player's quest KILL subtasks advance. This rides the same real
+			// host-authoritative death chain as loot (Enemy.onDefeat with a=false),
+			// which is exactly the set of kills the engine credits natively on THIS
+			// client — so the killer is never double-counted (the server excludes the
+			// sender). The server routes it party-wide in story-sync mode (any member's
+			// kill, any map) and same-instance otherwise (same-map requirement).
+			if (typeof conn.questKill === 'function') {
+				const enemyName = enemy && enemy.enemyName;
+				if (typeof enemyName === 'string' && enemyName) {
+					try {
+						conn.questKill({
+							enemy: String(enemyName).slice(0, 64),
+							map: String((ig.game && (ig.game as any).mapName) || '').slice(0, 96),
+						});
+					} catch (_) { /* a kill relay must never break loot */ }
+				}
+			}
 			if (credit > 0 || drops.length) {
 				conn.emitLoot({ uid: enemy.uid, credit: Math.round(credit), boosterState, drops });
 			}
@@ -4778,6 +4802,39 @@ export class NetSync {
 				} catch (_) { /* skip this drop entry on any failure */ }
 			}
 		} catch (_) { /* never let a loot packet crash the frame */ }
+	}
+
+	/** 1.71.7 (quest kill-progress, RECEIVER side): a real enemy defeat was relayed.
+	 * The server has already scoped the packet (same instance in normal play; whole
+	 * party in story-sync mode). We enforce the user-facing contract again here:
+	 *  - story sync active -> apply regardless of map (a teammate's kill counts);
+	 *  - otherwise         -> apply only when the kill happened on OUR current map.
+	 * Progress goes through `sc.quests.onCombatEvent` — the exact engine path the
+	 * native defeat uses for KILL subtasks (updateActiveQuests('KILL', ...)) — so
+	 * quest advancement, HUD refresh and varsChangedDeferred all behave natively.
+	 * The sender is excluded server-side and already got its native credit, so there
+	 * is no double count. */
+	private applyQuestKill(kill: { enemy: string, map: string }): void {
+		try {
+			if (!kill || typeof kill.enemy !== 'string' || !kill.enemy || kill.enemy.length > 64) return;
+			const synced = !!(this.main.storySync && typeof this.main.storySync.isStorySyncActive === 'function'
+				&& this.main.storySync.isStorySyncActive());
+			if (!synced) {
+				const localMap = String((ig.game && (ig.game as any).mapName) || '');
+				if (typeof kill.map !== 'string' || !kill.map || kill.map !== localMap) return;
+			}
+			const q: any = (sc as any).quests;
+			if (!q || typeof q.onCombatEvent !== 'function') return;
+			const ev: any = (sc as any).COMBAT_EVENT;
+			if (!ev || typeof ev.DEFEATED !== 'number') return;
+			q.onCombatEvent({ enemyName: kill.enemy }, ev.DEFEATED);
+			// In story-sync mode, when WE are the leader this kill must flow to every
+			// member immediately (the 0.25s coalescing timer would normally wait).
+			if (synced && this.main.storySync && typeof this.main.storySync.markStateDirty === 'function'
+				&& this.main.storySync.isLocalLeader()) {
+				this.main.storySync.markStateDirty();
+			}
+		} catch (_) { /* never let a quest relay crash the frame */ }
 	}
 
 	/** ROUND 33 (item 2b): HOST-side observer (ig.SoundHelper.playAtEntity wrap).

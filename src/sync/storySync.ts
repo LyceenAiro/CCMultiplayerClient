@@ -696,6 +696,12 @@ export class StorySyncController {
 
 	// --------------------------------------------------------- start handshake
 
+	/** 1.71.7: netSync reads this to decide whether a relayed questKill may cross
+	 * maps (story-sync party relay) or must stay same-map (normal instance relay). */
+	public isStorySyncActive(): boolean {
+		return this.active;
+	}
+
 	/** Quest-menu entry: leader requests the mode for the currently selected (or
 	 * marked) quest. Returns a user-facing string for validation failures. */
 	public leaderRequestSync(): string {
