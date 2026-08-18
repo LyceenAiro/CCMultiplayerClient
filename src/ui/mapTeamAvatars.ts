@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { areaPathOfMap } from '../util/areaUtil';
+import { getMpUiScale } from './uiScale';
 
 /**
  * 1.71.9 (QoL 2): show party-member mini avatars on the AREA map and the WORLD
@@ -188,7 +189,8 @@ function showTooltipForMouse(mx: number, my: number): void {
 			if (!tip) return;
 			ensureStyle();
 			// Convert game coords -> canvas CSS px (same math as netBadge).
-			let x = mx + 14, y = my + 16;
+			const ui = getMpUiScale();
+			let x = mx + 14 * ui, y = my + 16 * ui;
 			try {
 				const sys: any = (ig as any).system;
 				const canvas: any = sys && sys.canvas;
@@ -196,11 +198,13 @@ function showTooltipForMouse(mx: number, my: number): void {
 					const r = canvas.getBoundingClientRect();
 					const sx = (sys.width > 0 && r.width > 0) ? r.width / sys.width : 1;
 					const sy = (sys.height > 0 && r.height > 0) ? r.height / sys.height : 1;
-					x = r.left + mx * sx + 14;
-					y = r.top + my * sy + 16;
+					x = r.left + mx * sx + 14 * ui;
+					y = r.top + my * sy + 16 * ui;
 				}
 			} catch (_) { /* fall back to game coords */ }
-			tip.css({ left: Math.round(x), top: Math.round(y) }).text(h.name).show();
+			// The tooltip root is zoomed; Chromium multiplies authored left/top,
+			// so divide the DESIRED CSS position by the zoom factor.
+			tip.css({ left: Math.round(x / ui), top: Math.round(y / ui) }).text(h.name).show();
 			return;
 		}
 	}

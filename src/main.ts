@@ -1,7 +1,8 @@
 import { Multiplayer, MP_VERSION } from './multiplayer';
 import { installSocialMenuButton } from './ui/socialMenuInject';
 import { installQuickMenuEnhancements } from './ui/quickMenuInject';
-import { installMpOptionsTab, startNameTagLoop, startNetHudLoop } from './ui/mpOptions';
+import { installMpOptionsTab, getMpOption, startNameTagLoop, startNetHudLoop } from './ui/mpOptions';
+import { installMpUiScale } from './ui/uiScale';
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
 import { installTeammateIndicators } from './ui/teammateIndicators';
@@ -67,6 +68,10 @@ async function startMultiplayer(): Promise<void> {
 
 		// Round 12: mod-dedicated options tab (+ persistent player name tags).
 		installMpOptionsTab(() => multiplayer);
+
+		// 1.71.10: live external-UI scale pump. The option getter is injected so
+		// uiScale.ts doesn't import mpOptions (avoids the multiplayer import cycle).
+		installMpUiScale(() => getMpOption('uiScale'));
 
 		// Round 23: direct save+upload from the bag-menu / ESC-menu save buttons while
 		// connected (vanilla save menu when not connected). Same lazy getMain pattern.

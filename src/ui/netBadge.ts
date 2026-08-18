@@ -1,6 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 import type { INetQuality, NetTier } from '../connection';
+import { getMpUiScale } from './uiScale';
 
 /**
  * Round 24: network-quality DIAMOND badges on the party-HUD portraits and the
@@ -325,7 +326,8 @@ function showTooltip(text: string, mx: number, my: number): void {
     const tip = ensureTooltip();
     if (!tip) return;
     ensureTipStyle();
-    let x = mx, y = my;
+    const ui = getMpUiScale();
+    let x = mx + 14 * ui, y = my + 16 * ui;
     try {
         const sys: any = (ig as any).system;
         const canvas: any = sys && sys.canvas;
@@ -333,22 +335,25 @@ function showTooltip(text: string, mx: number, my: number): void {
             const rect = canvas.getBoundingClientRect();
             const scaleX = (sys.width > 0 && rect.width > 0) ? rect.width / sys.width : (sys.scale || 1);
             const scaleY = (sys.height > 0 && rect.height > 0) ? rect.height / sys.height : (sys.scale || 1);
-            x = rect.left + mx * scaleX;
-            y = rect.top + my * scaleY;
+            x = rect.left + mx * scaleX + 14 * ui;
+            y = rect.top + my * scaleY + 16 * ui;
         } else if (sys && typeof sys.getDrawPos === 'function') {
-            x = sys.getDrawPos(mx); y = sys.getDrawPos(my);
+            x = sys.getDrawPos(mx) + 14 * ui; y = sys.getDrawPos(my) + 16 * ui;
         }
     } catch (_) { /* fall back to raw coords */ }
-    tip.css({ left: Math.round(x + 14), top: Math.round(y + 16) }).text(text).show();
+    // 1.71.10: the tooltip root is zoomed and Chromium multiplies authored
+    // left/top, so the DESIRED CSS position is divided by the zoom factor. The
+    // keep-on-screen clamp below works in real (post-zoom) CSS px.
+    const setAt = (left: number, top: number): void => {
+        tip.css({ left: Math.round(left / ui), top: Math.round(top / ui) }).text(text).show();
+    };
+    setAt(x, y);
     // Keep it fully on-screen (the tooltip is nowrap; measure after show).
     const rect = tip[0].getBoundingClientRect();
     const maxX = (window.innerWidth || document.documentElement.clientWidth) - rect.width - 4;
     const maxY = (window.innerHeight || document.documentElement.clientHeight) - rect.height - 4;
     if (rect.left > maxX || rect.top > maxY) {
-        tip.css({
-            left: Math.max(4, Math.min(maxX, Math.round(x + 14))),
-            top: Math.max(4, Math.min(maxY, Math.round(y + 16))),
-        });
+        setAt(Math.max(4, Math.min(maxX, x)), Math.max(4, Math.min(maxY, y)));
     }
 }
 

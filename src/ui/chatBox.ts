@@ -1,6 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 import { showMpToast } from './toasts';
+import { getMpUiScale } from './uiScale';
 
 /**
  * ROUND 93/94 — MMO-STYLE CHANNEL CHAT (world / party / private).
@@ -760,13 +761,18 @@ function openNameMenu(name: string, anchor: HTMLElement): void {
         document.body.appendChild(menu);
         nameMenu = menu;
         const r = anchor.getBoundingClientRect();
-        const mw = menu.offsetWidth || 180;
-        const mh = menu.offsetHeight || 90;
-        let left = Math.min(r.left, window.innerWidth - mw - 8);
-        let top = r.bottom + 4;
-        if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
-        menu.style.left = Math.max(8, left) + 'px';
-        menu.style.top = top + 'px';
+        // 1.71.10: the menu is zoomed. offsetWidth stays PRE-zoom while
+        // getBoundingClientRect/left/top are POST-zoom in Chromium, so compute the
+        // desired on-screen rect with visual sizes, then store pre-zoom offsets.
+        const ui = getMpUiScale();
+        const mw = (menu.offsetWidth || 180) * ui;
+        const mh = (menu.offsetHeight || 90) * ui;
+        const pad = 8 * ui;
+        let left = Math.min(r.left, window.innerWidth - mw - pad);
+        let top = r.bottom + 4 * ui;
+        if (top + mh > window.innerHeight - pad) top = Math.max(pad, r.top - mh - 4 * ui);
+        menu.style.left = Math.max(pad, left) / ui + 'px';
+        menu.style.top = top / ui + 'px';
 
         // Close on any click outside the menu (capture phase; clicks INSIDE the
         // menu still reach their button because the listener only removes on

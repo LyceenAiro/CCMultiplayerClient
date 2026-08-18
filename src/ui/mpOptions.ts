@@ -66,6 +66,11 @@ interface IMpOptions {
     /** Round 24: show the save-success toast when the server confirms an upload
      * (read live at save time in multiplayer.ts — no latch/rebuild needed). */
     showSaveToast: boolean;
+    /** 1.71.10: scale of the mod's EXTERNAL DOM UIs. 'auto' follows the engine's
+     * on-screen zoom (canvas CSS size / virtual resolution); otherwise a fixed
+     * multiplier (0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 3 / 4). In-canvas name tags
+     * use the same value with 'auto' = 1 (they are already drawn at game zoom). */
+    uiScale: number | 'auto';
 }
 
 const DEFAULTS: IMpOptions = {
@@ -82,9 +87,13 @@ const DEFAULTS: IMpOptions = {
     tagAlpha: 0.5,
     tagSize: 'tiny',
     showSaveToast: true,
+    uiScale: 'auto',
 };
 
 let cached: IMpOptions | null = null;
+
+/** Allowed fixed UI-scale multipliers (plus 'auto'). Mirrored by the tab labels. */
+const UI_SCALE_VALUES: Array<number | 'auto'> = ['auto', 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
 function loadOptions(): IMpOptions {
     if (cached) return cached;
@@ -102,6 +111,7 @@ function loadOptions(): IMpOptions {
         tagAlpha: DEFAULTS.tagAlpha,
         tagSize: DEFAULTS.tagSize,
         showSaveToast: DEFAULTS.showSaveToast,
+        uiScale: DEFAULTS.uiScale,
     };
     try {
         const raw = window.localStorage.getItem(LS_KEY);
@@ -127,6 +137,11 @@ function loadOptions(): IMpOptions {
                 if (typeof parsed.tagSize === 'string' && ['tiny', 'small', 'font'].indexOf(parsed.tagSize) !== -1) out.tagSize = parsed.tagSize;
                 // Round-24 key: absent on older saves -> default (on).
                 if (typeof parsed.showSaveToast === 'boolean') out.showSaveToast = parsed.showSaveToast;
+                // 1.71.10 key: 'auto' or an allowlisted fixed multiplier; anything
+                // else (older saves / hand-edited values) -> default auto.
+                if (parsed.uiScale === 'auto' || UI_SCALE_VALUES.indexOf(parsed.uiScale) !== -1) {
+                    out.uiScale = parsed.uiScale;
+                }
             }
         }
     } catch (_) { /* localStorage unavailable -> defaults */ }
@@ -219,6 +234,9 @@ const TAG_ALPHA_LABELS = ['0%', '25%', '50%', '75%', '100%'];
 /** Tag font choices mapped to real sc.fontsystem fonts (7/13/16px, ascending). */
 const TAG_SIZE_KEYS = ['tiny', 'small', 'font'];
 const TAG_SIZE_LABELS = [t('sizeSmall'), t('sizeMedium'), t('sizeLarge')];
+/** 1.71.10: external-UI scale choices. 'auto' follows the on-screen game zoom;
+ * the fixed tiers are exact multipliers. Same VALUES as UI_SCALE_VALUES above. */
+const UI_SCALE_LABELS = [t('uiScaleAuto'), '50%', '75%', '100%', '125%', '150%', '200%', '300%', '400%'];
 /** Round 21: host enemy-block tick-rate choices (15/30/60 Hz). Display labels are
  * plain ASCII (`30 tick`) — the rate is a number the label names directly. */
 const HOST_TICK_VALUES = [15, 30, 60];
@@ -469,6 +487,13 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     this.list.addButton(rows[r], true); r++;
                     rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optTagSize'), t('optTagSizeDesc'), 'tagSize', TAG_SIZE_LABELS, TAG_SIZE_KEYS, refreshTags);
                     this.list.addButton(rows[r], true); r++;
+                    // 1.71.10: one scale for every mod-owned EXTERNAL UI (panels,
+                    // toasts, chat, tooltips, arrows, story banners). Auto follows
+                    // the game's on-screen zoom; fixed tiers are exact. The CSS
+                    // pump reads the option live every frame, so only the canvas
+                    // name tags need an immediate rebuild here.
+                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optUiScale'), t('optUiScaleDesc'), 'uiScale', UI_SCALE_LABELS, UI_SCALE_VALUES, refreshTags);
+                    this.list.addButton(rows[r], true); r++;
                     this.rows = rows;
                 } catch (e) { console.warn('[multiplayer] failed to build options rows', e); }
                 return;
@@ -503,10 +528,20 @@ function pickTagFont(): any {
     return fs && fs.tinyFont;
 }
 
-function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean }): any {
+/** 1.71.10: fixed UI-scale multiplier for IN-CANVAS overlays (name tags). The
+ * tags are rendered into the game canvas, so 'auto' = 1 — the engine's own zoom
+ * already scales them with the rest of the HUD. Fixed tiers scale the tag hook
+ * (and therefore the text + backing) around its top-left corner. */
+export function getMpUiCanvasScale(): number {
+    const v = getMpOption('uiScale');
+    return typeof v === 'number' ? v : 1;
+}
+
+function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean, scale?: number }): any {
     const font = opts.font || ((sc as any).fontsystem && (sc as any).fontsystem.tinyFont);
     const alpha = (typeof opts.alpha === 'number') ? opts.alpha : 0.55;
     const gold = !!opts.gold;
+    const scale = (typeof opts.scale === 'number' && isFinite(opts.scale) && opts.scale > 0) ? opts.scale : 1;
     // Gold leader tags reuse the engine's own gold color. TextGui/TextBlock take NO
     // color option, but the \c[N] text command picks a font color-set index; the
     // PURPLE set (3) renders #FFE430 on every tag font (verified: the three glyph
@@ -539,6 +574,11 @@ function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean }
     box._mpFontKey = font;
     box._mpAlpha = alpha;
     box._mpGold = gold;
+    box._mpScale = scale;
+    // 1.71.10: scale the whole tag (text + backing) around its top-left. The
+    // logical hook size stays unscaled so setTagLabel re-fitting and the cached
+    // size checks keep working; addTagAt compensates the projection math.
+    try { box.hook.setScale(scale, scale); } catch (_) { /* older engine: render at 100% */ }
     return box;
 }
 
@@ -606,15 +646,15 @@ function setTagLabel(tag: any, label: string): void {
 /** Position + show one name tag above an entity, creating or reusing the cached
  * tag. The tag is recreated when its styling (font/alpha/gold) changed, because
  * the box size derives from the text hook and the backing is baked at creation. */
-function addTagAt(name: string, ent: any, font: any, alpha: number, gold: boolean, label?: string): void {
+function addTagAt(name: string, ent: any, font: any, alpha: number, gold: boolean, scale: number, label?: string): void {
     let tag = tags[name];
-    if (tag && (tag._mpFontKey !== font || tag._mpAlpha !== alpha || tag._mpGold !== gold)) {
+    if (tag && (tag._mpFontKey !== font || tag._mpAlpha !== alpha || tag._mpGold !== gold || tag._mpScale !== scale)) {
         try { tagContainer && tagContainer.removeChildGui(tag); } catch (_) { /* ignore */ }
         delete tags[name];
         tag = null;
     }
     if (!tag) {
-        tag = makeTag(label != null ? label : name, { font, alpha, gold });
+        tag = makeTag(label != null ? label : name, { font, alpha, gold, scale });
         tags[name] = tag;
         tagContainer.addChildGui(tag);
     } else {
@@ -633,7 +673,11 @@ function addTagAt(name: string, ent: any, font: any, alpha: number, gold: boolea
     const cx = coll.pos.x + coll.size.x / 2;
     const cy = coll.pos.y - coll.pos.z - coll.size.z + coll.size.y / 2;
     (ig as any).system.getScreenFromMapPos(scr, Math.round(cx), Math.round(cy));
-    tag.setPos(Math.round(scr.x - tag.hook.size.x / 2), Math.round(scr.y - tag.hook.size.y - 2));
+    // The hook is scaled visually but keeps its logical size, so the projection
+    // uses the VISUAL half-width/height for a centered tag above the head.
+    const vw = tag.hook.size.x * tag._mpScale;
+    const vh = tag.hook.size.y * tag._mpScale;
+    tag.setPos(Math.round(scr.x - vw / 2), Math.round(scr.y - vh - 2));
     try { tag.hook._visible = true; } catch (_) { /* ignore */ }
 }
 
@@ -705,6 +749,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const seen: { [name: string]: boolean } = {};
         const font = pickTagFont();
         const alpha = pickTagAlpha();
+        const tagScale = getMpUiCanvasScale();
         const goldOn = !!getMpOption('leaderGold') && !!(m as any).partyLeader;
         // 1.71.9 (issue 11): while a synced story video plays, player name tags
         // (own included) are hidden like the rest of the HUD — the cutscene owns
@@ -719,7 +764,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
             const ent = (ig as any).game && (ig as any).game.playerEntity;
             if (selfName && ent && ent.coll && !ent._killed && !(ent.params && ent.params.currentHp <= 0)) {
                 seen[selfName] = true;
-                addTagAt(selfName, ent, font, alpha, goldOn && (m as any).partyLeader === selfName, ownTagLabel(m, selfName));
+                addTagAt(selfName, ent, font, alpha, goldOn && (m as any).partyLeader === selfName, tagScale, ownTagLabel(m, selfName));
             }
         }
 
@@ -767,7 +812,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                 // 显示ping值 is on (remoteTagLabel appends ` (Nms)`). The gold
                 // \c[3] leader prefix is applied by makeTag/setTagLabel around the
                 // whole label, so prefix + ping-suffix order stays consistent.
-                addTagAt(name, ent, font, alpha, goldOn && (m as any).partyLeader === name, remoteTagLabel(m, name));
+                addTagAt(name, ent, font, alpha, goldOn && (m as any).partyLeader === name, tagScale, remoteTagLabel(m, name));
                 // Round 19: dim the name tag of a player who is in a cutscene
                 // (their mirror is faded too, so a bright tag would look wrong).
                 // The tag's alpha lever is hook.localAlpha (the same localAlpha the
@@ -808,7 +853,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                         const mdl = party.models && party.models[name];
                         if (mdl && typeof mdl.getCharacterName === 'function') label = mdl.getCharacterName();
                         // Bots are never gold — only player tags are.
-                        addTagAt(name, ent, font, alpha, false, label);
+                        addTagAt(name, ent, font, alpha, false, tagScale, label);
                     } catch (_) { /* one broken entry must not abort the hide pass below */ }
                 }
             }

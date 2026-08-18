@@ -133,6 +133,13 @@ everything goes through `CCMultiplayerServer`.
   names are hidden during synced story videos; buffalo charge footstep loops
   are stopped correctly; sync-start fanfares are louder; off-screen teammate
   arrows and area/world-map teammate avatars were added.
+- **1.71.10 external UI scale** — the Multiplayer options tab gains an
+  **External UI Scale** setting (Auto / 50% / 75% / 100% / 125% / 150% / 200% /
+  300% / 400%). It scales every mod-owned DOM surface — panels, server list,
+  login, chat, toasts, tooltips, story banners, save block and off-screen
+  teammate arrows — in one go. Auto follows the game's on-screen zoom; the
+  fixed tiers are exact multipliers. In-canvas name tags follow the same
+  setting (Auto = native game zoom).
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original

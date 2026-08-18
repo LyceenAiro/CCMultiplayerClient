@@ -1,4 +1,5 @@
 import { Multiplayer } from '../multiplayer';
+import { getMpUiScale } from './uiScale';
 
 /**
  * 1.71.9 (QoL 1): off-screen teammate arrows.
@@ -145,10 +146,27 @@ function tick(): void {
 				el.attr('data-size', Math.round(size));
 				el.html(arrowSvg(Math.round(size)));
 			}
-			const cssX = left0 + px * scaleX - size / 2;
-			const cssY = top0 + py * scaleY - size / 2;
+			// 1.71.10: the arrow root is `zoom: var(--mp-ui-scale)`, and Chromium's
+			// zoom multiplies authored left/top too. Convert the desired CSS center
+			// back into PRE-ZOOM coords (`desired / ui - size/2`) so the visual
+			// center still lands on the canvas-projected teammate position. Also
+			// clamp by the VISUAL half-size so a 300%/400% arrow never slides
+			// half-off the edge.
+			const ui = getMpUiScale();
+			const halfX = scaleX > 0 ? (size * ui / 2) / scaleX : 0;
+			const halfY = scaleY > 0 ? (size * ui / 2) / scaleY : 0;
+			px = Math.max(halfX, Math.min(vw - halfX, px));
+			py = Math.max(halfY, Math.min(vh - halfY, py));
+			const cssX = left0 + px * scaleX;
+			const cssY = top0 + py * scaleY;
 			const deg = Math.round(ang * 180 / Math.PI);
-			el.css({ left: Math.round(cssX), top: Math.round(cssY), width: size, height: size, transform: 'rotate(' + deg + 'deg)' }).show();
+			el.css({
+				left: Math.round(cssX / ui - size / 2),
+				top: Math.round(cssY / ui - size / 2),
+				width: size,
+				height: size,
+				transform: 'rotate(' + deg + 'deg)',
+			}).show();
 			shown[name] = true;
 		}
 		for (const name in els) {

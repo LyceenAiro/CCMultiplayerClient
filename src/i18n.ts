@@ -98,6 +98,10 @@ const enDict: { [key: string]: string } = {
     sizeSmall: 'Small',
     sizeMedium: 'Medium',
     sizeLarge: 'Large',
+    // 1.71.10 — one scale for every mod-owned external DOM UI.
+    optUiScale: 'External UI Scale',
+    optUiScaleDesc: 'Scales the mod\'s panels, chat, toasts, tooltips, story banners and teammate arrows. Auto follows the game\'s on-screen zoom.',
+    uiScaleAuto: 'Auto',
 
     // Reserved keys for other agents (multiplayer.ts / netSync.ts) — defined now so
     // they never need to edit i18n.ts again.
@@ -428,6 +432,10 @@ const zhDict: { [key: string]: string } = {
     sizeSmall: '小',
     sizeMedium: '中',
     sizeLarge: '大',
+    // 1.71.10 —— 统一缩放模组的所有外部DOM界面
+    optUiScale: '外部UI缩放',
+    optUiScaleDesc: '统一缩放模组的面板、聊天、通知、悬浮提示、剧情横幅和队友方向箭头；自动跟随游戏画面缩放',
+    uiScaleAuto: '自动',
 
     // Reserved keys for other agents (multiplayer.ts / netSync.ts) — defined now so
     // they never need to edit i18n.ts again.
