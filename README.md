@@ -103,6 +103,12 @@ everything goes through `CCMultiplayerServer`.
   are host-authoritative: members apply the host's positions but never echo their
   own half-finished transition back, so the Temple Chamber 1 pillars sink/rise to
   their final height instead of oscillating at ~80%.
+- **Dungeon box echo isolation & one-time switch latch (1.71.5)** — unowned
+  push/pull boxes are also host-authoritative (gripping members stay owners), a
+  box is snapped back to its real ground before a grip, and permanent
+  `OneTimeSwitch`es (the Temple Chamber 1 attack switch) stay ON once any peer
+  reports them on — a late joiner's stale "not triggered" state can no longer
+  revert the party's solved mechanism or leave an unattackable switch behind.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original

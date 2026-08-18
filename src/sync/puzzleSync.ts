@@ -4,6 +4,9 @@ import { Multiplayer } from '../multiplayer';
  * 1.71.0 — dungeon interaction-mechanism sync.
  * 1.71.2 — box push/pull ownership + interpolation.
  * 1.71.3 — PushPullDest progress is personal save state.
+ * 1.71.4 — platform positions are host-authoritative (no member echoes).
+ * 1.71.5 — unowned boxes are host-authoritative; permanent OneTimeSwitch
+ *          state is monotonic (once triggered, never reverted by a peer).
  *
  * CrossCode dungeon puzzles are mostly var-driven, but each client owns its own
  * ig.vars, so the ENGINE never shares puzzle state across machines. This module
@@ -19,8 +22,9 @@ import { Multiplayer } from '../multiplayer';
  * timestamp), every other client drops its own stale box packets while that
  * owner is alive, and the local map-interact entry is disabled for everyone
  * else. Remote positions are lerped per-frame so 10Hz snapshots glide instead
- * of stuttering. The instance host still sends a 1Hz full snapshot for late
- * joiners / silent drift, but skips boxes that are currently owned remotely.
+ * of stuttering. When nobody is gripping, only the map-instance host publishes
+ * box positions (mechanism-raised boxes therefore can't be dragged back into
+ * their pit by a peer's stale echo); the gripping member stays owner-authority.
  *
  * 1.71.3: "box already pushed onto the switch / plate half-lowered" is saved
  * per player (vanilla var `map.entity<destMapId>_placed`). Cross-syncing it
@@ -177,6 +181,14 @@ class PuzzleSync implements IPuzzleSync {
 				if (this.ownedLast.has(mi)) this.ownedLast.delete(mi);
 				continue;
 			}
+			// 1.71.4 (raised-box pit echo): mechanism-driven boxes are exactly like
+			// the platforms under them — only the HOST may publish their position
+			// while nobody is gripping them. A member echoing its still-in-the-pit
+			// copy kept pulling the raised box back down, and the next grip aligned
+			// the player to that underground z (the "grabbed it and teleported below
+			// the floor" report). The gripping member stays the owner-authority, and
+			// its one-shot own='' release still ships when it lets go.
+			if (push && !m.host && !this.isLocalGripping(e) && !this.ownedLast.has(mi)) continue;
 			const entry = this.encode(e);
 			let force = false;
 			if (push) {
@@ -421,6 +433,23 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.71.5 safety net: a network-written box z can lag below its own baseZPos
+	 * (e.g. the Temple Chamber 1 box echoed from the pit while the platform under
+	 * it had already risen). Vanilla PushPullable aligns the PLAYER to the box's
+	 * raw coll.pos.z on grip, so a stale pit z teleports the player underground.
+	 * Before any local grip, snap a sunken box back up to its real ground. */
+	private reconcileBoxGround(e: any): void {
+		try {
+			const c = e && e.coll;
+			if (!c) return;
+			const z = c.pos.z;
+			const b = typeof c.baseZPos === 'number' ? c.baseZPos : z;
+			if (typeof z === 'number' && typeof b === 'number' && z < b - 8) {
+				c.setPos(c.pos.x, c.pos.y, b);
+			}
+		} catch (_) { /* ignore */ }
+	}
+
 	private restoreRemoteState(e: any): void {
 		if (!e || e._killed) return;
 		if (!e._mpPuzzleRemote) return;
@@ -504,14 +533,41 @@ class PuzzleSync implements IPuzzleSync {
 		if (typeof s.on === 'number' && typeof e.isOn === 'boolean') {
 			try {
 				const want = s.on === 1;
-				if (e.isOn !== want) e.isOn = want;
-				// Keep the entity's backing var coherent too (linked platforms /
-				// blockers on this client re-evaluate via varsChanged).
-				if (typeof e.variable === 'string' && e.variable) {
-					try { (ig as any).vars.set(e.variable, want); } catch (_) { /* ignore */ }
-				}
-				if (!s.anim && typeof e.setCurrentAnim === 'function') {
-					try { e.setCurrentAnim(want ? 'on' : 'off', true, null, true); } catch (_) { /* ignore */ }
+				// 1.71.5: permanent OneTimeSwitch (the Temple Chamber 1 attack
+				// switch) is monotonic across clients. One player entering with
+				// `map.extraPullable` already true and another with it false used to
+				// ping-pong on/off and settle untriggered — while the synced switch
+				// kept its activated zero-height coll, so the player could no longer
+				// physically hit it. Once ANY peer reports it on, keep it on.
+				const OT: any = (ig.ENTITY as any).OneTimeSwitch;
+				if (OT && e instanceof OT) {
+					const permanent = !e.activeTime;
+					if (permanent && !want) return; // stale off must never revert a solved switch
+					const changed = e.isOn !== want;
+					if (changed) e.isOn = want;
+					try {
+						// Always repair the height: the pre-1.71.5 sync could leave a
+						// triggered switch at activated height while isOn was flipped
+						// back off by a peer, making it physically unattackable.
+						if (want) e.coll.size.z = (e.data && typeof e.data.activeZHeight === 'number') ? e.data.activeZHeight : 0;
+						else if (typeof e.fullZHeight === 'number') e.coll.size.z = e.fullZHeight;
+					} catch (_) { /* ignore */ }
+					if (changed && typeof e.variable === 'string' && e.variable) {
+						try { (ig as any).vars.set(e.variable, want); } catch (_) { /* ignore */ }
+					}
+					if (changed && !s.anim && typeof e.setCurrentAnim === 'function') {
+						try { e.setCurrentAnim(want ? 'on' : (typeof e.getOffAnim === 'function' ? e.getOffAnim() : 'off'), true, null, true); } catch (_) { /* ignore */ }
+					}
+				} else {
+					if (e.isOn !== want) e.isOn = want;
+					// Keep the entity's backing var coherent too (linked platforms /
+					// blockers on this client re-evaluate via varsChanged).
+					if (typeof e.variable === 'string' && e.variable) {
+						try { (ig as any).vars.set(e.variable, want); } catch (_) { /* ignore */ }
+					}
+					if (!s.anim && typeof e.setCurrentAnim === 'function') {
+						try { e.setCurrentAnim(want ? 'on' : 'off', true, null, true); } catch (_) { /* ignore */ }
+					}
 				}
 			} catch (_) { /* ignore */ }
 		}
@@ -605,6 +661,7 @@ class PuzzleSync implements IPuzzleSync {
 				try {
 					if (self.isRemoteOwned(this.entity)) return;
 					self.dropInterp(this.entity);
+					self.reconcileBoxGround(this.entity);
 					if (this.entity && typeof this.entity._mpPuzzleGripAt !== 'number') {
 						this.entity._mpPuzzleGripAt = Date.now();
 					}
