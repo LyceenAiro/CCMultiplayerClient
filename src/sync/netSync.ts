@@ -79,6 +79,11 @@ interface IEnemySnap {
 	                  // Preserved across host handoff so respawned enemies stay in the
 	                  // same state instead of waking into IDLE/combat.
 	tos?: number;     // 1.71.0: targetOnSpawn flag (1/0). Preserved across host handoff.
+	ats?: string;     // 1.71.2: serialized enemyInfo.attribs from the HOST's real spawn
+	                  // settings (e.g. mine-runbot `activeIf`). Puppets without a mapId
+	                  // are re-created from bare {type} on the member, so their local
+	                  // VarCondition attributes would default to `true` and wake the
+	                  // sleeping bots on handoff — the host-shipped values fix that.
 	sh?: IShieldSnap[]; // ROUND 66: the host enemy's ACTIVE shields (ADD_SHIELD state
 	                  // guards like the hedgehog's roll-up "full" shield). The member's
 	                  // puppet runs no AI, so these state-driven shields never attach
@@ -6143,6 +6148,9 @@ export class NetSync {
 			// 1.71.0: preserve AI state + targetOnSpawn across host handoff.
 			ss: typeof e.currentState === 'string' ? e.currentState : '',
 			tos: e.targetOnSpawn ? 1 : 0,
+			// 1.71.2: ship the ORIGINAL enemyInfo.attribs so a handoff respawn can
+			// reconstruct them even for mapId-less EnemySpawner bots (Temple Mine).
+			ats: this.encodeEnemyAttribs(e),
 			// ROUND 66: active shields (poise/state guards) — the puppet's native
 			// isShielded needs them to reduce the member's damage exactly like the host.
 			sh: this.encodeEnemyShields(e),
@@ -6455,6 +6463,8 @@ export class NetSync {
 		// 1.71.0: AI state / targetOnSpawn must survive handoff.
 		if ((a.ss || '') !== (b.ss || '')) return true;
 		if ((a.tos || 0) !== (b.tos || 0)) return true;
+		// 1.71.2: original enemyInfo.attribs must survive handoff too.
+		if ((a.ats || '') !== (b.ats || '')) return true;
 		// ROUND 66: a shield attach/detach mid-windup (hedgehog roll-up) changes the
 		// damage the member's hit should deal — ship it immediately.
 		const ash = a.sh, bsh = b.sh;
@@ -9115,9 +9125,17 @@ export class NetSync {
 			if (isFull) {
 				const psvNow = (s.psv || 0) === 1;
 				// 1.71.0: remember the host's AI state + targetOnSpawn for handoff.
+				// 1.71.2: also remember the host's ORIGINAL enemyInfo.attribs — puppets
+				// without a mapId were spawned from bare {type}, so their live VarCondition
+				// attributes already defaulted to `true` (that is exactly what wakes the
+				// Temple Mine elevator bots after a handoff).
 				try {
 					if (typeof s.ss === 'string') (e as any)._mpEnemyState = s.ss;
 					(e as any)._mpTargetOnSpawn = (s.tos || 0) === 1;
+					if (typeof s.ats === 'string' && s.ats) {
+						const parsed = JSON.parse(s.ats);
+						if (parsed && typeof parsed === 'object') (e as any)._mpEnemyAttribs = parsed;
+					}
 				} catch (_) { /* ignore */ }
 				if (e._mpPassiveSynced !== psvNow) {
 					e._mpPassiveSynced = psvNow;
@@ -9623,8 +9641,18 @@ export class NetSync {
 				type.load(() => { delete this.pendingTypes[s.t]; });
 				return null;
 			}
+			const enemyInfo: any = { type: s.t };
+			// 1.71.2: the host now ships the ORIGINAL enemyInfo.attribs; spawn the
+			// puppet with them so mapId-less EnemySpawner bots (Temple Mine elevator
+			// runbots) keep their `activeIf` condition from the very first frame.
+			if (typeof s.ats === 'string' && s.ats) {
+				try {
+					const parsed = JSON.parse(s.ats);
+					if (parsed && typeof parsed === 'object') enemyInfo.attribs = parsed;
+				} catch (_) { /* spawn with bare type below */ }
+			}
 			const e = ig.game.spawnEntity('Enemy', s.x, s.y, s.z, {
-				enemyInfo: { type: s.t },
+				enemyInfo,
 				skipHook: true,
 			} as any);
 			return e || null;
@@ -9660,6 +9688,65 @@ export class NetSync {
 	/** The uid we track this entity by: the host's uid once adopted, else 0. */
 	private uidOf(e: any): number {
 		return e._mpUid || 0;
+	}
+
+	/** Reconstruct the spawn enemyInfo needed by a handoff respawn from a puppet
+	 * entity. Puppets created from a snapshot only carry {type}, so enemyInfo
+	 * attribs (e.g. mine-runbot `activeIf`) are lost; without them the engine's
+	 * initEntity turns a VarCondition attribute into `true`, which wakes the
+	 * sleeping bots in the Temple Mine elevator right after the handoff. Read
+	 * the live values back from the puppet's own attributes instead. */
+	private reconstructEnemyInfo(e: any): any {
+		const info: any = { type: e.enemyName || (e.enemyType && (e.enemyType as any).name) || '' };
+		if (typeof e.enemyGroup === 'string') info.group = e.enemyGroup;
+		if (typeof e.currentState === 'string' && e.currentState) info.state = e.currentState;
+		info.targetOnSpawn = !!e.targetOnSpawn;
+		if (typeof e.dropHealOrb === 'number') info.dropHealOrb = e.dropHealOrb;
+		if (typeof e.defeatVarIncrease === 'string' && e.defeatVarIncrease) info.varIncrease = e.defeatVarIncrease;
+		try {
+			const attribs = (e as any)._mpEnemyAttribs && Object.keys((e as any)._mpEnemyAttribs).length
+				? (e as any)._mpEnemyAttribs
+				: this.serializeEnemyAttribs(e);
+			if (attribs && Object.keys(attribs).length) info.attribs = attribs;
+		} catch (_) { /* a missing attrib set is safer than the all-true default */ }
+		return info;
+	}
+
+	/** Serialize an enemy's live attribute values back to the raw enemyInfo.attribs
+	 * shape (VarCondition attributes keep their original condition STRING — a
+	 * missing one would evaluate as `true` on the next spawn). */
+	private serializeEnemyAttribs(e: any): any {
+		const typeAttribs: any = (e.enemyType && e.enemyType.attribs) || {};
+		const attribs: any = {};
+		for (const key in typeAttribs) {
+			const def = typeAttribs[key];
+			const value = e.attributes ? e.attributes[key] : undefined;
+			if (def && def._type === 'VarCondition') {
+				let code = '';
+				if (value && typeof value === 'object') code = String(value.pretty || value.code || '');
+				else if (typeof value === 'string') code = value;
+				attribs[key] = code && code.trim() ? code.trim() : 'true';
+			} else if (value !== undefined && !(value instanceof ig.Class)) {
+				if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+					attribs[key] = value;
+				} else {
+					try {
+						const plain = JSON.parse(JSON.stringify(value));
+						if (plain !== undefined) attribs[key] = plain;
+					} catch (_) { /* skip non-serializable attribute */ }
+				}
+			}
+		}
+		return attribs;
+	}
+
+	/** Compact host-side attribute payload for the entityState block (1.71.2). */
+	private encodeEnemyAttribs(e: any): string | undefined {
+		try {
+			const attribs = this.serializeEnemyAttribs(e);
+			if (!attribs || !Object.keys(attribs).length) return undefined;
+			return JSON.stringify(attribs);
+		} catch (_) { return undefined; }
 	}
 
 	/**
@@ -9741,7 +9828,7 @@ export class NetSync {
 				// "all monsters vanished" after host migration). e.settings (when present)
 				// deep-merges over it and may replace type with its own full info object.
 				const baseSettings = ig.merge(
-					{ skipHook: true, mapId, enemyInfo: { type } },
+					{ skipHook: true, mapId, enemyInfo: this.reconstructEnemyInfo(e) },
 					e.settings || {});
 				// 1.71.0: keep the enemy ASLEEP/passive across the handoff. The
 				// member-side puppet never carried the original settings, so without

@@ -91,8 +91,17 @@ everything goes through `CCMultiplayerServer`.
 - **Dungeon mechanism sync (1.71.0)** — push/pull boxes, sliding blocks,
   floating platforms, switches, ice pillars and other puzzle entities sync
   inside dungeons via a compact `puzzleState` relay + host snapshots.
+- **Dungeon box authority & smoothing (1.71.2)** — only one player can grip a
+  push/pull box; the gripping client is the sole position authority, other
+  players' boxes follow with per-frame interpolation, and push/pull destination
+  plates (the "box sinks down and becomes a step" plates) lower in sync so the
+  box never vanishes.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
+- **Host handoff keeps enemy spawn settings (1.71.2)** — the original
+  `enemyInfo` attributes (`activeIf`, etc.) are shipped with the enemy block and
+  restored on respawn, so the Temple Mine elevator bots stay asleep before the
+  story unlock instead of waking instantly.
 - **Story-leader action relay (1.71.0)** — external animations (sitting down,
   poses) the story leader performs are replayed on every member's leader
   mirror.
@@ -297,7 +306,7 @@ Then, per map membership:
 | `registerEntity` / `killEntity` | both | `{id,type,pos,settings}` / `{id}` | host-authoritative entities |
 | `updateEntityPosition` / `…Animation` / `…State` / `…Target` / `…Health` | both | `{id, …}` | mirror entity state |
 | `throwBall` | both | `{ballInfo, combatant, dir, party}` | projectiles |
-| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle entity snapshots |
+| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle snapshots; 1.71.2 adds `own`/`ot` box-grip ownership + `pl`/`dl` plate state |
 | `saveMirrorRestore` | C→S | `{index}` | 1.71.0 restore one of the five save mirrors |
 | `setHost` | S→C | `isHost` | host migration |
 

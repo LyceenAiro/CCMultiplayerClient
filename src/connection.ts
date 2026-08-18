@@ -172,8 +172,10 @@ export interface IConnection {
     plantBreak(data: { map: string, mapId: number }): void;
     /** 1.71.0 (dungeon puzzles): any client -> its instance — compact state of
      * dungeon puzzle entities (boxes/platforms/switches/ice pillars) that changed
-     * locally. The server relays it to the other same-instance members. */
-    puzzleState(map: string, entries: Array<{ mi: number, p?: [number, number, number], on?: number, hits?: number, st?: number, anim?: string, ph?: number, act?: number, mv?: number, hd?: number, gone?: number }>): void;
+     * locally. The server relays it to the other same-instance members.
+     * 1.71.2: `own`/`ot` carry push/pull box grip ownership, `pl`/`dl` carry the
+     * PushPullDest plate state. */
+    puzzleState(map: string, entries: Array<{ mi: number, p?: [number, number, number], on?: number, hits?: number, st?: number, anim?: string, ph?: number, act?: number, mv?: number, hd?: number, gone?: number, own?: string, ot?: number, pl?: number, dl?: number }>): void;
     /** 1.71.0: a same-instance client relayed dungeon puzzle state — apply it to
      * our matching local entities by mapId. */
     onPuzzleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
