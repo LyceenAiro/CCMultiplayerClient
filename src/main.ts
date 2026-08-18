@@ -4,6 +4,8 @@ import { installQuickMenuEnhancements } from './ui/quickMenuInject';
 import { installMpOptionsTab, startNameTagLoop, startNetHudLoop } from './ui/mpOptions';
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
+import { installTeammateIndicators } from './ui/teammateIndicators';
+import { installMapTeamAvatars } from './ui/mapTeamAvatars';
 import { installChatBox } from './ui/chatBox';
 import { installItemUseIndicators } from './ui/itemUseIndicator';
 import { installHealSync } from './ui/healSync';
@@ -85,6 +87,12 @@ async function startMultiplayer(): Promise<void> {
 		// Round 23 wave 5: network-quality diamond badges on the party-HUD portraits
 		// and the element-mode indicator, with hover tooltips (ping/loss, name+level).
 		installNetBadge(() => multiplayer);
+
+		// 1.71.9 (QoL 1): off-screen party-member arrow indicators.
+		installTeammateIndicators(() => multiplayer);
+
+		// 1.71.9 (QoL 2): party-member avatars on the area/world maps.
+		installMapTeamAvatars(() => multiplayer);
 
 		// ROUND 79 (feature): "MP v{version}" line under the version/CCLoader text on
 		// the title screen and the pause screen.

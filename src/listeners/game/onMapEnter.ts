@@ -1,4 +1,5 @@
 import { Multiplayer } from '../../multiplayer';
+import { SHARED_TOWNS } from '../../util/areaUtil';
 
 export class OnMapEnterListener {
 	constructor(
@@ -47,6 +48,24 @@ export class OnMapEnterListener {
 		// world of its enemies.
 		const connected = !!(this.main.connection && this.main.connection.isOpen
 			&& this.main.connection.isOpen());
+		// 1.71.9 (issue 2): shared-town maps (shops included) must never keep a stale
+		// combat-mode latch from the previous block. NPC interact entries are
+		// `blockedDuringCombat`, so a lingering combatMode=true makes the shop
+		// counter appear but refuse to open — exactly the intermittent shop bug.
+		try {
+			const area = data && data.attributes && (data.attributes.area || '');
+			if (connected && area && SHARED_TOWNS.indexOf(area) !== -1) {
+				const mdl: any = (sc as any).model;
+				if (mdl && typeof mdl.setCombatMode === 'function') mdl.setCombatMode(false);
+				const combat: any = (sc as any).combat;
+				if (combat && typeof combat.forceEnd === 'function') {
+					try { combat.forceEnd(); } catch (_) { /* ignore */ }
+				}
+				if (this.main.netSync && typeof this.main.netSync.purgeStaleCombatants === 'function') {
+					this.main.netSync.purgeStaleCombatants();
+				}
+			}
+		} catch (_) { /* never block a map load */ }
 		// mpForceStripNextLoad: a party regroup into a never-visited area is allowed
 		// (round 6); if we end up HOST of that instance (leader left meanwhile) the
 		// quest-gated spawns are local and can wedge the loader — strip for this one

@@ -706,9 +706,15 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const font = pickTagFont();
         const alpha = pickTagAlpha();
         const goldOn = !!getMpOption('leaderGold') && !!(m as any).partyLeader;
+        // 1.71.9 (issue 11): while a synced story video plays, player name tags
+        // (own included) are hidden like the rest of the HUD — the cutscene owns
+        // the screen and must not show names above the actors.
+        const storyHideNames = !!(m.storySync
+            && typeof m.storySync.storyEventActive === 'function'
+            && m.storySync.storyEventActive());
 
         // Own player tag (account name above the local player entity).
-        if (getMpOption('showOwnName')) {
+        if (getMpOption('showOwnName') && !storyHideNames) {
             const selfName = (m as any).name;
             const ent = (ig as any).game && (ig as any).game.playerEntity;
             if (selfName && ent && ent.coll && !ent._killed && !(ent.params && ent.params.currentHp <= 0)) {
@@ -740,6 +746,11 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                 if (!knownHere && onMap && !onMap[name] && ((m as any).playersRosterReady || Object.keys(onMap).length > 0)) continue;
                 const pl = players[name];
                 const ent = pl && pl.entity;
+                // 1.71.9 (issue 11): hide teammate names during a synced story video.
+                if (storyHideNames) {
+                    try { dropNameTag(name); } catch (_) { /* ignore */ }
+                    continue;
+                }
                 // ROUND 107: while the LOCAL player is in a story cutscene, other
                 // players have no collision and their name tags are hidden entirely.
                 const nsNow: any = (m as any).netSync;
@@ -777,7 +788,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         // Follower bots (native + mod). Keyed by their sc.party.partyEntities name;
         // the label resolves through the party model's getCharacterName override
         // (mod bots return the account name, native bots their character name).
-        if (getMpOption('showBotNames')) {
+        if (getMpOption('showBotNames') && !storyHideNames) {
             const party: any = (sc as any).party;
             const ents = party && party.partyEntities;
             if (ents) {

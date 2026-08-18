@@ -60,6 +60,9 @@ const enDict: { [key: string]: string } = {
     netPingLabel: 'Ping',
     netLossLabel: 'Loss',
     memberLevel: 'Lv.',
+    // 1.71.9 (issue 5): member badges show the RELATIVE link latency.
+    netRelPingLabel: 'Relative Ping',
+    netPingParts: 'you→server {a} ms · them→server {b} ms',
     // Round 27 (item 2): off-map teammate badge/portrait tooltip.
     notInSameRoom: 'Not in the same room',
 
@@ -334,6 +337,9 @@ const enDict: { [key: string]: string } = {
     storySyncCommSub: 'Quest: {quest}',
     storySyncPartyLight: 'LIGHT PARTY',
     storySyncPartyFull: 'FULL PARTY',
+    // 1.71.9 (issue 9): name prefix of the temporary quest entry shown to players
+    // who already solved the synced quest.
+    storySyncVirtualPrefix: '[Sync] ',
     storySyncStarTip: 'Story sync in progress',
 };
 
@@ -384,6 +390,9 @@ const zhDict: { [key: string]: string } = {
     netPingLabel: '延迟',
     netLossLabel: '丢包',
     memberLevel: '等级',
+    // 1.71.9 (issue 5): member badges show the RELATIVE link latency.
+    netRelPingLabel: '相对延迟',
+    netPingParts: '你→服务器 {a} ms · 对方→服务器 {b} ms',
     // Round 27 (item 2): off-map teammate badge/portrait tooltip.
     notInSameRoom: '不在同一房间',
 
@@ -657,6 +666,9 @@ const zhDict: { [key: string]: string } = {
     storySyncCommSub: '任务：{quest}',
     storySyncPartyLight: '轻锐小队',
     storySyncPartyFull: '满编小队',
+    // 1.71.9 (issue 9): name prefix of the temporary quest entry shown to players
+    // who already solved the synced quest.
+    storySyncVirtualPrefix: '【同步】',
     storySyncStarTip: '任务同步中',
 };
 

@@ -353,7 +353,7 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 		// ---- sub-modals ----
 		const openModal = (
 			title: string,
-			fields: { label: string; ph: string; value?: string; type?: string }[],
+			fields: { label: string; ph: string; value?: string; type?: string; inputmode?: string }[],
 			submit: (values: string[], hint: JQuery) => boolean,
 		): void => {
 			const modal = $('<div class="mpServerModal"></div>');
@@ -364,6 +364,7 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 			for (const f of fields) {
 				const label = $('<label class="mpServerField"></label>').text(f.label);
 				const input = $('<input class="mpServerInput" />').attr('type', f.type || 'text').attr('placeholder', f.ph);
+				if (f.inputmode) input.attr('inputmode', f.inputmode);
 				if (f.value !== undefined) input.val(f.value);
 				label.append(input);
 				form.append(label);
@@ -448,7 +449,11 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 			openModal(t('serverAdd'), [
 				{ label: t('serverNameLabel'), ph: t('serverNamePh') },
 				{ label: t('serverHostLabel'), ph: t('serverHostPh') },
-				{ label: t('serverPortLabel'), ph: String(DEFAULT_PORT), value: String(DEFAULT_PORT), type: 'number' },
+				// 1.71.9 (issue 1): NOT type=number — in the NW.js game shell a number
+				// input only reacts to its up/down spinners and swallows typed digits.
+				// A plain text field with numeric inputmode accepts the keyboard and
+				// is still validated against /^\d+$/ below.
+				{ label: t('serverPortLabel'), ph: String(DEFAULT_PORT), value: String(DEFAULT_PORT), type: 'text', inputmode: 'numeric' },
 			], (values, hint) => {
 				const name = values[0];
 				const host = parseHost(values[1]);
@@ -456,7 +461,12 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 					hint.text(t('serverRequiredHost'));
 					return false;
 				}
-				const port = parseInt(values[2], 10);
+				const rawPort = values[2];
+				if (!/^\d{1,5}$/.test(rawPort)) {
+					hint.text(t('serverInvalidPort'));
+					return false;
+				}
+				const port = parseInt(rawPort, 10);
 				if (!(port >= 1 && port <= 65535)) {
 					hint.text(t('serverInvalidPort'));
 					return false;

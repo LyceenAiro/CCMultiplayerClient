@@ -953,6 +953,11 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('enemySound', s);
 	}
 
+	// 1.71.9 (issue 7): host-only STOP_SOUNDS relay for looped enemy sounds.
+	public enemySoundStop(uid: number): void {
+		this.syncEmit('enemySoundStop', { uid });
+	}
+
 	// ROUND 34 (item 3): any client -> its instance — the local player's own attack sound
 	// (melee swing / ball throw); every other same-instance client replays it on the mirror.
 	public emitPlayerSound(s: { path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }): void {
@@ -1209,6 +1214,14 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('enemySound', (data: any) => {
 			if (data && typeof data.uid === 'number' && typeof data.path === 'string') {
 				callback(data);
+			}
+		});
+	}
+	/** 1.71.9 (issue 7): host relayed STOP_SOUNDS for an enemy uid. */
+	public onEnemySoundStop(callback: (uid: number) => void): void {
+		this.socket.on('enemySoundStop', (data: any) => {
+			if (data && typeof data.uid === 'number' && Number.isInteger(data.uid) && data.uid > 0) {
+				callback(data.uid);
 			}
 		});
 	}

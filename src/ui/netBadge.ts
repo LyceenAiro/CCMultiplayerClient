@@ -35,6 +35,15 @@ const TIER_COLORS: Record<NetTier, string> = {
  * (instead of a live tier color) and its hover tooltip says 不在同一房间. */
 const OFFMAP_COLOR = '#8a8a92';
 
+/** Same thresholds as SocketIOConnector.computeNetTier (loss dominates, then
+ * latency). Used locally so member badges can tier a RELATIVE ping. */
+function tierFor(ping: number, lossPct: number): NetTier {
+    if (lossPct > 50 || ping > 300) return 'red';
+    if (lossPct > 20 || ping > 150) return 'orange';
+    if (lossPct > 5 || ping > 75) return 'yellow';
+    return 'green';
+}
+
 /** Subtle dark outline behind the diamond so it reads on any portrait. */
 const BADGE_OUTLINE = '#16161f';
 
@@ -74,6 +83,12 @@ interface HoverTarget {
     level?: number;
     /** Round 27 (item 2): this member is off our map — grey diamond + tooltip. */
     offMap?: boolean;
+    /** 1.71.9 (issue 5): member badge quality = RELATIVE link latency
+     * (my RTT/2 to the server + the member's RTT/2 to the server). */
+    relPing?: number;
+    myPing?: number;
+    peerPing?: number;
+    lossPct?: number;
 }
 let hoverTargets: HoverTarget[] = [];
 
@@ -176,6 +191,39 @@ function collectMemberHud(gui: any, renderer: any): void {
     // iterates last-pushed first, so the badge (drawn on top) wins overlaps.
     const model: any = gui.model;
     const offMap = memberOffMap(model);
+    const name: string = model ? String(model._mpName || model.name || '') : '';
+    // 1.71.9 (issue 5): member diamonds describe the RELATIVE link between us and
+    // that member, not just our own route to the server. The member's route is
+    // `main.remotePings[name]` (their own server RTT, ~1/s); the relative RTT is
+    // the sum of both half-trips.
+    let relPing: number | undefined;
+    let myPing: number | undefined;
+    let peerPing: number | undefined;
+    let lossPct: number | undefined;
+    let tier: NetTier | null = null;
+    if (!offMap && name) {
+        try {
+            const m = mpGetMain && mpGetMain();
+            const q = m && m.connection && typeof m.connection.getNetQuality === 'function'
+                ? m.connection.getNetQuality() : null;
+            const local = q && q.known ? q : null;
+            const peer = m && m.remotePings && typeof m.remotePings[name] === 'number' ? m.remotePings[name] : -1;
+            if (local) {
+                myPing = local.ping >= 0 ? Math.round(local.ping) : undefined;
+                lossPct = local.lossPct || 0;
+                if (peer >= 0) {
+                    peerPing = Math.round(peer);
+                    relPing = Math.round((Number(myPing) + Number(peerPing)) / 2);
+                } else {
+                    relPing = myPing; // peer probe unknown -> fall back to our route
+                }
+                tier = tierFor(relPing != null ? relPing : 0, lossPct);
+            }
+        } catch (_) { /* fall back to the shared local quality below */ }
+    }
+    const q = mpQuality;
+    const tierColor = offMap ? OFFMAP_COLOR : (tier ? TIER_COLORS[tier] : (q ? TIER_COLORS[q.tier] : OFFMAP_COLOR));
+    const hasBadge = !!q || offMap;
     // ROUND 30 (item 5): hide an off-map member's HP/SP/EXP bars by zeroing the
     // child guis' hook localAlpha. The engine's draw gate is `x.localAlpha > 0`
     // on EACH hook (updateDrawables is skipped entirely at 0), and localAlpha
@@ -198,18 +246,17 @@ function collectMemberHud(gui: any, renderer: any): void {
     } catch (_) { /* a bar-hide failure must never break the HUD draw */ }
     hoverTargets.push({
         x: sc.x, y: sc.y, w: sc.w, h: sc.h, kind: 'portrait',
-        name: model ? (model._mpName || model.name) : undefined,
+        name: name || undefined,
         level: model && typeof model.level === 'number' ? model.level : undefined,
         offMap,
     });
-    const q = mpQuality;
-    if (q || offMap) {
-        drawDiamond(renderer, BADGE_OFF_MEMBER, BADGE_OFF_MEMBER, BADGE_HALF_MEMBER,
-            offMap ? OFFMAP_COLOR : TIER_COLORS[q!.tier]);
+    if (hasBadge) {
+        drawDiamond(renderer, BADGE_OFF_MEMBER, BADGE_OFF_MEMBER, BADGE_HALF_MEMBER, tierColor);
         const pad = BADGE_HALF_MEMBER + BADGE_HOVER_PAD;
         hoverTargets.push({
             x: sc.x + BADGE_OFF_MEMBER - pad, y: sc.y + BADGE_OFF_MEMBER - pad,
             w: pad * 2, h: pad * 2, kind: 'badge', offMap,
+            name: name || undefined, relPing, myPing, peerPing, lossPct,
         });
     }
 }
@@ -361,6 +408,16 @@ function pumpNetBadges(): void {
         // level — the user asked for that to never change to the room warning.
         if (hit.offMap) {
             text = t('notInSameRoom');
+        } else if (hit.name && typeof hit.relPing === 'number') {
+            // 1.71.9 (issue 5): a MEMBER badge reports the relative link quality
+            // between our client and that member, with both server hops spelled out.
+            const rel = Math.round(hit.relPing);
+            const parts = t('netPingParts')
+                .replace('{a}', hit.myPing != null ? String(Math.round(hit.myPing)) : '—')
+                .replace('{b}', hit.peerPing != null ? String(Math.round(hit.peerPing)) : '—');
+            text = t('netRelPingLabel') + ': ' + rel + 'ms  '
+                + parts + '  '
+                + t('netLossLabel') + ': ' + (hit.lossPct != null ? hit.lossPct : 0) + '%';
         } else {
             const q = mpQuality;
             // 100% loss -> no answered probe -> ping unknown; show a dash instead of -1.

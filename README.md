@@ -122,6 +122,17 @@ everything goes through `CCMultiplayerServer`.
   engine gravity resumes immediately, so Temple Chamber 1's upper-left box can
   be pushed off its ledge and actually falls to the lower floor instead of
   being pulled back up to the ledge.
+- **1.71.9 fixes & QoL** — keyboard-typable port field; shared-town shop
+  counters clear stale combat state and retry when a quest-solved dialog is
+  stacked; remote skill charges darken the screen with one non-stacking effect
+  tied to the party charge time-stop; light/full-party banners always render
+  text; member network badges show the RELATIVE latency between you and that
+  player; side-quest sync no longer rolls back or removes progress on end
+  (already-solved players get a temporary "[Sync]" quest entry, no rewards);
+  main-story sync clamps ahead-teammates to the leader's plot every frame;
+  names are hidden during synced story videos; buffalo charge footstep loops
+  are stopped correctly; sync-start fanfares are louder; off-screen teammate
+  arrows and area/world-map teammate avatars were added.
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original

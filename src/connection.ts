@@ -160,6 +160,10 @@ export interface IConnection {
      * replays it locally positioned on their same-uid puppet. `global` = a non-positional
      * sound; `radius` = the 3D falloff radius. Server relays via broadcastHostState. */
     emitEnemySound(s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }): void;
+    /** 1.71.9 (issue 7): host -> instance — an enemy's looped sound was stopped by
+     * the engine's STOP_SOUNDS action step (e.g. buffalo-run.ogg after the charge).
+     * Members stop every live loop handle for that uid. Host-only relay. */
+    enemySoundStop(uid: number): void;
     /** ROUND 34 (item 3): any client -> its instance — the LOCAL player's own attack
      * sound (melee swing / ball throw) fired on an Effect entity. The enemySound relay is
      * host-only + Enemy-gated, so it never carries player attack sounds; this fills the
@@ -387,6 +391,9 @@ export interface IConnection {
     /** Round 33 (item 2b): the host relayed an enemy sound (see emitEnemySound). Replay
      * it locally positioned on the same-uid puppet (or globally when `global`). */
     onEnemySound(callback: (s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }) => void): void;
+    /** 1.71.9: the host's engine stopped a looped enemy sound (STOP_SOUNDS) — stop
+     * our live loop handles for that enemy uid. */
+    onEnemySoundStop(callback: (uid: number) => void): void;
     /** ROUND 34 (item 3): a same-instance player's attack sound (see emitPlayerSound).
      * Replay it locally positioned on that player's mirror. */
     onPlayerSound(callback: (s: { player: string, path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }) => void): void;

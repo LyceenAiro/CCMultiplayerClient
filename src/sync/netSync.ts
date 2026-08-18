@@ -178,6 +178,12 @@ export class NetSync {
 	/** True while WE hold the shared 'mpCharge' slow-motion handle (any party
 	 * member is charging a skill). Cleared when the last charger releases. */
 	private _mpChargeFrozen = false;
+	/** 1.71.9 (issue 3): ONE shared DarknessHandle for the party charge effect.
+	 * Vanilla attaches a darkness handle to the charging player's entity; remote
+	 * clients never see it, so we reproduce it here. One handle total — never one
+	 * per charger — and it is only held while a REMOTE charger is active (the
+	 * LOCAL player's native CombatCharge.darkness already covers their own charge). */
+	private _mpChargeDarkness: any = null;
 	// ---- hit-while-in-menu monitor (round 11) ----
 	/** Last-seen local currentHp; a DROP while the inventory menu is open means we
 	 * got hit and must auto-close the bag (menus no longer pause while partied). */
@@ -493,6 +499,11 @@ export class NetSync {
 	 * the instant the remote player releases — the old one-shot relay let the final
 	 * charge level ring out to its full buffer end after release. */
 	private _mpSustained: { [player: string]: any } = Object.create(null);
+	/** 1.71.9 (issue 7): live looped ENEMY sound handles keyed by enemy uid. The
+	 * host relays loop:true PLAY_SOUND steps (buffalo-run.ogg etc.); we keep ONE
+	 * handle per uid and cut it when the host relays STOP_SOUNDS, when the puppet
+	 * dies, or on map change — no more stacked footsteps that survive the room. */
+	private _mpEnemyLoops: { [uid: string]: any } = Object.create(null);
 
 	/** Read by the ig.game.respawn shadow installed in install(). */
 	public allowNativeRespawn(): boolean { return this._mpAllowRespawn; }
@@ -603,6 +614,11 @@ export class NetSync {
 		// ROUND 33 (item 2b): the host relayed an enemy's sound — replay it on our
 		// matching puppet so enemies aren't silent for the member.
 		conn.onEnemySound((s) => this.applyEnemySound(s));
+		// 1.71.9 (issue 7): the host's STOP_SOUNDS step cut a looped enemy sound —
+		// cut our matching loop handle so buffalo charges can't stack footsteps.
+		if (typeof conn.onEnemySoundStop === 'function') {
+			conn.onEnemySoundStop((uid) => this.applyEnemySoundStop(uid));
+		}
 		// ROUND 34 (item 3): a remote player relayed one of THEIR attack sounds — replay it
 		// on our mirror of that player.
 		conn.onPlayerSound((s) => this.applyPlayerSound(s));
@@ -1181,6 +1197,25 @@ export class NetSync {
 				}
 			}
 		} catch (e) { console.warn('[netsync] CombatCharge sound wrap failed', e); }
+		// 1.71.9 (issue 7): ACTION_STEP.STOP_SOUNDS is the engine's single choke point
+		// that cuts a looped enemy PLAY_SOUND (e.g. buffalo-run.ogg after the charge).
+		// Observe it HOST-side and relay enemySoundStop {uid}, so member-side loop
+		// handles can be stopped exactly when the host's own loop stops.
+		try {
+			const SS: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.STOP_SOUNDS;
+			if (SS && SS.prototype && typeof SS.prototype.run === 'function' && !SS.prototype._mpEnemySoundStopWrapped) {
+				SS.prototype._mpEnemySoundStopWrapped = true;
+				const origStopSounds = SS.prototype.run;
+				SS.prototype.run = function (this: any, a: any) {
+					const r = origStopSounds.call(this, a);
+					try {
+						const ns = cur();
+						if (ns) ns.onHostEnemySoundStop(a);
+					} catch (_) { /* never break STOP_SOUNDS */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[netsync] STOP_SOUNDS relay wrap failed', e); }
 				// ROUND 33 (item 2b): HOST-side observer on ig.SoundHelper.playAtEntity.
 				// Member puppets run NO Enemy AI, so the engine's PLAY_SOUND /
 				// PLAY_RANDOM_SOUND steps (and every AI/roar sound) never fire on a
@@ -1315,6 +1350,12 @@ export class NetSync {
 							}
 						} catch (_) { /* ignore */ }
 						const r = this.parent(a);
+						// 1.71.9 (issue 7): a killed puppet must cut any looped enemy sound
+						// handle we started for its uid (no more footsteps after a charge).
+						try {
+							const ns = cur();
+							if (ns && typeof this.uid === 'number') ns.stopEnemyLoop(this.uid);
+						} catch (_) { /* ignore */ }
 						// Fix 1 (host): re-evaluate combat once the kill fully completed. When
 						// the LAST enemy dies while targeting a remote-player MIRROR, the
 						// engine's own combat-exit never runs: Combatant.onKill's
@@ -5120,6 +5161,9 @@ export class NetSync {
 			}
 		} catch (_) { /* ignore */ }
 		this._mpSustained = Object.create(null);
+		// 1.71.9 (issue 7): the same map change also strands every looped enemy
+		// sound handle — cut them too so a charge can't keep running cross-map.
+		this.clearAllEnemyLoops();
 	}
 
 	// ---- ROUND 74 (plant destruct sync) ----
@@ -5199,14 +5243,68 @@ export class NetSync {
 				const dme: any = (puppet.coll && me && me.coll)
 					? Math.hypot(puppet.coll.pos.x - me.coll.pos.x, puppet.coll.pos.y - me.coll.pos.y) : -1;
 				D('playat', s.path, 'dist=' + Math.round(dme), 'pupPos=' + (puppet.coll ? Math.round(puppet.coll.pos.x) + ',' + Math.round(puppet.coll.pos.y) : '?'));
-				igAny.SoundHelper.playAtEntity(snd, puppet, s.loop === true, settings, undefined,
-					typeof s.radius === 'number' && isFinite(s.radius) ? s.radius : undefined);
+				if (s.loop === true) {
+					// 1.71.9 (issue 7): a new loop REPLACES the previous one for this uid
+					// (one footstep layer per enemy), and the handle is remembered so the
+					// host's STOP_SOUNDS relay / puppet death / map change can cut it.
+					this.stopEnemyLoop(s.uid);
+					const h = igAny.SoundHelper.playAtEntity(snd, puppet, true, settings, undefined,
+						typeof s.radius === 'number' && isFinite(s.radius) ? s.radius : undefined);
+					if (h) {
+						this._mpEnemyLoops[String(s.uid)] = h;
+						try { if (typeof puppet.addActionAttached === 'function') puppet.addActionAttached(h); } catch (_) { /* ignore */ }
+					}
+				} else {
+					igAny.SoundHelper.playAtEntity(snd, puppet, false, settings, undefined,
+						typeof s.radius === 'number' && isFinite(s.radius) ? s.radius : undefined);
+				}
 			} catch (_) { /* the sound is cosmetic — never break the frame */ }
 			finally { this._mpReplayingFx = false; }
 		} catch (_) { /* a failed sound replay must never crash the frame */ }
 	}
 
-	// ------------------------------------------------------------------ outbound
+	/** 1.71.9 (issue 7): stop (and forget) the looped enemy sound for one uid. */
+	private stopEnemyLoop(uid: number): void {
+		try {
+			const key = String(uid);
+			const h: any = this._mpEnemyLoops[key];
+			delete this._mpEnemyLoops[key];
+			if (h && typeof h.stop === 'function') h.stop();
+		} catch (_) { /* cosmetic */ }
+	}
+
+	/** MEMBER side: the host relayed STOP_SOUNDS for an enemy — cut its loop. */
+	private applyEnemySoundStop(uid: number): void {
+		try {
+			if (this.main.host || !uid) return;
+			this.stopEnemyLoop(uid);
+		} catch (_) { /* a failed stop must never crash the frame */ }
+	}
+
+	/** HOST side: the engine ran ACTION_STEP.STOP_SOUNDS on a real enemy. Relay the
+	 * stop to the instance so members can cut the loop handle they started for it. */
+	private onHostEnemySoundStop(actor: any): void {
+		try {
+			if (!this.main.host || !actor) return;
+			if (actor._mpMirror || actor._mpPuppet) return;
+			const Enemy = (ig.ENTITY as any).Enemy;
+			if (Enemy && !(actor instanceof Enemy)) return;
+			if (typeof actor.uid !== 'number' || !(actor.uid > 0)) return;
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen()) return;
+			if (typeof conn.enemySoundStop === 'function') conn.enemySoundStop(actor.uid);
+		} catch (_) { /* a failed relay must never break the action */ }
+	}
+
+	/** Stop every live enemy loop handle (map change / cleanup). */
+	private clearAllEnemyLoops(): void {
+		try {
+			for (const k in this._mpEnemyLoops) {
+				try { const h = this._mpEnemyLoops[k]; if (h && typeof h.stop === 'function') h.stop(); } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* ignore */ }
+		this._mpEnemyLoops = Object.create(null);
+	}
 
 	/** 1.71.0: records the LOCAL player's current SHOW_EXTERN_ANIM step (the
 	 * sitting/pose animations that set currentAnim to an object instead of a
@@ -6744,7 +6842,7 @@ export class NetSync {
 	 * true across map changes (and even title/re-login). Also injected around
 	 * isPlayerPartyInCombat itself in install() so no engine-side updateCombatMode
 	 * can re-arm combat from a stale entry between blocks. */
-	private purgeStaleCombatants(): void {
+	public purgeStaleCombatants(): void {
 		const c: any = (sc as any).combat;
 		if (!c || !c.activeCombatants) return;
 		const arr: any[] = c.activeCombatants[(sc as any).COMBATANT_PARTY.ENEMY];
@@ -7970,14 +8068,14 @@ export class NetSync {
 				if (this._mpChargeFrozen) this.clearChargeFreeze();
 				return;
 			}
-			let any = this.localCharging();
-			if (!any) {
-				for (const name in this.main.players) {
-					if (party.indexOf(name) === -1) continue;
-					const ent: any = this.main.players[name] && this.main.players[name]!.entity;
-					if (ent && !ent._killed && ent._mpCharging) { any = true; break; }
-				}
+			const local = this.localCharging();
+			let remote = false;
+			for (const name in this.main.players) {
+				if (party.indexOf(name) === -1) continue;
+				const ent: any = this.main.players[name] && this.main.players[name]!.entity;
+				if (ent && !ent._killed && ent._mpCharging) { remote = true; break; }
 			}
+			const any = local || remote;
 			const sm: any = (ig as any).slowMotion;
 			if (!sm || typeof sm.add !== 'function') return;
 			if (any && !this._mpChargeFrozen) {
@@ -7988,7 +8086,38 @@ export class NetSync {
 				this.clearChargeFreeze();
 				console.log('[netsync] party charge time-stop released');
 			}
+			// 1.71.9 (issue 3): mirror the vanilla skill-charge darkening for remote
+			// chargers. While WE are charging the native handle already darkens the
+			// screen; start/keep our single shared handle only for TEAMMATES, and let
+			// it fade out together with the party time-stop when the last one releases.
+			if (remote) this.ensureChargeDarkness();
+			else this.clearChargeDarkness();
 		} catch (_) { /* visuals must never break sync */ }
+	}
+
+	/** One shared screen-darkening handle for remote party-member charge. No
+	 * stacking: every charger shares the SAME handle; re-entries only re-assert
+	 * the temporary target. Intensity 0.5 sits inside vanilla's 0.4..0.6 range. */
+	private ensureChargeDarkness(): void {
+		try {
+			const light: any = (ig as any).light;
+			if (!light || typeof light.addDarknessHandle !== 'function') return;
+			if (this._mpChargeDarkness) return; // already held — never duplicate
+			const D: any = (ig as any).DarknessHandle;
+			if (!D) return;
+			const h = new D();
+			this._mpChargeDarkness = h;
+			try { light.addDarknessHandle(h); } catch (_) { /* ignore */ }
+			try { h.setTemporary(null, 0.5, -1, 0.05, 0.5); } catch (_) { /* ignore */ }
+		} catch (_) { /* a cosmetic handle must never break sync */ }
+	}
+
+	/** Fade out and drop the shared charge-darkness handle. */
+	private clearChargeDarkness(): void {
+		if (!this._mpChargeDarkness) return;
+		const h = this._mpChargeDarkness;
+		this._mpChargeDarkness = null;
+		try { h.stop(); } catch (_) { /* the light addon reaps it on fade-out */ }
 	}
 
 	/** Drop our shared charge slow-motion handle (map change / disconnect / party end). */
@@ -8000,6 +8129,7 @@ export class NetSync {
 			}
 		} catch (_) { /* ignore */ }
 		this._mpChargeFrozen = false;
+		this.clearChargeDarkness();
 	}
 
 	/** First live PARTY-member mirror (a teammate we can spectate / respawn at).

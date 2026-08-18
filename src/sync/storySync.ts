@@ -157,9 +157,7 @@ export function ensureStorySyncStyle(): void {
 .mpStoryCommTitle { position: relative;
 	font-family: 'STZhongsong','Source Han Serif SC','Noto Serif SC','SimSun',serif;
 	font-size: 58px; font-weight: 700; letter-spacing: 16px; padding-left: 16px; color: #ffd068;
-	background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
-	-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
-	filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 24px rgba(255,196,80,0.6));
+	text-shadow: 0 2px 1px rgba(60,30,0,0.55), 0 0 24px rgba(255,196,80,0.6);
 	animation: mpStoryZoomIn 0.5s cubic-bezier(.2,1.5,.4,1) both; }
 .mpStoryCommSub { position: relative; margin-top: 22px;
 	font-family: 'Noto Sans SC','Microsoft YaHei','Segoe UI',sans-serif;
@@ -185,15 +183,33 @@ export function ensureStorySyncStyle(): void {
 .mpStoryParty.light .mpStoryPartyGlow { background: radial-gradient(circle, rgba(140,200,255,0.24) 0%, rgba(140,200,255,0.05) 55%, transparent 72%); }
 .mpStoryParty.full .mpStoryPartyGlow { background: radial-gradient(circle, rgba(255,198,64,0.28) 0%, rgba(255,198,64,0.06) 55%, transparent 72%); }
 .mpStoryPartyInner { position: relative; text-align: center; transform: translateY(-6vh); }
+/* 1.71.9 (issue 4): ALWAYS keep a solid text color as the fallback. The
+   gradient + background-clip:text + transparent fill combo produced a blank
+   rectangle (轻锐小队 / 满编小队) on engines that don't apply clip-to-text. */
 .mpStoryPartyTitle { position: relative;
 	font-family: 'STZhongsong','Source Han Serif SC','Noto Serif SC','SimSun',serif;
 	font-size: 44px; font-weight: 700; letter-spacing: 14px; padding-left: 14px;
-	-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 	animation: mpStoryZoomIn 0.45s cubic-bezier(.2,1.5,.4,1) both; }
-.mpStoryParty.light .mpStoryPartyTitle { background: linear-gradient(180deg, #f4fcff 10%, #d5ecff 38%, #8fc1ee 62%, #46719e 96%);
-	filter: drop-shadow(0 2px 1px rgba(10,30,50,0.55)) drop-shadow(0 0 20px rgba(140,200,255,0.6)); }
-.mpStoryParty.full .mpStoryPartyTitle { background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
-	filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 20px rgba(255,196,80,0.6)); }
+.mpStoryParty.light .mpStoryPartyTitle { color: #a9d6ff;
+	text-shadow: 0 2px 1px rgba(10,30,50,0.55), 0 0 20px rgba(140,200,255,0.6); }
+.mpStoryParty.full .mpStoryPartyTitle { color: #ffd068;
+	text-shadow: 0 2px 1px rgba(60,30,0,0.55), 0 0 20px rgba(255,196,80,0.6); }
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+	.mpStoryCommTitle {
+		background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
+		-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+		filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 24px rgba(255,196,80,0.6));
+	}
+	.mpStoryPartyTitle { -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+	.mpStoryParty.light .mpStoryPartyTitle {
+		background: linear-gradient(180deg, #f4fcff 10%, #d5ecff 38%, #8fc1ee 62%, #46719e 96%);
+		filter: drop-shadow(0 2px 1px rgba(10,30,50,0.55)) drop-shadow(0 0 20px rgba(140,200,255,0.6));
+	}
+	.mpStoryParty.full .mpStoryPartyTitle {
+		background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
+		filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 20px rgba(255,196,80,0.6));
+	}
+}
 .mpStoryParty .mpStoryCommOrnament { width: 420px; margin-bottom: 16px; }
 .mpStoryParty .mpStoryCommOrnament.below { margin: 16px auto 0; }
 .mpStoryParty.light .mpStoryCommOrnament .seg.left { background: linear-gradient(90deg, transparent, rgba(170,215,255,0.95)); }
@@ -241,6 +257,10 @@ export class StorySyncController {
 	private members: string[] = [];
 	private snapshot: any = null;
 	private committed = false;
+	/** 1.71.9 (issue 9): synthetic ACTIVE quest id shown to a member who had
+	 * already solved the synced quest, so they can follow the shared progress
+	 * without ever receiving another reward. Removed on mode exit. */
+	private virtualQuestId = '';
 	private isPendingStart = false;
 	private pendingReqId = '';
 	private pendingQuest = '';
@@ -310,6 +330,10 @@ export class StorySyncController {
 	private plotSaveGuardInstalled = false;
 	private rawVarsGetJson: any = null;
 	private mainPlotSnapshot: number | null = null;
+	/** 1.71.9 (issue 10): the leader's latest relayed plot.line for MAIN-STORY sync.
+	 * Members ahead of the leader are re-clamped to this every frame while the mode
+	 * runs (the leader's story position is the one being played). */
+	private plotSyncTarget: number | null = null;
 	private triggersInstalled = false;
 	private modelSkipInstalled = false;
 	private cutsceneWrapperInstalled = false;
@@ -548,6 +572,108 @@ export class StorySyncController {
 			}
 			return String(lbl && lbl.data ? lbl.data : lbl);
 		} catch (_) { return id; }
+	}
+
+	// ------------------------------------------------- 1.71.9 virtual solved quest
+
+	private virtualSyncId(): string {
+		return 'mp.sync.' + this.quest;
+	}
+
+	/** Issue 9: for a member who ALREADY solved the synced side quest, register a
+	 * temporary static quest + active QuestState so the normal quest list shows a
+	 * "[同步] <name>" entry. It has no rewards and is removed the moment the mode
+	 * ends — its only purpose is viewing the leader-shared progress. */
+	private ensureVirtualQuest(): void {
+		try {
+			if (!this.active || this.isPlotQuest(this.quest)) return;
+			const q = this.questManager();
+			if (!q || typeof q.isQuestSolved !== 'function' || !q.isQuestSolved(this.quest)) return;
+			if (this.virtualQuestId) return;
+			const id = this.virtualSyncId();
+			if (q.staticQuests[id]) { this.virtualQuestId = id; return; }
+			const db: any = (ig as any).database;
+			const raw: any = db && typeof db.get === 'function' ? db.get('quests') : null;
+			const src = raw && raw[this.quest];
+			if (!src) {
+				console.warn('[storysync] virtual quest skipped: no database entry for ' + this.quest);
+				return;
+			}
+			// Clone the raw quest definition, strip rewards/parent linkage and mark
+			// it as the sync-view copy.
+			const clone: any = {};
+			for (const k in src) clone[k] = src[k];
+			const prefix = t('storySyncVirtualPrefix');
+			if (clone.name && typeof clone.name === 'object') {
+				const names: any = {};
+				for (const lang in clone.name) {
+					const base = String(clone.name[lang] || '');
+					names[lang] = prefix + base;
+				}
+				names.en_US = names.en_US || prefix + this.questLabel(this.quest);
+				names.zh_CN = names.zh_CN || names.en_US;
+				clone.name = names;
+			} else {
+				clone.name = { en_US: prefix + this.questLabel(this.quest), zh_CN: prefix + this.questLabel(this.quest) };
+			}
+			clone.rewards = {};
+			clone.hideRewards = true;
+			clone.noTrack = true;
+			clone.parent = undefined;
+			clone.extension = false;
+			const Quest: any = (sc as any).Quest;
+			const QuestState: any = (sc as any).QuestState;
+			if (!Quest || !QuestState) return;
+			const virt = new Quest(clone, id);
+			q.staticQuests[id] = virt;
+			const st = new QuestState(virt);
+			q.activeQuests.push(st);
+			if (!q._activeQuestIndex) q._activeQuestIndex = {};
+			q._activeQuestIndex[id] = q.activeQuests.length - 1;
+			this.virtualQuestId = id;
+			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			console.log('[storysync] virtual quest registered: ' + id);
+		} catch (_) { /* a UI helper must never break the sync */ }
+	}
+
+	private applyVirtualQuestState(state: any): void {
+		try {
+			if (!this.virtualQuestId) return;
+			const q = this.questManager();
+			if (!q) return;
+			const st = q.getQuestState ? q.getQuestState({ id: this.virtualQuestId }) : null;
+			if (!st) return;
+			st.setLoadData({
+				finished: !!state.finished,
+				task: Number(state.task) || 0,
+				highest: Number(state.highest) || 0,
+				completed: state.completed || [],
+				labels: state.labels || {},
+			});
+			try { (sc as any).Model.notifyObserver(q, 1, st); } catch (_) { /* ignore */ }
+			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+		} catch (_) { /* ignore */ }
+	}
+
+	private removeVirtualQuest(): void {
+		try {
+			const id = this.virtualQuestId;
+			this.virtualQuestId = '';
+			if (!id) return;
+			const q = this.questManager();
+			if (!q) return;
+			const idx = q._activeQuestIndex ? q._activeQuestIndex[id] : -1;
+			if (typeof idx === 'number' && idx >= 0 && q.activeQuests[idx] && q.activeQuests[idx].quest && q.activeQuests[idx].quest.id === id) {
+				q.activeQuests.splice(idx, 1);
+				for (const k in q._activeQuestIndex) {
+					if (q._activeQuestIndex[k] > idx) q._activeQuestIndex[k] = q._activeQuestIndex[k] - 1;
+				}
+			}
+			if (q._activeQuestIndex) delete q._activeQuestIndex[id];
+			try { delete q.staticQuests[id]; } catch (_) { /* ignore */ }
+			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			console.log('[storysync] virtual quest removed: ' + id);
+		} catch (_) { /* ignore */ }
 	}
 
 	/** QuestState.getSaveData() shape, JSON-safe. Null when neither active nor
@@ -859,6 +985,7 @@ export class StorySyncController {
 		this.members = Array.isArray(data.members) ? data.members.slice() : [];
 		this.snapshot = null;
 		this.mainPlotSnapshot = null;
+		this.plotSyncTarget = null;
 		this.committed = false;
 		this.finishedSynced = false;
 		this.currentEventSeq = 0;
@@ -884,6 +1011,9 @@ export class StorySyncController {
 		}
 		console.log('[storysync] MODE START quest=' + this.quest + ' leader=' + this.leader +
 			' members=' + JSON.stringify(this.members) + ' snapshot=true I-am-leader=' + this.isLocalLeader());
+		// 1.71.9 (issue 9): a member whose save already solved this quest gets a
+		// virtual "[同步] …" quest entry for the duration of the mode (no rewards).
+		try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
 		this.lockQuestHud();
 		if (this.isLocalLeader()) {
 			this.markStateDirty();
@@ -942,6 +1072,7 @@ export class StorySyncController {
 			// varsChanged pump recalculate the chapter/lore.
 			if (this.isPlotQuest(this.quest)) {
 				const line = Math.max(0, Number(state.task) || 0);
+				this.plotSyncTarget = line;
 				(ig as any).vars.set('plot.line', line);
 				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
 				return;
@@ -951,7 +1082,12 @@ export class StorySyncController {
 			if (!q || !quest) return;
 			// A member who has ALREADY solved the quest stays solved — the story
 			// plays, but their finished state is never rewound or rewarded again.
-			if (q.isQuestSolved(this.quest)) return;
+			if (q.isQuestSolved(this.quest)) {
+				// 1.71.9 (issue 9): their virtual "[同步]" quest still follows the
+				// leader's progress so they can see the shared task state.
+				this.applyVirtualQuestState(state);
+				return;
+			}
 			if (state.finished) {
 				this.tryFinishSyncedQuest(state);
 				return;
@@ -1047,6 +1183,19 @@ export class StorySyncController {
 							console.log('[storysync] leader broadcast completion: ' + this.quest);
 						}
 					}
+				} else if (this.isPlotQuest(this.quest) && this.plotSyncTarget !== null) {
+					// 1.71.9 (issue 10): a member whose OWN main story is AHEAD of the
+					// leader must stay clamped to the leader's streamed plot.line. Any
+					// local re-evaluation between the 0.25s state packets is corrected
+					// here on the very next frame, so story triggers actually play at
+					// the leader's position instead of skipping ahead.
+					try {
+						const cur = this.mainPlotLine();
+						if (cur !== null && cur !== this.plotSyncTarget) {
+							(ig as any).vars.set('plot.line', this.plotSyncTarget);
+							if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+						}
+					} catch (_) { /* ignore */ }
 				}
 				// A pending start whose server reply never lands eventually resets.
 				if (this.isPendingStart && Date.now() - this.pendingAt > CHECK_LOCAL_TIMEOUT) {
@@ -1320,7 +1469,42 @@ export class StorySyncController {
 						if (ctl.npcApplyBypass) return this.parent();
 						if (ctl.maybeGateNpcInteraction(this)) return undefined;
 					}
-					return this.parent();
+					const r = this.parent();
+					// 1.71.9 (issue 2): SHOP NPCs silently no-op while the engine has a
+					// stacked QuestSolvedDialog. In multiplayer that stack can be delayed
+					// (map change / party event / story sync), leaving the counter
+					// unopenable. Retry the same interaction a few times until the stack
+					// drains — the native onPreUpdate also keeps trying in parallel, so a
+					// normal completion still shows its reward exactly once.
+					try {
+						const self = this;
+						const st = self.npcStates && self.npcStates[self.activeStateIdx];
+						const EV: any = (sc as any).NPC_EVENT_TYPE;
+						const isShop = !!(st && EV && st.npcEventType === EV.SHOP);
+						const solvedStacked = !!(sc as any).quests
+							&& typeof (sc as any).quests.hasSolvedQuestsStacked === 'function'
+							&& (sc as any).quests.hasSolvedQuestsStacked();
+						if (isShop && !self.eventCall && (solvedStacked || self.eventBlocked)) {
+							self._mpShopRetries = (self._mpShopRetries || 0) + 1;
+							if (self._mpShopRetries <= 6) {
+								setTimeout(() => {
+									try {
+										if (self._killed || self.eventCall) return;
+										const stillStacked = (sc as any).quests && typeof (sc as any).quests.hasSolvedQuestsStacked === 'function'
+											&& (sc as any).quests.hasSolvedQuestsStacked();
+										if (!stillStacked && !self.eventBlocked) return;
+										if (self.eventBlocked && !(self.currentAction && self.currentAction.eventAction)) {
+											self.eventBlocked = false;
+										}
+										self.onInteraction();
+									} catch (_) { /* ignore */ }
+								}, 400);
+							}
+						} else {
+							self._mpShopRetries = 0;
+						}
+					} catch (_) { /* never break the interaction */ }
+					return r;
 				},
 			});
 			console.log('[storysync] NPC interaction gate installed');
@@ -2428,12 +2612,29 @@ export class StorySyncController {
 			if (!this.active && !this.isPendingStart && reason !== 'sessionEnd') return;
 			if (this.active) {
 				console.log('[storysync] exitLocal reason=' + reason + ' restore=' + restore + ' quest=' + this.quest);
-				if (restore && this.snapshot) this.restoreSnapshot();
+				if (restore && this.snapshot) {
+					if (this.isPlotQuest(this.quest)) {
+						// Main-story sync: put the player's OWN plot.line back (teammates
+						// who were ahead were only temporarily clamped to the leader).
+						this.restoreSnapshot();
+					} else {
+						// 1.71.9 (issues 6/8): side-quest sync NEVER rolls the quest back.
+						// The live (leader-synced) progress IS the result — cancel, party
+						// loss and completion must all keep it. Only crash/logout during
+						// the OLD flow used the snapshot; the user wants progress retained.
+						this.committed = true;
+						this.snapshot = null;
+						this.mainPlotSnapshot = null;
+						console.log('[storysync] side-quest sync ended — committing live progress (no snapshot rollback)');
+					}
+				}
 				if (!restore) this.committed = true;              // completion persists
+				this.removeVirtualQuest();
 				this.active = false;
 				this.committed = true;                            // save guard disarms
 				this.snapshot = null;
 				this.mainPlotSnapshot = null;
+				this.plotSyncTarget = null;
 				this.currentEventSeq = 0;
 				this.currentEventActive = false;
 				this.currentEventPendingSince = 0;
@@ -2778,7 +2979,10 @@ export class StorySyncController {
 		};
 		let snd = this.storySounds[key];
 		if (!snd) {
-			snd = new (ig as any).Sound(paths[key], 1);
+			// 1.71.9 (QoL 3): the FF14 fanfares ship quiet — 1.75x makes the sync-start
+			// audio clearly audible over BGM without clipping (WebAudio volume is not
+			// clamped at construction; SoundHandle applies its own squared falloff).
+			snd = new (ig as any).Sound(paths[key], 1.75);
 			this.storySounds[key] = snd;
 		}
 		return snd;
