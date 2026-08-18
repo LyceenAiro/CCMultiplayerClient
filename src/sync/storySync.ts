@@ -2764,9 +2764,9 @@ export class StorySyncController {
 	 * is not up yet; the caller then simply retries at play time. */
 	private getStorySound(key: 'accept' | 'light' | 'full'): any {
 		const paths: { [key: string]: string } = {
-			accept: 'media/sound/storysync/quest-accept.mp3',
-			light: 'media/sound/storysync/light-party.mp3',
-			full: 'media/sound/storysync/full-party.mp3',
+			accept: 'media/sound/storysync/quest-accept.ogg',
+			light: 'media/sound/storysync/light-party.ogg',
+			full: 'media/sound/storysync/full-party.ogg',
 		};
 		let snd = this.storySounds[key];
 		if (!snd) {
