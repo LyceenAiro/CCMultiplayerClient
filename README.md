@@ -137,9 +137,10 @@ everything goes through `CCMultiplayerServer`.
   **External UI Scale** setting (Auto / 50% / 75% / 100% / 125% / 150% / 200% /
   300% / 400%). It scales every mod-owned DOM surface — panels, server list,
   login, chat, toasts, tooltips, story banners, save block and off-screen
-  teammate arrows — in one go. Auto follows the game's on-screen zoom; the
-  fixed tiers are exact multipliers. In-canvas name tags follow the same
-  setting (Auto = native game zoom).
+  teammate arrows — in one go. Auto uses the game's launch window size as
+  100% and then follows window resizing; the fixed tiers are exact
+  multipliers. In-canvas name tags follow the same setting (Auto = native
+  game zoom).
 - **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
   stays asleep when the instance host migrates.
 - **Host handoff keeps enemy spawn settings (1.71.2)** — the original

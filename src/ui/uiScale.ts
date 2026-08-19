@@ -11,11 +11,11 @@
  *     top-level overlay root, so the whole layout (fonts, paddings, sizes, and
  *     reflowed text wrapping) scales coherently.
  *
- * 'auto' follows the engine's on-screen zoom: the ratio between the canvas CSS
- * box and the virtual game resolution (`canvas.getBoundingClientRect()` /
- * `ig.system.width/height`). That is exactly the mapping the mod already uses to
- * position DOM overlays over game coordinates, so Auto keeps the DOM UIs the
- * same visual size as the zoomed game HUD.
+ * 'auto' is relative to the game's LAUNCH window size: the canvas CSS size at
+ * the moment the game started (windowed) is captured as the 100% baseline, and
+ * Auto then follows window resizing as `current canvas scale / launch scale`.
+ * At the launch size the mod UI therefore looks exactly like the fixed 100%
+ * tier; enlarging the window scales the DOM UIs up with the game canvas.
  *
  * NOTE: Chromium's `zoom` multiplies authored absolute offsets too. Modules
  * that position a zoomed root from canvas coordinates (teammate arrows,
@@ -55,12 +55,20 @@ let styleInstalled = false;
 let getOption: (() => number | 'auto') | null = null;
 let current = 1;
 let lastApplied = -1;
+/** Launch-window canvas scale (canvas CSS px / virtual game px). Captured from
+ * the FIRST valid canvas rect of the session — that is the windowed size the
+ * game started at — and never updated afterwards. */
+let launchScale: number | null = null;
 
 /** Engine's on-screen zoom: canvas CSS box / virtual game resolution. The
- * geometric mean handles minor aspect-ratio rounding; clamped so a hidden /
- * resizing canvas can never produce a pathological multiplier. */
-function autoScale(): number {
+ * geometric mean handles minor aspect-ratio rounding. Returns null when the
+ * canvas is not measurable yet (hidden / zero-sized / not ready). */
+function currentCanvasScale(): number | null {
 	try {
+		// The game's OptionModel sets window.IG_SCREEN_MODE inside _setDisplaySize;
+		// until that runs the canvas CSS box is not the launch window yet. Waiting
+		// for it guarantees the captured baseline is the real launch window size.
+		if ((window as any).IG_SCREEN_MODE === undefined) return null;
 		const sys: any = (ig as any).system;
 		if (sys && sys.width > 0 && sys.height > 0 && sys.canvas
 			&& typeof sys.canvas.getBoundingClientRect === 'function') {
@@ -69,14 +77,23 @@ function autoScale(): number {
 				const sx = r.width / sys.width;
 				const sy = r.height / sys.height;
 				const s = Math.sqrt(sx * sy);
-				if (isFinite(s) && s > 0) return Math.max(0.25, Math.min(8, s));
+				if (isFinite(s) && s > 0) return s;
 			}
 		}
-		if (sys && typeof sys.scale === 'number' && sys.scale > 0) {
-			return Math.max(0.25, Math.min(8, sys.scale));
-		}
-	} catch (_) { /* fall back to 100% */ }
-	return 1;
+	} catch (_) { /* canvas not measurable */ }
+	return null;
+}
+
+/** Auto multiplier = current canvas scale / launch-window canvas scale. At the
+ * launch size this is exactly 100%; afterwards it tracks window resizing. */
+function autoScale(): number {
+	const raw = currentCanvasScale();
+	if (raw == null) return 1;
+	if (launchScale == null) {
+		launchScale = Math.max(0.1, Math.min(16, raw));
+	}
+	const base = launchScale || 1;
+	return Math.max(0.25, Math.min(8, raw / base));
 }
 
 function compute(): number {
