@@ -123,7 +123,13 @@ function tick(): void {
 			} else {
 				continue;
 			}
-			const scr = sys.getScreenFromMapPos(Math.round(wx), Math.round(wy));
+			// 1.71.10 fix: ig.system.getScreenFromMapPos(dest, x, y) MUTATES and
+			// returns `dest`. The old call passed the x/y numbers as the first two
+			// arguments, so in strict mode assigning `dest.x` on a number primitive
+			// threw and the whole per-frame pass was swallowed — no arrow ever
+			// appeared. Give it a real vector like the name-tag projection does.
+			const scr: any = {};
+			sys.getScreenFromMapPos(scr, Math.round(wx), Math.round(wy));
 			const sx = Number(scr && scr.x);
 			const sy = Number(scr && scr.y);
 			if (!isFinite(sx) || !isFinite(sy)) continue;

@@ -58,21 +58,28 @@ function hideTooltip(): void {
 	if (tooltip) { try { tooltip.hide().text(''); } catch (_) { /* ignore */ } }
 }
 
-/** Party members with a known area path; self excluded; town strangers excluded. */
+/** Party members with a known map; self excluded; town strangers excluded. The
+ * instance roster (playerMapByName) is authoritative while the member is on our
+ * own instance; the cross-instance memberMap cache covers story-sync members
+ * who are legitimately on another map. */
 function partyMembers(m: Multiplayer): Array<{ name: string; map: string }> {
 	const out: Array<{ name: string; map: string }> = [];
 	try {
 		const roster: string[] = Array.isArray(m.partyMembers) ? m.partyMembers : [];
 		for (const name of roster) {
 			if (!name || name === m.name) continue;
-			const map = (m.playerMapByName && m.playerMapByName[name]) || '';
+			const map = (m.playerMapByName && m.playerMapByName[name])
+				|| (m.memberMapByName && m.memberMapByName[name])
+				|| '';
 			if (map) out.push({ name, map });
 		}
 	} catch (_) { /* ignore */ }
 	return out;
 }
 
-/** Room + floor record for a map path in the given area data. */
+/** Room + floor record for a map path in the given area DATA. CrossCode's
+ * AreaLoadable._createRooms() has already turned each floor's `maps` entries
+ * into `floor.rooms` (AreaRoomBounds with name/min/max/offset), so read that. */
 function findRoom(area: any, mapName: string): { floor: any; room: any } | null {
 	try {
 		if (!area || !Array.isArray(area.floors)) return null;
@@ -86,13 +93,32 @@ function findRoom(area: any, mapName: string): { floor: any; room: any } | null 
 	return null;
 }
 
-/** Live world position for a same-map member, else the room centre. */
+/** Area-map GUI coordinates for one member. Same-map members are placed by
+ * their live world position normalised into the room block (the area map is a
+ * stylised 8px-per-tile overview, NOT a 1:1 world map, so raw coll pixels would
+ * land far outside the floor GUI); members elsewhere in the area use the room
+ * block centre. */
 function memberMapPos(m: Multiplayer, name: string, room: any): { x: number; y: number } | null {
 	try {
 		const rec = m.players && m.players[name];
 		const ent = rec && rec.entity;
-		if (ent && ent.coll && !ent._killed) {
-			return { x: Math.round(ent.coll.pos.x + ent.coll.size.x / 2), y: Math.round(ent.coll.pos.y + ent.coll.size.y / 2) };
+		const g: any = (ig as any).game;
+		const sameMap = !!(g && g.mapName && room && room.name === g.mapName);
+		if (sameMap && ent && ent.coll && !ent._killed) {
+			const wx = ent.coll.pos.x + ent.coll.size.x / 2;
+			const wy = ent.coll.pos.y + ent.coll.size.y / 2;
+			let nx = 0.5, ny = 0.5;
+			const cm = g.collision;
+			const ts = (cm && cm.tilesize) || 16;
+			if (cm && typeof cm.width === 'number' && cm.width > 0) {
+				nx = Math.max(0, Math.min(1, wx / (cm.width * ts)));
+			}
+			if (cm && typeof cm.height === 'number' && cm.height > 0) {
+				ny = Math.max(0, Math.min(1, wy / (cm.height * ts)));
+			}
+			const rw = Math.max(8, (room.max.x - room.min.x) * 8);
+			const rh = Math.max(8, (room.max.y - room.min.y) * 8);
+			return { x: Math.round(room.min.x * 8 + nx * rw), y: Math.round(room.min.y * 8 + ny * rh) };
 		}
 	} catch (_) { /* fall through to room centre */ }
 	try {
@@ -108,33 +134,43 @@ function drawAreaFloorAvatars(floorGui: any, renderer: any): void {
 		const m = getMain && getMain();
 		const mapAny: any = (sc as any).map;
 		const menu: any = (sc as any).menu;
-		const area = mapAny && mapAny.getCurrentArea ? mapAny.getCurrentArea() : null;
+		// 1.71.10 fix: sc.map has NO getCurrentArea() method in 1.4.2 — the old
+		// guard evaluated it to undefined and bailed out every frame, so no area
+		// avatar was ever drawn. Use currentArea (an AreaLoadable) directly; its
+		// .data.floors[].rooms were created by the engine from the JSON maps.
 		const curArea = mapAny && mapAny.currentArea;
-		const areaPath = (curArea && curArea.path) || '';
-		if (!m || !area || !menu || !floorGui || !floorGui.floor) return;
-		const cameraX = typeof menu.mapCamera === 'object' ? (menu.mapCamera.x || 0) : 0;
-		const cameraY = typeof menu.mapCamera === 'object' ? (menu.mapCamera.y || 0) : 0;
-		const areaOffX = typeof menu.mapAreaOffset === 'object' ? (menu.mapAreaOffset.x || 0) : 0;
-		const areaOffY = typeof menu.mapAreaOffset === 'object' ? (menu.mapAreaOffset.y || 0) : 0;
+		if (!m || !curArea || !menu || !floorGui || !floorGui.floor) return;
+		const areaPath = (curArea.path || '');
+		const areaData = curArea.data;
 		const floorLevel = floorGui.floor.level || 0;
-		const floorOffY = floorGui.hook ? (floorGui.hook.pos ? floorGui.hook.pos.y : 0) : 0;
+		// Seed screenCoords on the floor hook so ig.gui keeps it current every
+		// frame (the same idiom as the world-map hook + netBadge). Hover hits can
+		// then be computed in real screen coords instead of hand-built camera math.
+		const fh = floorGui.hook;
+		if (fh && !fh.screenCoords) {
+			fh.screenCoords = { x: 0, y: 0, w: fh.size ? fh.size.x : 0, h: fh.size ? fh.size.y : 0, active: false, zIndex: 0 };
+		}
+		const scr = fh && fh.screenCoords;
 		for (const mate of partyMembers(m)) {
 			if (areaPathOfMap(mate.map) !== areaPath) continue;
-			const found = findRoom(area, mate.map);
+			const found = findRoom(areaData, mate.map);
 			if (!found || found.floor.level !== floorLevel) continue;
 			const pos = memberMapPos(m, mate.name, found.room);
 			if (!pos) continue;
-			const lx = pos.x - 4;
-			const ly = pos.y - 13;
+			const lx = Math.round(pos.x - Math.floor(ICON_W / 2));
+			const ly = Math.round(pos.y - ICON_H + 1);
 			renderer.addGfx(gfx, lx, ly, ICON_X, ICON_Y, ICON_W, ICON_H);
-			// Record a hit target in GAME screen coords (same space as ig.input.mouse).
-			hits.push({
-				x: pos.x + cameraX + areaOffX - 5,
-				y: pos.y + cameraY + areaOffY + floorOffY - 14,
-				w: 12,
-				h: 16,
-				name: mate.name,
-			});
+			// Record the hover target in the same screen-coordinate space the
+			// engine reports for the floor hook.
+			if (scr) {
+				hits.push({
+					x: scr.x + lx - 2,
+					y: scr.y + ly - 2,
+					w: ICON_W + 4,
+					h: ICON_H + 4,
+					name: mate.name,
+				});
+			}
 		}
 	} catch (_) { /* a map icon must never break the map draw */ }
 }
