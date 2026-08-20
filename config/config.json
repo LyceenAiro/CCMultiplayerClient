@@ -2,7 +2,7 @@
 	"servers": [
 		{
 			"hostname": "localhost",
-			"port": 15152,
+			"port": 15151,
 			"type": "http"
 		}
 	]

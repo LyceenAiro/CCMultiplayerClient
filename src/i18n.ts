@@ -60,9 +60,6 @@ const enDict: { [key: string]: string } = {
     netPingLabel: 'Ping',
     netLossLabel: 'Loss',
     memberLevel: 'Lv.',
-    // 1.71.9 (issue 5): member badges show the RELATIVE link latency.
-    netRelPingLabel: 'Relative Ping',
-    netPingParts: 'you→server {a} ms · them→server {b} ms',
     // Round 27 (item 2): off-map teammate badge/portrait tooltip.
     notInSameRoom: 'Not in the same room',
 
@@ -168,6 +165,9 @@ const enDict: { [key: string]: string } = {
     reqWithdrawTitle: 'Withdraw request',
     // round 23 wave 3 — party-invite busy + friend-remove confirm
     partyInviteBusy: 'They have a pending invite',
+    // ROUND 117: offline targets are uninvitable (no more offline->bot fallback)
+    partyInviteOffline: 'They are offline — invites need them online',
+    optOffline: 'Offline',
     confirmRemoveFriendTitle: 'Remove Friend',
     confirmRemoveFriendMsg: 'Remove {name} from friends?',
     confirmOk: 'Confirm',
@@ -284,7 +284,7 @@ const enDict: { [key: string]: string } = {
     storySyncStartedMember: 'Story Sync entered',
     storySyncFinishedTitle: 'Quest Complete — Story Sync',
     storySyncCancelTitle: 'Cancel Story Sync',
-    storySyncCancelConfirmBody: 'Cancel story sync and restore every teammate to their OWN previous quest progress?',
+    storySyncCancelConfirmBody: 'Cancel story sync? Every teammate KEEPS the quest progress reached so far.',
     storySyncCancelConfirm: 'Cancel Story Sync',
     storySyncCancelStay: 'Keep Playing',
     storySyncCancelRequested: 'Story-sync cancel sent…',
@@ -394,9 +394,6 @@ const zhDict: { [key: string]: string } = {
     netPingLabel: '延迟',
     netLossLabel: '丢包',
     memberLevel: '等级',
-    // 1.71.9 (issue 5): member badges show the RELATIVE link latency.
-    netRelPingLabel: '相对延迟',
-    netPingParts: '你→服务器 {a} ms · 对方→服务器 {b} ms',
     // Round 27 (item 2): off-map teammate badge/portrait tooltip.
     notInSameRoom: '不在同一房间',
 
@@ -502,6 +499,9 @@ const zhDict: { [key: string]: string } = {
     reqWithdrawTitle: '撤回好友申请',
     // round 23 wave 3 — party-invite busy + friend-remove confirm
     partyInviteBusy: '对方正在处理其他邀请',
+    // ROUND 117: 离线目标不可邀请（不再有“离线邀请为 bot”的回退）
+    partyInviteOffline: '对方不在线，无法邀请',
+    optOffline: '不在线',
     confirmRemoveFriendTitle: '删除好友',
     confirmRemoveFriendMsg: '确定要删除好友 {name} 吗？',
     confirmOk: '确认',
@@ -618,7 +618,7 @@ const zhDict: { [key: string]: string } = {
     storySyncStartedMember: '已进入剧情同步',
     storySyncFinishedTitle: '任务完成——剧情同步',
     storySyncCancelTitle: '取消剧情同步',
-    storySyncCancelConfirmBody: '取消剧情同步，所有队员将恢复到各自原来的任务进度？',
+    storySyncCancelConfirmBody: '取消剧情同步？所有队员将保留当前已同步的任务进度。',
     storySyncCancelConfirm: '取消剧情同步',
     storySyncCancelStay: '继续游戏',
     storySyncCancelRequested: '正在向服务器发送取消请求…',

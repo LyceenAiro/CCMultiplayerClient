@@ -20,6 +20,9 @@ import { getMpUiScale } from './uiScale';
  *    (世界 / 小队 / closable private tabs), the message list (newest pinned to
  *    the bottom) and the input strip. Popups are hidden while the panel is open;
  *    incoming messages land in their channel tab (unread badge when inactive).
+ *    Clicking the ALREADY-ACTIVE tab toggles that channel's do-not-disturb
+ *    mode: a white moon rides above the tab and its new messages no longer
+ *    pop up as bubbles while the panel is closed (history/unread unaffected).
  *
  * The Enter hook is a CAPTURE-phase window keydown listener (never a rebind of
  * ig.KEY.ENTER / sc.control). While the input is open it consumes every key not
@@ -47,6 +50,10 @@ interface ChatChannel {
     target?: string;
     messages: ChatMessage[];
     unread: number;
+    /** Do-not-disturb: new messages in this channel never render as popup
+     * bubbles while the panel is closed (toggled by re-clicking the ACTIVE tab;
+     * shown as a white moon above the tab). Session-scoped, like the tabs. */
+    muted?: boolean;
 }
 
 export interface IChatMessage {
@@ -334,7 +341,10 @@ function ensureChatStyle(): void {
 .mpChatTabs {
     display: flex; align-items: stretch; gap: 3px;
     overflow-x: auto; overflow-y: hidden;
-    padding: 4px 0 0 0;
+    /* 10px top padding leaves room for the do-not-disturb moon that rides
+     * above a muted tab (overflow-y:hidden clips at the PADDING box, so a
+     * badge inside the padding strip stays visible). */
+    padding: 10px 0 0 0;
     background: transparent;
     border: none;
     scrollbar-width: thin;
@@ -345,6 +355,7 @@ function ensureChatStyle(): void {
 .mpChatTabs::-webkit-scrollbar-thumb { background: rgba(111, 199, 255, 0.4); border-radius: 3px; }
 .mpChatTabs::-webkit-scrollbar-thumb:hover { background: rgba(111, 199, 255, 0.7); }
 .mpChatTab {
+    position: relative; /* anchor for the do-not-disturb moon badge */
     flex: 0 0 auto;
     display: inline-flex; align-items: center;
     padding: 3px 9px;
@@ -355,6 +366,18 @@ function ensureChatStyle(): void {
     border-radius: 6px 6px 0 0;
     cursor: pointer;
 }
+/* Do-not-disturb badge: a WHITE crescent moon riding just above the tab,
+ * HORIZONTALLY CENTERED on it (sits inside the tab row's top padding strip). */
+.mpChatMute {
+    position: absolute; top: -8px; left: 0; right: 0;
+    text-align: center;
+    font-size: 11px; line-height: 11px;
+    font-family: 'Segoe UI Symbol', 'Noto Sans Symbols 2', 'Noto Sans SC', sans-serif;
+    color: #ffffff;
+    text-shadow: 0 0 3px rgba(0, 0, 0, 0.95), 0 1px 2px rgba(0, 0, 0, 0.9);
+    pointer-events: none;
+}
+
 .mpChatTab:hover { color: #eaf7ff; background: rgba(27, 70, 104, 0.85); }
 .mpChatTab.active {
     color: #ffffff; background: rgba(41, 98, 140, 0.95);
@@ -582,6 +605,13 @@ function renderTabs(): void {
         if (ch.id === activeId) tab.className += ' active';
         if (ch.unread > 0) tab.className += ' unread';
 
+        if (ch.muted) {
+            const moon = document.createElement('span');
+            moon.className = 'mpChatMute';
+            moon.textContent = '\u263E'; // white crescent moon (CSS-colored)
+            tab.appendChild(moon);
+        }
+
         const label = document.createElement('span');
         label.textContent = ch.kind === 'private' ? String(ch.target || ch.id) : (ch.kind === 'party' ? t('chatParty') : t('chatWorld'));
         tab.appendChild(label);
@@ -607,6 +637,15 @@ function renderTabs(): void {
         }
 
         tab.addEventListener('click', () => {
+            // Re-clicking the ALREADY-ACTIVE tab toggles its do-not-disturb mode
+            // (moon badge; the channel's messages stop popping up as bubbles
+            // while the panel is closed). The selection itself does not move.
+            if (ch.id === activeId) {
+                ch.muted = !ch.muted;
+                renderTabs();
+                if (chatOpen && inputEl) inputEl.focus();
+                return;
+            }
             // Switching tabs always works; the input only opens when the game is in
             // a typeable state (never steal the keyboard mid-cutscene/menu).
             setActiveChannel(ch.id, canOpenChat());
@@ -936,7 +975,9 @@ function addMessage(ch: ChatChannel, from: string, text: string, system: boolean
     if (!system) savePersisted();
     if (chatOpen && panel && activeId === ch.id) renderMessages();
     else if (chatOpen && panel) renderTabs();
-    else if (!chatOpen) showPopup(ch.kind, from || '', text);
+    // Do-not-disturb channels still record history/unread — only the transient
+    // bubble is withheld.
+    else if (!chatOpen && !ch.muted) showPopup(ch.kind, from || '', text);
 }
 
 function closeChannel(id: string): void {

@@ -80,7 +80,7 @@ const DEFAULTS: IMpOptions = {
     leaderGold: true,
     showPing: false,
     hostTickRate: 30,
-    playerStateRate: 10,
+    playerStateRate: 30,   // ROUND 117: default raised 10 -> 30 Hz (user request)
     showNetDebug: false,
     showNetDebugCumulative: false,
     showNetTool: false,
@@ -127,7 +127,7 @@ function loadOptions(): IMpOptions {
                 if (typeof parsed.showPing === 'boolean') out.showPing = parsed.showPing;
                 // Round-21 key: allowlist 15/30/60 Hz only; anything else -> default 30.
                 if (parsed.hostTickRate === 15 || parsed.hostTickRate === 30 || parsed.hostTickRate === 60) out.hostTickRate = parsed.hostTickRate;
-                // Round-23 key: allowlist 10/20/30/60 Hz only; anything else -> default 10.
+                // Round-23 key: allowlist 10/20/30/60 Hz only; anything else -> default 30 (ROUND 117).
                 if ([10, 20, 30, 60].indexOf(parsed.playerStateRate) !== -1) out.playerStateRate = parsed.playerStateRate;
                 if (typeof parsed.showNetDebug === 'boolean') out.showNetDebug = parsed.showNetDebug;
                 if (typeof parsed.showNetDebugCumulative === 'boolean') out.showNetDebugCumulative = parsed.showNetDebugCumulative;
@@ -757,9 +757,14 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const storyHideNames = !!(m.storySync
             && typeof m.storySync.storyEventActive === 'function'
             && m.storySync.storyEventActive());
+        // 1.72.0 (user report): hide the OWN name tag while the local player is in
+        // a story cutscene too. Remote tags already hide via ROUND 107 below, but
+        // this gate only checked storyHideNames (synced story VIDEO) — during an
+        // engine story cutscene (netSync.inCutscene) the own name stayed visible.
+        const inCutsceneNow = !!((m as any).netSync && (m as any).netSync.inCutscene);
 
         // Own player tag (account name above the local player entity).
-        if (getMpOption('showOwnName') && !storyHideNames) {
+        if (getMpOption('showOwnName') && !storyHideNames && !inCutsceneNow) {
             const selfName = (m as any).name;
             const ent = (ig as any).game && (ig as any).game.playerEntity;
             if (selfName && ent && ent.coll && !ent._killed && !(ent.params && ent.params.currentHp <= 0)) {

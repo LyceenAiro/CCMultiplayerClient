@@ -11,6 +11,7 @@ import { installChatBox } from './ui/chatBox';
 import { installItemUseIndicators } from './ui/itemUseIndicator';
 import { installHealSync } from './ui/healSync';
 import { installVersionDisplay } from './ui/versionDisplay';
+import { installShopDiag } from './ui/shopDiag';
 
 /**
  * CCLoader v2 entry point.
@@ -80,6 +81,9 @@ async function startMultiplayer(): Promise<void> {
 		// ROUND 93/94: channel chat — popup bubbles with [世界]/[小队]/[私聊]
 		// prefixes while closed; Enter opens the full bottom-left tab panel.
 		installChatBox(() => multiplayer);
+
+		// ROUND 123: 商人购买点击失灵的只读诊断（[mpdiag] 日志，不改行为）。
+		installShopDiag();
 
 		// ROUND 95: item-use indicators — other players see the item icon pop above
 		// our head when we use a consumable (and vice versa).

@@ -55,7 +55,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.71.10';
+export const MP_VERSION = '1.72.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -88,6 +88,11 @@ export class Multiplayer {
 	 *  the remote members) and cleared on map change / logout. The party HUD reads
 	 *  it to hide an off-map member's HP/SP/EXP bars + grey their net diamond. */
 	public memberMapByName: { [name: string]: string } = {};
+	/** World-map fix: the engine-resolved AREA PATH each remote member is in
+	 *  (username -> areaPath, e.g. "autumn-area"), relayed alongside memberMap.
+	 *  Map names do NOT always start with the area key ("autumn.path-3-1" lives in
+	 *  area "autumn-area"), so the world-map marker cannot derive it locally. */
+	public memberAreaByName: { [name: string]: string } = {};
 	/** Round 27 (item 2): the HOST's map for each party BOT (botName -> mapName),
 	 *  from the extended partyBots broadcast. Same HUD consumer as memberMapByName. */
 	public botMapByName: { [name: string]: string } = {};
@@ -422,11 +427,22 @@ export class Multiplayer {
 		try { if (this.netSync) this.netSync.setBlockInterval(this.getHostTickInterval()); } catch (_) { /* ignore */ }
 
 		// Round 16 (issue 4): read the server's per-extra-party-member enemy max-HP
-		// fraction off the handshake (handshakeResponse.hpScale, default 0.5) and hand
+		// fraction off the handshake (handshakeResponse.hpScale, default 0.7) and hand
 		// it to netSync, which scales monster max/current HP by party size at spawn —
 		// HOST side only (members' puppets are locked mirrors of host enemies).
 		if (typeof result.hpScale === 'number' && isFinite(result.hpScale)) this.mpHpScale = result.hpScale;
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
+		// Same scheme for attack/defense/focus (default +10% per extra member) and
+		// elemental resistance (flat points + positive-only percentage, defaults 0).
+		// Older servers omit the fields — fall back to the documented defaults.
+		try {
+			if (this.netSync) {
+				const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
+				this.netSync.setStatScales(
+					num(result.attackScale, 0.1), num(result.defenseScale, 0.1), num(result.focusScale, 0.1),
+					num(result.resistFlat, 0), num(result.resistPercent, 0));
+			}
+		} catch (_) { /* ignore */ }
 
 		// Round 23: the server no longer embeds the save in handshakeResponse — it
 		// streams it as paced saveDownload parts right after the handshake. Register
@@ -1466,10 +1482,11 @@ export class Multiplayer {
 		// Round 27 (item 2): a party member relayed their current map — cache it so the
 		// party HUD hides an off-map member's bars + greys their net diamond. Our own
 		// echo is ignored (self is always on our map).
-		if (conn.onMemberMap) safeWire(conn.onMemberMap.bind(conn), (name, map) => {
+		if (conn.onMemberMap) safeWire(conn.onMemberMap.bind(conn), (name, map, area) => {
 			try {
 				if (!name || name === this.name) return;
 				this.memberMapByName[name] = map;
+				if (area) this.memberAreaByName[name] = area;
 			} catch (_) { /* ignore */ }
 		});
 
@@ -1644,7 +1661,7 @@ export class Multiplayer {
 	 * member). Consumed by netSync (setHpScale) — the HOST scales monster HP at
 	 * spawn by `1 + hpScale * (partySize - 1)`; members never scale (their puppets
 	 * are locked mirrors of host enemies). */
-	public mpHpScale = 0.5;
+	public mpHpScale = 0.7;
 	/** Round 17: RTT in ms each remote player in our instance reports to the
 	 * server (relayed as `playerPing`, ~1/s cadence). Shown on their name tag when
 	 * 显示ping值 is on. Stale entries are harmless (tags only render for present
@@ -1970,13 +1987,51 @@ export class Multiplayer {
 				+ ' baseZ=' + Math.round(c.baseZPos) + ' posZ=' + Math.round(c.pos.z) + ' map=' + fix.map);
 		} catch (_) { /* a landing fix must never break the load */ }
 		// One delayed re-pass catches floors that only exist after the first ground
-		// entities finish settling; then drop the fix.
+		// entities finish settling; then persist the corrected position and drop
+		// the fix.
 		if (this._mpRegroupFixAttempts++ >= 1) {
+			// ROUND 121 (sunk-after-relogin): the engine's map-change checkpoint save
+			// fired DURING the load with the RAW TeleportPosition (level 0 + raw z —
+			// the very mismatch corrected above) and the upload hook pushed that bad
+			// position to the server; relogin restored level 0 with a level-1 z and
+			// the player spawned half-sunk into the floor. Now that the live coll is
+			// corrected, rewrite the persisted position and re-upload.
+			try { this.persistRegroupLanding(); } catch (_) { /* ignore */ }
 			this._mpRegroupLandingFix = null;
 			this._mpRegroupFixAttempts = 0;
 		} else {
 			setTimeout(() => this.applyRegroupLandingFix(), 200);
 		}
+	}
+
+	/**
+	 * ROUND 121: after applyRegroupLandingFix settles, make the SAVED position
+	 * match the corrected live one:
+	 *  1. patch ig.storage.checkPointSave.position (still the raw teleport target)
+	 *     so a defeat respawn in this session doesn't reuse the sunk values;
+	 *  2. rebuild + persist + upload the auto slot from the corrected live coll —
+	 *     _saveState snapshots the player's CURRENT position/level/baseZPos, and
+	 *     the 'other' reason bypasses the area throttle the engine's own map-change
+	 *     save just consumed. The server save is what relogin downloads.
+	 */
+	private persistRegroupLanding(): void {
+		try {
+			const fix = this._mpRegroupLandingFix;
+			const storage: any = (ig as any).storage;
+			const p: any = ig.game && ig.game.playerEntity;
+			if (!fix || !storage || !p || typeof storage._createCopyTeleportPosition !== 'function') return;
+			const posJson = storage._createCopyTeleportPosition(p);
+			if (!posJson) return;
+			try {
+				if (storage.checkPointSave && storage.checkPointSave.position && storage.checkPointSave.map === fix.map) {
+					storage.checkPointSave.position = posJson;
+				}
+			} catch (_) { /* ignore */ }
+			this.setSaveReason('other');
+			if (this.saveWithoutMovingCheckpoint()) {
+				console.log('[multiplayer] regroup landing persisted to save (level/z corrected)');
+			}
+		} catch (_) { /* a save must never break the frame */ }
 	}
 
 	/**
@@ -2052,12 +2107,13 @@ export class Multiplayer {
 	}
 
 	/** Round 23: the own playerState send interval (ms) from the options tab
-	 * (playerStateRate 10/20/30/60 -> 1000/rate). Rounds a garbage value back to 10Hz.
-	 * Read LIVE every tick (hot-applies on the next packet), so this is deliberately
-	 * NOT latched like getHostTickInterval. Routed here so netSync never has to import
-	 * mpOptions (avoids the netSync -> mpOptions import cycle, same as getHostTickInterval). */
+	 * (playerStateRate 10/20/30/60 -> 1000/rate). Rounds a garbage value back to the
+	 * default 30Hz (ROUND 117 — default raised from 10). Read LIVE every tick
+	 * (hot-applies on the next packet), so this is deliberately NOT latched like
+	 * getHostTickInterval. Routed here so netSync never has to import mpOptions
+	 * (avoids the netSync -> mpOptions import cycle, same as getHostTickInterval). */
 	public getPlayerStateMs(): number {
-		const r = Number(getMpOption('playerStateRate')) || 10;
+		const r = Number(getMpOption('playerStateRate')) || 30;
 		return 1000 / r;
 	}
 
@@ -2350,7 +2406,10 @@ export class Multiplayer {
 			(this as any)._mpLastPublishedMap = map;
 			this._mpLastMemberMapAt = now;
 			if (typeof (this.connection as any).memberMap === 'function') {
-				(this.connection as any).memberMap(map);
+				// Publish our engine-resolved AREA alongside the map: the world-map
+				// marker lookup needs the exact area key, which the map name's first
+				// segment does not always equal ("autumn.*" maps -> "autumn-area").
+				(this.connection as any).memberMap(map, currentAreaPath());
 			}
 		} catch (_) { /* ignore */ }
 	}
@@ -3884,6 +3943,10 @@ export class Multiplayer {
 		if ((this as any)._loggedOut) return;
 		(this as any)._loggedOut = true;
 		try {
+			// ROUND 102 (inherit synced quest progress): end story sync FIRST — its
+			// quest save-guard would otherwise substitute the pre-sync quest block
+			// into this final save/upload. Idempotent vs the later clearSession call.
+			try { if (this.storySync) this.storySync.onSessionCleared(); } catch (_) { /* ignore */ }
 			// Best-effort final save (checkpoint-safe — see saveWithoutMovingCheckpoint;
 			// the onStorageSave hook uploads while the socket is still open). Round 23:
 			// stamped 'exit' so the upload bypasses the area-save anti-spam gate.
@@ -3979,6 +4042,13 @@ export class Multiplayer {
 			return true;
 		}
 
+		// ROUND 102 (inherit synced quest progress): end any active story sync BEFORE
+		// building the save. Its quest save-guard would otherwise still be armed here
+		// (the session teardown that disarms it runs only later, in clearSession) and
+		// the exit save + upload would carry the PRE-SYNC quest block — reverting the
+		// synced progress the exit matrix says to keep. Idempotent: the real teardown
+		// re-calls onSessionCleared, which early-returns once the mode is down.
+		try { if (this.storySync) this.storySync.onSessionCleared(); } catch (_) { /* ignore */ }
 		// Build the save locally (checkpoint-safe). saveWithoutMovingCheckpoint ALSO fires
 		// the onStorageSave upload hook, which would push the same save with reason 'exit'
 		// — suppress that one-shot so ONLY our dialog-tracked flush() upload below goes out
@@ -4305,6 +4375,7 @@ export class Multiplayer {
 		// Round 27 (item 2): the per-member/bot map signals are session-scoped — wipe
 		// them so a stale map never greys/hides a teammate in the next session.
 		this.memberMapByName = {};
+		this.memberAreaByName = {};
 		this.botMapByName = {};
 		this.playerMapByName = {};
 		this.playersOnThisMap = {};

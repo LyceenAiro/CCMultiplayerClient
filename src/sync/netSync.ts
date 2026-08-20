@@ -4,6 +4,7 @@ import { t } from '../i18n';
 import { isSharedTownNow, isSharedTownMap, currentAreaPath } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
 import { showRemoteHeal } from '../ui/healSync';
+import { createDeathLineHud, DeathLineHud } from '../ui/deathLineHud';
 
 /**
  * New sync system — whole-state broadcast, replacing the original mod's per-entity
@@ -55,6 +56,8 @@ interface IEnemySnap {
 	                  // member tell "engaged on ME" (mirror red) from "engaged on
 	                  // someone else" (still hostile to the group). The plain tg flag
 	                  // couldn't, so a de-aggro off the member read as still-red.
+	st?: number[];    // Elemental status: [burn, chill, jolt, mark] charge in
+	                  // integer percent + active bitmask ([4]). Absent = no status.
 	sp?: number;      // ROUND 61: currentSp — the guard/break bar. Synced so the
 	                  // member's puppet shows the host's break progress.
 	msp?: number;     // ROUND 61: maxSp (baseParams.sp), the guard bar ceiling.
@@ -150,6 +153,16 @@ export class NetSync {
 	private _mpPlayerCamDetached = false;
 	private _mpDeathGui: any = null;
 	private _mpDeathGuiText = '';
+	/** 1.72.0: the death-wait indicator is now the combat-rank-style converging
+	 * LINE (ui/deathLineHud). _mpDeathGui holds either the DeathLineHud wrapper
+	 * (has setTarget) or the legacy TextGui fallback (has setText).
+	 * _mpDeathWasCombat: the local player was in combat at some point during this
+	 * death — a later combat-END engages the eased fast shrink (quick revive).
+	 * _mpDeathShrinkArmed/_mpDeathShrinkAt: which fast-shrink fired and when —
+	 * guards re-arming + provides the hard fallback if the HUD callback is lost. */
+	private _mpDeathWasCombat = false;
+	private _mpDeathShrinkArmed: 'revive' | 'wipe' | null = null;
+	private _mpDeathShrinkAt = 0;
 	private _mpDeathPos: { x: number, y: number, z: number } | null = null;
 	private _mpDeathMap = '';
 	private _mpSafeRespawnPos: { x: number, y: number, z: number } | null = null;
@@ -188,12 +201,23 @@ export class NetSync {
 	/** Last-seen local currentHp; a DROP while the inventory menu is open means we
 	 * got hit and must auto-close the bag (menus no longer pause while partied). */
 	private _mpLastLocalHp = -1;
-	// ---- round 16 (issue 4): party-size monster HP scaling (host side) ----
+	// ---- round 16 (issue 4): party-size monster stat scaling (host side) ----
 	/** Per-extra-party-member max-HP fraction from the server handshake
-	 * (default 0.5 = +50% HP per additional party member). Set via setHpScale();
+	 * (default 0.7 = +70% HP per additional party member). Set via setHpScale();
 	 * the HOST multiplies enemy max/current HP at spawn by
 	 * 1 + _mpHpScale * (partySize - 1). Clamped [0, 10]. */
-	private _mpHpScale = 0.5;
+	private _mpHpScale = 0.7;
+	/** Per-extra-member attack/defense/focus fractions (default 0.1 = +10%). */
+	private _mpAttackScale = 0.1;
+	private _mpDefenseScale = 0.1;
+	private _mpFocusScale = 0.1;
+	/** Per-extra-member elemental-resistance adjustments: FLAT points as a
+	 * fraction (0.1 = +10pt) and a PERCENTAGE boost applied ONLY to positive
+	 * resistance (elemFactor < 1 after the flat boost; weaknesses untouched).
+	 * Both default 0 = no adjustment. Resistance R = 1 - elemFactor; the forward
+	 * adjustment is R' = (R + flat) * (R + flat > 0 ? 1 + pct : 1). */
+	private _mpResistFlat = 0;
+	private _mpResistPercent = 0;
 	// ---- round 19: cutscene compatibility ----
 	/** True while the LOCAL player is inside a story cutscene (sc.model.isCutscene()).
 	 * Maintained by the enterCutscene/enterGame wraps installed in install(). Drives
@@ -253,6 +277,12 @@ export class NetSync {
 	 * (replayCombatFx). The sc.combat.doDramaticEffect wrap's observer skips while this
 	 * is set, so a replay can never re-emit the same event (the emit-loop guard). */
 	private _mpReplayingFx = false;
+	/** 1.71.11 (enemy telegraph sync): set while a member replays a relayed enemy
+	 * telegraph effect (applyEnemyFx). The playAtEntity wrap mutes the effect's
+	 * embedded PLAY_SOUND entries (marking the Effect entity _mpFxMuted so sounds
+	 * scheduled after WAIT steps stay muted) because those sounds already reach
+	 * the member through the observeEffectSound -> enemySound channel. */
+	private _mpFxMuteSpawn = false;
 
 	// ---- ROUND 52: connect-compensation for the physical monster->member hit ----
 	/** Master toggle for the anim-edge connect-compensation. The Branch B (physical
@@ -636,9 +666,19 @@ export class NetSync {
 		// our own copy at the same mapId (vanilla chain, idempotent). Guarded like
 		// onSkillSound so a mixed client/server pair never crashes.
 		if (typeof conn.onPlantBreak === 'function') conn.onPlantBreak((d) => this.applyPlantBreak(d));
+		// ROUND 100 (drop-pickup visibility): a same-instance player obtained an item
+		// drop (monster kill / plant break) — spawn the visual-only drop entity at the
+		// relayed position and let it fly to OUR mirror of that player, so teammates
+		// can see each other's pickups. Guarded like onSkillSound so a mixed
+		// client/server pair never crashes.
+		if (typeof conn.onDropFx === 'function') conn.onDropFx((fx) => this.applyDropFx(fx));
 		// Round 11: a remote player cast a special skill — replay its effect sheet
 		// on their mirror.
 		conn.onSkillFx((player, fx) => this.applySkillFx(player, fx));
+		// Enemy action FX relay (charge telegraphs): replay on the same-uid puppet.
+		if (typeof (conn as any).onEnemyFx === 'function') (conn as any).onEnemyFx((uid: number, fx: any) => this.applyEnemyFx(uid, fx));
+		// 1.71.11: the host's telegraph effect ended — stop our replayed copy.
+		if (typeof (conn as any).onEnemyFxStop === 'function') (conn as any).onEnemyFxStop((uid: number, sheet: string, key: string) => this.applyEnemyFxStop(uid, sheet, key));
 		// Round 19: a client's cutscene-spawned monsters arrived (the server stamps
 		// the stream owner as `from`). Render them as csPuppets on members.
 		conn.onCutsceneEntity((from, data) => this.applyCutsceneEntity(from, data));
@@ -819,6 +859,45 @@ export class NetSync {
 				}
 			} catch (e) { console.warn('[netsync] setPaused wrap failed', e); }
 
+			// ROUND 123: WORLD-INTERACT MENU GATE. The pause suppression above leaves the
+			// world live behind an open menu — a state vanilla can never reach (menu =>
+			// paused, and sc.MapInteract.onPreUpdate's ONLY gate is !ig.game.paused).
+			// With a shop open, pressing E near the NPC re-fires its greeting event ->
+			// OPEN_SHOP re-enters a menu that was never closed: the shop scene's
+			// showMenu pushes the start-button group + hotkey globals AGAIN with no
+			// matching hideMenu/exitMenu cleanup (live log: buttonGroupStack/globals
+			// grow 2/2 -> 3/4 -> 4/6 per open) and the menu click path dies silently
+			// ("点击购买无反应"). Restore the vanilla gate: while substate is MENU or
+			// PAUSE, hide every world-interact entry and drop the focus so no
+			// interactPressed() can fire mid-menu. No-op for vanilla states (paused
+			// already no-ops the original body; RUNNING passes through untouched).
+			try {
+				const mi: any = (sc as any).MapInteract && (sc as any).MapInteract.prototype;
+				if (mi && typeof mi.onPreUpdate === 'function' && !mi._mpMenuGateWrapped) {
+					mi._mpMenuGateWrapped = true;
+					const origMapInteract = mi.onPreUpdate;
+					mi.onPreUpdate = function (this: any) {
+						try {
+							const mdl: any = (sc as any).model;
+							const menuLike = !!(mdl
+								&& ((typeof mdl.isMenu === 'function' && mdl.isMenu())
+									|| (typeof mdl.isPaused === 'function' && mdl.isPaused())));
+							if (menuLike) {
+								this.focusEntry = null;
+								const st: any = (sc as any).INTERACT_ENTRY_STATE;
+								if (st && this.entries) {
+									for (let q = 0; q < this.entries.length; q++) {
+										try { this.entries[q].setState(st.HIDDEN); } catch (_) { /* ignore */ }
+									}
+								}
+								return;
+							}
+						} catch (_) { /* fall through to native */ }
+						return origMapInteract.apply(this, arguments as any);
+					};
+				}
+			} catch (e) { console.warn('[netsync] mapInteract menu gate failed', e); }
+
 			try {
 				// Round 11 skill-FX sync: wrap the EffectSheet spawn choke points. Skill
 				// visuals are SHOW_EFFECT action steps -> EffectHandle -> sheet.spawnOnTarget/
@@ -862,28 +941,176 @@ export class NetSync {
 						// neutral/heat/... keys, which that path spawns natively on the mirror) —
 						// whitelisting the sheet here too would play the mode sound twice.
 					};
+					/* 1.71.11 (enemy telegraph sync): the RED-GLOW "about to unleash a heavy
+					 * attack" warnings are enemy-action SHOW_EFFECT steps on sheets that were
+					 * never whitelisted, so only the HOST saw them — members got hit by
+					 * attacks that flashed red on the host's screen with no warning on theirs
+					 * (buffalo 'enemy/angry2', goat/snowman charge glows 'charge/light', ...).
+					 * Only the meerkat's VULNERABLE-window blink was covered (annotation path).
+					 * Relay these host->member through the existing enemyFx channel:
+					 *  - ENEMY_TELEGRAPH_SHEETS: whole sheets whose keys are ALL glow/state
+					 *    telegraphs (the classic red BLINK_COLOR flashes live on 'enemy',
+					 *    'charge' and 'weak'; color_fade/color_blink are colorized flashes).
+					 *  - ENEMY_TELEGRAPH_KEYS: individual red-blink keys on mixed-use sheets
+					 *    (the per-area enemies.* sheets carry hundreds of unrelated battle
+					 *    effects — relaying whole sheets would flood members, so only their
+					 *    red telegraph keys are relayed). Verified against game data: every
+					 *    key below is a BLINK_COLOR/FLASH_COLOR red glow actually referenced
+					 *    by an enemy's SHOW_EFFECT step.
+					 * Keys with an embedded PLAY_SOUND are included as well — the member
+					 * replays the effect MUTED (see _mpFxMuted in the playAtEntity wrap)
+					 * because that sound already arrives via observeEffectSound ->
+					 * enemySound; replaying it inside the effect too would double it. */
+					const ENEMY_TELEGRAPH_SHEETS: { [path: string]: boolean } = {
+						'enemy': true, 'weak': true, 'charge': true,
+						'color_fade': true, 'color_blink': true,
+					};
+					const ENEMY_TELEGRAPH_KEYS: { [sheetAndKey: string]: boolean } = {
+						'combat/flashShort': true,
+						'enemies.designer/preRecover': true,
+						'enemies.heat-dng/dashBlinkHeat': true, 'enemies.heat-dng/heatGolemCoalLand': true,
+						'enemies.heat-dng/heatGolemCoalAppear': true, 'enemies.heat-dng/mothCharge': true,
+						'enemies.meerkat-car/chargeSpecial': true, 'enemies.meerkat-car/chargeSpecialPre': true,
+						'enemies.meerkat-car/chargeSpecialFast': true,
+						'enemies.arid/shredHeatCharge': true, 'enemies.arid/shredHeatChargeBig': true,
+						'enemies.arid/shredHeatTrail': true, 'enemies.arid/virusHeatCharge': true,
+						'enemies.arid/virusHeatDash': true, 'enemies.arid/virusHeatWeak': true,
+						'enemies.arid/virusDischarge': true,
+						'enemies.jungle/notChickenConfused': true, 'enemies.jungle/chickenConfused': true,
+						'enemies.jungle/apeWaveTrailMeleeClone': true, 'enemies.jungle/apeDummyAuraMelee': true,
+						'enemies.elephant/eyeHeatCharge': true, 'enemies.elephant/eyeHeatShoot': true,
+						'enemies.elephant/eyeWeak': true,
+						'enemies.goat-father/heatCharge': true, 'enemies.goat-father/heatMegaCharge': true,
+						'enemies.goat-father/heatDash': true,
+						'enemies.glitch-boss/eyeAura': true,
+						'enemies.antlion/steamed': true, 'enemies.antlion/fireStoneGround': true,
+						'enemies.hedgehag-fly/bombTrail': true, 'enemies.hedgehag-fly/heatReady': true,
+						'enemies.hedgehag-fly/dustLand': true, 'enemies.hedgehag-fly/heatBoom': true,
+						'enemies.hedgehag-fly/weakEndCharge': true,
+						'enemies.peng/notesAngry': true,
+						'enemies.raid-boss/coreDestroyed': true, 'enemies.raid-boss/fortressDamage': true,
+						'enemies.sandshark/weak': true,
+						'enemies.beach/fishAngry': true, 'enemies.ele-pillars/weak': true,
+						'enemies.gods/godVulnerable': true, 'enemies.gods/neutralRegenBlink': true,
+						'enemies.scorpion-robo/clawHeatCharge': true, 'enemies.colibri/shockBreak': true,
+						'enemies.fish-gear/hitTorso': true,
+					};
+					const isEnemyTelegraph = (sheet: string, key: string): boolean =>
+						!!(ENEMY_TELEGRAPH_SHEETS[sheet] || ENEMY_TELEGRAPH_KEYS[sheet + '/' + key]);
 					const origSpawnOnTarget = ES.prototype.spawnOnTarget;
 					ES.prototype.spawnOnTarget = function (a: string, b: any, c: any) {
+						let markUid = 0;
 						try {
 							const m = (window as any).__mpMain;
-							if (m && m.netSync && SKILL_SHEETS[this.path] && b && ig.game && b === ig.game.playerEntity) {
-								m.netSync.broadcastSkillFx(this.path, a, null, c);
+							const telegraph = isEnemyTelegraph(this.path, a);
+							if (m && m.netSync && (SKILL_SHEETS[this.path] || telegraph) && b && ig.game) {
+								if (SKILL_SHEETS[this.path] && b === ig.game.playerEntity) {
+									m.netSync.broadcastSkillFx(this.path, a, null, c);
+								} else if ((SKILL_SHEETS[this.path] || telegraph) && m.host && b instanceof (ig as any).ENTITY.Enemy && !b._mpPuppet && !b._mpMirror) {
+									// Enemy action FX (SHOW_EFFECT telegraphs — the buffalo's
+									// red 'angry2' flash, charge glows, the snowman's
+									// coldMegaCharge windup on specials.cold, ...) run ONLY on
+									// the host — relay the sheet/key so members replay the
+									// telegraph on the same-uid puppet. Puppets/mirrors never
+									// run actions, so this cannot echo back from a receiver.
+									m.netSync.broadcastEnemyFx(this.path, a, b, null, c);
+									markUid = (typeof b.uid === 'number') ? b.uid : 0;
+								}
 							}
 						} catch (_) { /* never break the local effect */ }
-						return origSpawnOnTarget.call(this, a, b, c);
+						const h = origSpawnOnTarget.call(this, a, b, c);
+						// 1.71.11: mark the HOST's relayed telegraph handle so the
+						// Effect.stop wrap below relays its end (action end /
+						// CLEAR_EFFECTS) — looping glows never stop on their own.
+						if (markUid > 0 && h) {
+							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; } catch (_) { /* ignore */ }
+							if ((window as any)._mpFxDiag) console.log('[mpfx] HOST spawn marked uid=' + markUid + ' ' + this.path + '/' + a);
+						}
+						return h;
 					};
 					const origSpawnFixed = ES.prototype.spawnFixed;
 					ES.prototype.spawnFixed = function (a: string, x: number, y: number, z: number, i: any, j: any) {
+						let markUid = 0;
 						try {
 							const m = (window as any).__mpMain;
-							if (m && m.netSync && SKILL_SHEETS[this.path] && i && ig.game && i === ig.game.playerEntity) {
-								m.netSync.broadcastSkillFx(this.path, a, { x, y, z }, j);
+							const telegraph = isEnemyTelegraph(this.path, a);
+							if (m && m.netSync && (SKILL_SHEETS[this.path] || telegraph) && i && ig.game) {
+								if (SKILL_SHEETS[this.path] && i === ig.game.playerEntity) {
+									m.netSync.broadcastSkillFx(this.path, a, { x, y, z }, j);
+								} else if ((SKILL_SHEETS[this.path] || telegraph) && m.host && i instanceof (ig as any).ENTITY.Enemy && !i._mpPuppet && !i._mpMirror) {
+									m.netSync.broadcastEnemyFx(this.path, a, i, { x, y, z }, j);
+									markUid = (typeof i.uid === 'number') ? i.uid : 0;
+								}
 							}
 						} catch (_) { /* never break the local effect */ }
-						return origSpawnFixed.call(this, a, x, y, z, i, j);
+						const h = origSpawnFixed.call(this, a, x, y, z, i, j);
+						if (markUid > 0 && h) {
+							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; } catch (_) { /* ignore */ }
+							if ((window as any)._mpFxDiag) console.log('[mpfx] HOST spawn marked uid=' + markUid + ' ' + this.path + '/' + a);
+						}
+						return h;
 					};
 				}
 			} catch (e) { console.warn('[netsync] EffectSheet wrap failed', e); }
+			try {
+				// 1.71.11: relay the END of a host-side relayed telegraph effect. Every
+				// engine stop path funnels through Effect.stop() — action end
+				// (onActionEndDetach), CLEAR_EFFECTS (onEntityKillDetach) and manual
+				// stops — so one wrap covers them all. Only handles marked at relay
+				// time carry _mpTelegraphUid (member replays never do), so this can
+				// never echo back from a receiver. stop() is idempotent in the engine;
+				// the relay fires once via _mpTelegraphStopRelayed.
+				const EFF: any = (ig as any).ENTITY && (ig as any).ENTITY.Effect;
+				if (EFF && EFF.prototype && typeof EFF.prototype.stop === 'function' && !EFF.prototype._mpTelegraphStopWrapped) {
+					EFF.prototype._mpTelegraphStopWrapped = true;
+					const origFxStop = EFF.prototype.stop;
+					EFF.prototype.stop = function (this: any) {
+						try {
+							const u = this._mpTelegraphUid;
+							if (u && !this._mpTelegraphStopRelayed) {
+								this._mpTelegraphStopRelayed = true;
+								const m = (window as any).__mpMain;
+								if ((window as any)._mpFxDiag) console.log('[mpfx] HOST stop relay uid=' + u + ' ' + this._mpTelegraphSheet + '/' + this._mpTelegraphKey);
+								if (m && m.netSync && m.host) {
+									m.netSync.broadcastEnemyFxStop(u, this._mpTelegraphSheet || '', this._mpTelegraphKey || '');
+								}
+							}
+						} catch (_) { /* never break the engine stop */ }
+						return origFxStop.apply(this, arguments as any);
+					};
+				}
+			} catch (e) { console.warn('[netsync] Effect stop wrap failed', e); }
+			try {
+				// Elemental status on mirrors/puppets is SYNC-DRIVEN (applySyncedStatus
+				// replays the owner's / the host's authoritative [charge, active]). The
+				// native paths must not run on them:
+				//   inflict — the engine inflicts husk-stat charge on a mirror whenever a
+				//     host enemy's hit connects (and on a puppet whenever a member's local
+				//     hit connects). That double-fills the bar against the synced truth.
+				//   update  — the per-frame decay/countdown would tick a synced status
+				//     locally, and ACTIVE ticks are dangerous: burn's instantDamage chips
+				//     the puppet's local HP and jolt's zap runs a full onDamage on the
+				//     mirror (a phantom self-hit). Sync delivers the clear instead.
+				const CSB: any = (sc as any).CombatStatusBase;
+				if (CSB && CSB.prototype && !CSB.prototype._mpStatusWrapped) {
+					CSB.prototype._mpStatusWrapped = true;
+					const origInflict = CSB.prototype.inflict;
+					CSB.prototype.inflict = function (b: any, a: any, d: any) {
+						try {
+							const ent: any = a && a.combatant;
+							if (ent && (ent._mpMirror || ent._mpPuppet)) return;
+						} catch (_) { /* fall through to native */ }
+						return origInflict.call(this, b, a, d);
+					};
+					const origStatusUpdate = CSB.prototype.update;
+					CSB.prototype.update = function (b: any, a: any, d: any) {
+						try {
+							if (b && (b._mpMirror || b._mpPuppet)) return;
+						} catch (_) { /* fall through to native */ }
+						return origStatusUpdate.call(this, b, a, d);
+					};
+				}
+			} catch (e) { console.warn('[netsync] CombatStatusBase wrap failed', e); }
 			try {
 				// Resolve the CURRENT NetSync via the live main (not the install-time
 				// closure) so a reconnect's fresh instance is honoured.
@@ -1236,6 +1463,20 @@ export class NetSync {
 						sh.playAtEntity = function (a: any, b: any, c: any, d: any, f: any, g: any) {
 							try {
 								const ns = cur();
+								// 1.71.11: a member's replayed enemy-telegraph effect runs MUTED —
+								// its embedded PLAY_SOUND steps already arrive via the
+								// observeEffectSound -> enemySound channel; playing them natively
+								// here too would double every telegraph sound. The flag sticks to
+								// the Effect entity (_mpFxMuted) so sounds scheduled after WAIT
+								// steps — outside this synchronous spawn window — stay muted too.
+								if (ns && b) {
+									const fxMute = b._mpFxMuted
+										|| (ns._mpFxMuteSpawn && (ig as any).ENTITY && (ig as any).ENTITY.Effect && b instanceof (ig as any).ENTITY.Effect);
+									if (fxMute) {
+										try { b._mpFxMuted = true; } catch (_) { /* ignore */ }
+										return { stop: function () { }, onEntityKillDetach: function () { } };
+									}
+								}
 								if (ns) {
 									// ROUND 40 (diag): raw visibility into EVERY playAtEntity call
 									// so we can see exactly what fires during the item-2/3/5 repro.
@@ -2114,6 +2355,32 @@ export class NetSync {
 				}
 			} catch (e) { console.warn('[netsync] ItemDestruct destroy wrap failed', e); }
 
+		// ROUND 100 (drop-pickup visibility): wrap the engine's item-drop fan-out
+		// (sc.ItemDropEntity.spawnDrops — game.compiled.js). It is the ONE spawn
+		// point for every flying item drop: monster loot (EnemyType.resolveItemDrops,
+		// ITEM_DROP_TYPE.ENEMY), plant/destructible loot (ItemDestruct, .PROP), event
+		// drops (.EVENT_PROP) and chests (.CHEST). When a drop fans out toward OUR
+		// player, relay it so every other same-instance client replays the fall +
+		// fly-to-player animation on their mirror of us (observeLocalItemDrop gates
+		// to ENEMY/PROP and target===playerEntity — event/chest drops stay local).
+		// Receiver-side replays spawn via ig.game.spawnEntity directly (never via
+		// spawnDrops) and target the MIRROR, so this wrap can never re-emit them.
+		try {
+			const ID: any = (sc as any).ItemDropEntity;
+			if (ID && typeof ID.spawnDrops === 'function' && !ID._mpSpawnDropsWrapped) {
+				ID._mpSpawnDropsWrapped = true;
+				const origSpawnDrops = ID.spawnDrops;
+				ID.spawnDrops = function (entity: any, align: any, target: any, item: any, amount: any, dropType: any) {
+					const r = origSpawnDrops.apply(this, arguments as any);
+					try {
+						const m = (window as any).__mpMain;
+						if (m && m.netSync) m.netSync.observeLocalItemDrop(entity, target, item, amount, dropType);
+					} catch (_) { /* never break a drop */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[netsync] ItemDropEntity spawnDrops wrap failed', e); }
+
 			// ROUND 19 (Part 3, step 1): flag cutscene-spawned monsters. Story sequences
 			// spawn enemies via ig.Game.spawnEntity with mapId 0 and settings WITHOUT
 			// skipHook (every mod spawn passes skipHook — mirrors, typed puppets, promote-
@@ -2766,6 +3033,11 @@ export class NetSync {
 				if (typeof a === 'number' && a > 0) atk = a;
 			}
 		} catch (_) { /* ignore */ }
+		// PvP status: the engine already computed the FINAL inflict amount vs the
+		// mirror (dmg.status) using the attacker's real attackInfo — ship it as a
+		// pre-computed value (stb<0 marks 'final, apply directly') since the raw
+		// attackInfo isn't available on this path.
+		const preStatus = (dmg.element > 0 && typeof dmg.status === 'number' && dmg.status > 0) ? dmg.status : 0;
 		this.main.connection.combatHit({
 			player: mirror.name,
 			damage: dmg.damage,
@@ -2773,6 +3045,7 @@ export class NetSync {
 			critical: !!dmg.critical,
 			ax, ay,
 			attack: atk,
+			stb: preStatus > 0 ? -preStatus : undefined,
 		});
 	}
 
@@ -2866,6 +3139,23 @@ export class NetSync {
 		let el = 0;
 		let crit = false;
 		let chipF = -1;
+		// Elemental STATUS buildup ingredients — shipped on the verdict so the member
+		// re-runs the engine's inflict formula against their REAL stats (their own
+		// statusInflict/elemFactor/COND_GUARD_*). stb = the attack's statusInflict
+		// (attackInfo.status — snowball: 2.5), bdf = the damage-ceiling-adjusted
+		// damageFactor (du.baseOffensiveFactor), afc = the attacker's focus.
+		let stb = 0; let bdf = 1; let afc = 0;
+		try {
+			if (hitProps && typeof hitProps.statusInflict === 'number' && hitProps.statusInflict > 0) stb = hitProps.statusInflict;
+			if (du && typeof du.baseOffensiveFactor === 'number' && du.baseOffensiveFactor > 0) bdf = du.baseOffensiveFactor;
+			else if (hitProps && typeof hitProps.damageFactor === 'number' && hitProps.damageFactor > 0) bdf = hitProps.damageFactor;
+			const fsrc: any = (attacker && attacker.params && typeof attacker.params.getStat === 'function')
+				? attacker.params : (hitProps && hitProps.attackerParams);
+			if (fsrc && typeof fsrc.getStat === 'function') {
+				const f = fsrc.getStat('focus');
+				if (typeof f === 'number' && f > 0) afc = f;
+			}
+		} catch (_) { /* status fields are optional */ }
 		try {
 			// Attack stat for the formula: prefer the live attacker stat, else the hit's
 			// attackerParams (the engine stashes the ATTACKER's params on the DamageInfo).
@@ -2904,7 +3194,12 @@ export class NetSync {
 			//  1) guardable/strength gate (sc.GUARDABLE: AUTO=0 NEVER=1 FROM_ABOVE=2
 			//     ALWAYS=3): unblockable attacks ignore guard; FROM_ABOVE attacks need
 			//     the top-guard skill (GUARD_AREA >= 2 -> SHIELD_STRENGTH.BLOCK_ABOVE);
-			//     BREAK-type attacks beat the player shield's hitResist (MASSIVE=4).
+			//     attacks whose TYPE beats the player guard shield's hitResist pierce
+			//     guard entirely. The vanilla player guard is ADD_PLAYER_SHIELD with
+			//     hitResist "HEAVY" (=3) — so MASSIVE (4) and BREAK (5) attacks (e.g.
+			//     the buffalo's TACKLE) can NEVER be guarded. (The old check used
+			//     CombatShield's CLASS default hitResist MASSIVE=4 and wrongly let
+			//     members block MASSIVE attacks.)
 			//     GUARDABLE.ALWAYS skips all three, exactly like the engine.
 			//  2) direction gate: the victim must FACE the attacker within a frontal arc
 			//     of (range * 180°); range is 0.5 normally and 1 with the omnidirectional
@@ -2922,7 +3217,7 @@ export class NetSync {
 				if (guardable !== 3 /* GUARDABLE.ALWAYS */) {
 					if (guardable === 1 /* GUARDABLE.NEVER */) guardHolds = false;
 					else if (guardable === 2 /* GUARDABLE.FROM_ABOVE */ && !guardAbove) guardHolds = false;
-					else if (hitType > 4 /* player shield hitResist = ATTACK_TYPE.MASSIVE */) guardHolds = false;
+					else if (hitType > 3 /* player guard shield hitResist = ATTACK_TYPE.HEAVY (ADD_PLAYER_SHIELD) */) guardHolds = false;
 				}
 			}
 			if (guardHolds && guardRange < 1) {
@@ -3244,6 +3539,12 @@ export class NetSync {
 			// ROUND 78: guard-bar drain (engine's ratio^1.5 value, NOT the HP chip) and
 			// the full unguarded hit for the bar-break case (see the regular branch).
 			shieldDmg, full: fullForBreak,
+			// Elemental status buildup (chill etc.): the member's client recomputes the
+			// inflict amount against their real stats and fills their OWN status bar —
+			// previously only the host's mirror husk accumulated anything.
+			stb: (el > 0 && stb > 0) ? stb : undefined,
+			bdf: (el > 0 && stb > 0) ? bdf : undefined,
+			afc: (el > 0 && stb > 0) ? afc : undefined,
 		});
 	}
 
@@ -3665,10 +3966,39 @@ export class NetSync {
 				if (typeof style.def === 'number' && isFinite(style.def) && style.def > 0 && style.def <= 10) def = style.def;
 			}
 		} catch (_) { /* defaults */ }
+		// Elemental STATUS buildup for the host's real enemy: ship the ATTACKER-side
+		// portion of the engine's inflict formula (getDamage), computed with OUR real
+		// stats — the host's fabricated AttackInfo has no `status` and its husk-params
+		// focus would skew the ratio, so the host only multiplies the defender factors:
+		//   stb = damageFactor * attackInfo.statusInflict * focusFactor(ourFocus/puppetFocus)
+		//         * (1 + COND_EFFECT_<elem> + COND_EFFECT_ALL)
+		let stb = 0;
+		try {
+			const c3: any = attackInfo;
+			if (c3 && attackElement > 0 && typeof c3.statusInflict === 'number' && c3.statusInflict > 0) {
+				const ap: any = c3.attackerParams;
+				if (ap && typeof ap.getStat === 'function' && entity.params && typeof entity.params.getStat === 'function') {
+					const myFc = Math.max(1, Number(ap.getStat('focus')) || 1);
+					const dfFc = Math.max(1, Number(entity.params.getStat('focus')) || 1);
+					const ratio = myFc / dfFc;
+					const tt = (Math.pow(1 + Math.abs(ratio - 1) * 3, 0.25) - 1) * 1.5;
+					const pf = ratio >= 1 ? 1 + tt : Math.max(0, 1 - tt);
+					let offF = 1;
+					if (typeof ap.getModifier === 'function') {
+						const EL = ['', 'HEAT', 'COLD', 'SHOCK', 'WAVE'];
+						offF = 1 + (Number(ap.getModifier('COND_EFFECT_' + EL[attackElement])) || 0)
+							+ (Number(ap.getModifier('COND_EFFECT_ALL')) || 0);
+					}
+					const df2 = (typeof c3.damageFactor === 'number' && c3.damageFactor > 0) ? c3.damageFactor : 1;
+					stb = Math.round(df2 * c3.statusInflict * pf * offF * 1000) / 1000;
+				}
+			}
+		} catch (_) { stb = 0; }
 		this.main.connection.enemyDamage({
 			uid, damage, attacker: this.main.name,
 			type, ball: isBall, charged, knockback, attackElement, critical,
 			shield, weak, off, def,
+			stb: stb > 0 ? stb : undefined,
 		});
 		// Instant local aggro: don't wait the ~66ms for the host's tg=1 block — the hit
 		// itself guarantees the host will aggro this enemy (applyEnemyDamage sets the
@@ -3903,7 +4233,7 @@ export class NetSync {
 	 * back to the member via combatHit). This is "member attacks -> host enters
 	 * combat -> monsters attack member" in one packet.
 	 */
-	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
+	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number }): void {
 		if (!this.main.host) return;                 // only the host owns real enemies
 		try {
 			const list = ig.game.entities;
@@ -4176,6 +4506,34 @@ export class NetSync {
 						} finally {
 							if (ovrSet) { try { (this as any)._mpHitNumPosOverride = null; } catch (_) { /* ignore */ } }
 						}
+						// Elemental STATUS buildup: the fabricated AttackInfo carries no
+						// `status`, so the native chain never inflicts for a member's hit.
+						// Apply the member-computed attacker-side portion (hit.stb) folded
+						// with the REAL enemy's defender factors — the engine's own
+						// getInflictValue finishes the formula (COND_GUARD + /12 + the
+						// active/PERFECT zero gates), then inflict fills the status bar.
+						// The enemy stream's new st field broadcasts the result to every
+						// member's puppet.
+						if (applied && typeof hit.stb === 'number' && hit.stb > 0 && atkEl > 0 && hit.shield !== 2 /* PERFECT blocks status */) {
+							try {
+								const tp: any = target.params;
+								const sj = atkEl - 1;
+								const sts: any = tp && tp.statusStates && tp.statusStates[sj];
+								if (sts && typeof sts.inflict === 'function' && !tp.isDefeated()) {
+									const siArr = tp.getStat('statusInflict');
+									const siV = Array.isArray(siArr) ? (Number(siArr[sj]) || 0) : 1;
+									const tsiV = Array.isArray(tp.tmpStatusInflict) ? (Number(tp.tmpStatusInflict[sj]) || 0) : 1;
+									const efArr = tp.getStat('elemFactor');
+									const efV = Array.isArray(efArr) ? (Number(efArr[sj]) || 1) : 1;
+									const tefV = Array.isArray(tp.tmpElemFactor) ? (Number(tp.tmpElemFactor[sj]) || 1) : 1;
+									let sm = hit.stb * siV * tsiV * efV * tefV;
+									if (typeof sts.getInflictValue === 'function') {
+										sm = sts.getInflictValue(sm, tp, info, hit.shield || 0);
+									}
+									if (sm > 0) sts.inflict(sm, tp, info);
+								}
+							} catch (_) { /* status must never break the apply */ }
+						}
 						// ROUND 60 (diagnostics): did the engine chain ACCEPT the forwarded hit, and
 						// did the forced-damage branch (C) actually fire? `forced` is true when the
 						// mirror's _mpForcedDamage was still set at the moment damage() returned — i.e.
@@ -4416,15 +4774,34 @@ export class NetSync {
 		try {
 			if (this._mpReplayingFx) return;
 			const scAny: any = sc as any;
-			if (kind !== scAny.DRAMATIC_EFFECT.GUARD_COUNTER
-				&& kind !== scAny.DRAMATIC_EFFECT.GUARD_BREAK) return;
+			const DE = scAny.DRAMATIC_EFFECT;
+			if (!kind || !DE) return;
+			const isCounter = kind === DE.GUARD_COUNTER;
+			const isGuardBreak = kind === DE.GUARD_BREAK;
+			// 1.71.11: ENEMY break dramatic effects (meerkat reaction break etc.) carry
+			// break:true on their DRAMATIC_EFFECT variant (BREAK / BREAK_LIGHT /
+			// BREAK_BIG / ...). Relay the exact variant the host ACTUALLY played —
+			// script-driven stuns (buffalo wall-crash WALL_HIT has no dramaticEffect)
+			// never reach this choke point, so members no longer invent a phantom
+			// "BREAK!" caption the host never showed.
+			const isEnemyBreak = !isCounter && !isGuardBreak && (kind as any).break === true;
+			if (!isCounter && !isGuardBreak && !isEnemyBreak) return;
 			if (!target || typeof target.uid !== 'number' || !(target.uid > 0) || target._mpMirror) return;
 			// the local player's own guard-break is native on every screen that matters
 			// and its uid matches no shared enemy/puppet — skip the stray relay.
 			if (target === (ig as any).game.playerEntity) return;
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
-			const fxKind = kind === scAny.DRAMATIC_EFFECT.GUARD_COUNTER ? 'counter' : 'break';
+			let fxKind: string;
+			if (isCounter) fxKind = 'counter';
+			else if (isGuardBreak) fxKind = 'break';
+			else {
+				// Resolve the variant's enum NAME by identity so the receiver replays
+				// the exact same presentation (label / zoom / speedlines).
+				let nm = '';
+				for (const k in DE) { if (DE[k] === kind) { nm = k; break; } }
+				fxKind = 'ebreak:' + (nm || 'BREAK');
+			}
 			conn.emitCombatFx(target.uid, fxKind);
 		} catch (_) { /* a failed FX relay must never break the frame */ }
 	}
@@ -4440,7 +4817,8 @@ export class NetSync {
 	 * is try/catch'd so a failed replay never breaks the frame. */
 	private replayCombatFx(uid: number, kind: string): void {
 		try {
-			if (kind !== 'counter' && kind !== 'break') return;
+			const isEBreak = typeof kind === 'string' && kind.indexOf('ebreak:') === 0;
+			if (kind !== 'counter' && kind !== 'break' && !isEBreak) return;
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
 			if (this.inCutscene) return;
@@ -4466,6 +4844,14 @@ export class NetSync {
 			try {
 				if (kind === 'counter') {
 					scAny.combat.doDramaticEffect(ent, ent, scAny.DRAMATIC_EFFECT.GUARD_COUNTER, true);
+				} else if (isEBreak) {
+					// 1.71.11: replay the exact enemy break variant the HOST played
+					// (resolved by enum name; falls back to plain BREAK). Only fires
+					// when the host really ran doDramaticEffect — no phantom captions
+					// for script-driven stuns (buffalo wall crash).
+					const nm = kind.slice('ebreak:'.length);
+					const variant = scAny.DRAMATIC_EFFECT[nm] || scAny.DRAMATIC_EFFECT.BREAK;
+					if (variant) scAny.combat.doDramaticEffect(ent, ent, variant, true);
 				} else {
 					// Guard-break extra visual: the broken-guard FX (normally spawned inside
 					// the player's damageShield — sc.combat.effects.guard.spawnOnTarget). Its
@@ -4556,7 +4942,61 @@ export class NetSync {
 	 * unchanged (no `monster` flag): the member still cannot detect another player's hits
 	 * locally, so those keep the old verbatim-apply + knockback path.
 	 */
-	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number }): void {
+	/** Elemental STATUS buildup on the LOCAL player from a forwarded verdict.
+	 * Re-runs the engine's own inflict formula (game.compiled.js CombatParams.getDamage)
+	 * against OUR real stats — the host's verdict only carried the HP number before,
+	 * so a snowman's chill filled the HOST's mirror husk while the victim's own status
+	 * bar never moved and the debuff never applied.
+	 *
+	 *   m = bdf * stb * focusFactor(attackerFocus/ourFocus)
+	 *       * ourStatusInflict[j] * tmpStatusInflict[j] * (ourElemFactor[j] * tmpElemFactor[j])
+	 *   m = statusStates[j].getInflictValue(m, params, info, shieldResult)  // COND_GUARD + /12
+	 *   statusStates[j].inflict(m, params, info)                            // charge += m; >=1 -> activate
+	 *
+	 * (engine constants a=0.25, d=1.5, c=3 in the focus factor). stb < 0 marks a
+	 * PRE-COMPUTED final amount (the PvP path, which has no attackInfo) — apply it
+	 * verbatim. */
+	private inflictStatusOnLocalPlayer(element: number, stb: number, bdf: number, afc: number, shieldResult: number): void {
+		try {
+			const p: any = ig.game && ig.game.playerEntity;
+			if (!p || !p.params || p._killed) return;
+			const params: any = p.params;
+			const j = element - 1;
+			if (j < 0 || j > 3) return;
+			const st: any = params.statusStates && params.statusStates[j];
+			if (!st || typeof st.inflict !== 'function') return;
+			let m: number;
+			if (stb < 0) {
+				m = -stb; // PvP: host already ran the full formula
+				if (st.active) return; // getInflictValue's active gate, mirrored for the pre-computed path
+			} else {
+				const myFocus = Math.max(1, Number(params.getStat && params.getStat('focus')) || 1);
+				const af = (typeof afc === 'number' && afc > 0) ? afc : myFocus;
+				const ratio = af / myFocus;
+				const t = (Math.pow(1 + Math.abs(ratio - 1) * 3, 0.25) - 1) * 1.5;
+				const pf = ratio >= 1 ? 1 + t : Math.max(0, 1 - t);
+				const df = (typeof bdf === 'number' && bdf > 0) ? bdf : 1;
+				const siArr = params.getStat ? params.getStat('statusInflict') : null;
+				const si = Array.isArray(siArr) ? (Number(siArr[j]) || 0) : 1;
+				const tsi = Array.isArray(params.tmpStatusInflict) ? (Number(params.tmpStatusInflict[j]) || 0) : 1;
+				const efArr = params.getStat ? params.getStat('elemFactor') : null;
+				const ef = Array.isArray(efArr) ? (Number(efArr[j]) || 1) : 1;
+				const tef = Array.isArray(params.tmpElemFactor) ? (Number(params.tmpElemFactor[j]) || 1) : 1;
+				m = df * stb * pf * si * tsi * ef * tef;
+			}
+			if (!(m > 0)) return;
+			// The engine's per-status scaling (COND_GUARD_* defense, /12 divisor, the
+			// active/PERFECT zero gates). Enemies carry no COND_EFFECT_* gear modifiers,
+			// so a zero-stub attackerParams is exact for monster hits.
+			const fakeInfo: any = { element, attackerParams: { getModifier: () => 0 } };
+			if (typeof st.getInflictValue === 'function') {
+				m = st.getInflictValue(m, params, fakeInfo, shieldResult);
+			}
+			if (m > 0) st.inflict(m, params, fakeInfo);
+		} catch (_) { /* status must never break the hit */ }
+	}
+
+	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void {
 		try {
 			const D = (t: string, ...a: any[]) => { try { this._sfxLog('ch.' + t, ...a); } catch (_) { /* ignore */ } };
 			// ROUND 38: the attacker's REAL attack-type (sc.ATTACK_TYPE) rides on the packet
@@ -4717,6 +5157,11 @@ export class NetSync {
 					// fall through: the unguarded branch applies the full hit + knockback
 				} else {
 					p.params.reduceHp(dmg);
+					// Vanilla: a REGULAR-guarded hit still inflicts status (only PERFECT
+					// zeroes it — getInflictValue). The chill builds through the shield.
+					if (typeof hit.stb === 'number' && hit.stb !== 0 && (hit.element || 0) > 0) {
+						this.inflictStatusOnLocalPlayer(hit.element || 0, hit.stb, hit.bdf || 1, hit.afc || 0, 1 /* SHIELD_RESULT.REGULAR */);
+					}
 					try { if ((sc as any).model && (sc as any).model.setCombatMode) (sc as any).model.setCombatMode(true); } catch (_) { /* ignore */ }
 					p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
 					try {
@@ -4738,6 +5183,11 @@ export class NetSync {
 			// UNGUARDED hit (monster no-guard, or PvP): apply damage + knockback + flinch.
 			D('apply', 'dmg=' + dmg, 'knockback=' + (doKnockback ? 1 : 0));
 			p.params.reduceHp(dmg);
+			// Elemental status buildup with OUR real stats (the chill from the
+			// snowman's snowballs) — the bar fills and the debuff actually lands.
+			if (typeof hit.stb === 'number' && hit.stb !== 0 && (hit.element || 0) > 0) {
+				this.inflictStatusOnLocalPlayer(hit.element || 0, hit.stb, hit.bdf || 1, hit.afc || 0, 0 /* SHIELD_RESULT.NONE */);
+			}
 			// Enter combat mode (battle BGM / combat UI) — the hit came from a host enemy,
 			// which never targets the LOCAL playerEntity, so the engine's own
 			// _addTargetedBy->updateCombatMode never fires on a member. Nudge it here.
@@ -4840,6 +5290,10 @@ export class NetSync {
 					let n = m.min || 1;
 					if (m.max) n += Math.floor((m.max + 1 - n) * Math.random());
 					pm.addItem(Number(m.item), n, false, false);
+					// ROUND 100 (drop-pickup visibility): our roll is a silent addItem —
+					// relay it so teammates see the drop fall where the enemy died and
+					// fly to OUR mirror (the host's own drops ride the spawnDrops wrap).
+					this.emitMemberLootDropFx(loot.uid, Number(m.item), n);
 				} catch (_) { /* skip this drop entry on any failure */ }
 			}
 		} catch (_) { /* never let a loot packet crash the frame */ }
@@ -5210,6 +5664,195 @@ export class NetSync {
 			plant.enemyInfo = savedEnemyInfo;
 			plant.enemyChance = savedEnemyChance;
 		} catch (_) { /* never break the frame */ }
+	}
+
+	// ---- ROUND 100 (drop-pickup visibility) ----
+	/** LOCAL-side observer (the sc.ItemDropEntity.spawnDrops wrap): the engine just
+	 * fanned out item drops from `source` toward `target`. Only MONSTER (ENEMY)
+	 * and PLANT/destructible (PROP) drops that fly to OUR OWN player are relayed —
+	 * event/chest drops stay local (they have their own sync paths), and a drop
+	 * flying to anything but the local player is never ours to report. The relay is
+	 * cosmetic: receivers spawn a visual-only ItemDrop that falls at the source
+	 * position and then flies to OUR mirror on their screen; the item grant itself
+	 * stays fully local (the native chain, or applyLoot for member-side kills). */
+	public observeLocalItemDrop(source: any, target: any, item: any, amount: any, dropType: any): void {
+		try {
+			const scAny: any = sc as any;
+			if (!scAny.ITEM_DROP_TYPE) return;
+			const dt = dropType || scAny.ITEM_DROP_TYPE.ENEMY;   // spawnDrops defaults to ENEMY
+			if (dt !== scAny.ITEM_DROP_TYPE.ENEMY && dt !== scAny.ITEM_DROP_TYPE.PROP) return;
+			const me: any = (ig as any).game && (ig as any).game.playerEntity;
+			if (!me || target !== me) return;                    // only drops flying to OUR player
+			const id = Number(item);
+			if (!isFinite(id) || id < 0) return;
+			const n = Math.max(1, Math.min(24, Math.round(Number(amount) || 1)));
+			if (!source || !source.coll) return;
+			// The engine fans out from source.getAlignedPos(CENTER) — relay that point.
+			let x = 0, y = 0, z = 0;
+			try {
+				const p = source.getAlignedPos((ig as any).ENTITY_ALIGN.CENTER);
+				x = p.x; y = p.y; z = p.z;
+			} catch (_) {
+				const c = source.coll;
+				x = c.pos.x + c.size.x / 2; y = c.pos.y + c.size.y / 2; z = c.pos.z + c.size.z / 2;
+			}
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen() || typeof conn.emitDropFx !== 'function') return;
+			conn.emitDropFx({
+				item: Math.round(id), amount: n,
+				x: Math.round(x), y: Math.round(y), z: Math.round(z),
+				kind: dt === scAny.ITEM_DROP_TYPE.PROP ? 'prop' : 'enemy',
+				// snd:0 — the native drop on OUR client already plays its catch
+				// jingle at our playerEntity, and that rides the playerSound relay
+				// to the same receivers; a second jingle in the visual copy would
+				// echo. Only silent addItem grants (emitMemberLootDropFx) send 1.
+				snd: 0,
+			});
+		} catch (_) { /* never break a drop */ }
+	}
+
+	/** ROUND 100, MEMBER side: our applyLoot roll succeeded (the host's kill granted
+	 * US a drop). The host's own drops fly to the host natively and ride the
+	 * spawnDrops observer, but OUR roll is a silent addItem — relay it so every
+	 * other client plays the fall + fly-to-our-mirror animation. Position: the dead
+	 * enemy's puppet (its last spot while it is still around), else our own player
+	 * (the puppet is reaped quickly once the host block stops reporting it). */
+	private emitMemberLootDropFx(uid: number, item: number, amount: number): void {
+		try {
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen() || typeof conn.emitDropFx !== 'function') return;
+			if (!isFinite(item) || item < 0) return;
+			const n = Math.max(1, Math.min(24, Math.round(amount) || 1));
+			let x = 0, y = 0, z = 0, found = false;
+			try {
+				const p: any = this.puppets[uid];
+				if (p && p.coll && typeof p.getAlignedPos === 'function') {
+					const c = p.getAlignedPos((ig as any).ENTITY_ALIGN.CENTER);
+					x = c.x; y = c.y; z = c.z; found = true;
+				}
+			} catch (_) { /* fall through to the player position */ }
+			if (!found) {
+				const me: any = (ig as any).game && (ig as any).game.playerEntity;
+				if (!me || !me.coll || typeof me.getAlignedPos !== 'function') return;
+				const c = me.getAlignedPos((ig as any).ENTITY_ALIGN.CENTER);
+				x = c.x; y = c.y; z = c.z;
+			}
+			// snd:1 — our grant was a silent addItem (no native drop on our client,
+			// so no jingle rides the playerSound relay); the receiver's visual copy
+			// plays the rarity catch jingle at our mirror itself.
+			conn.emitDropFx({ item: Math.round(item), amount: n, x: Math.round(x), y: Math.round(y), z: Math.round(z), kind: 'enemy', snd: 1 });
+		} catch (_) { /* never break the loot grant */ }
+	}
+
+	/** Receiver side: a same-instance player obtained an item drop (monster kill or
+	 * plant break). Spawn VISUAL-ONLY ItemDrop entities at the relayed position that
+	 * fall, then fly to OUR mirror of that player — the exact engine animation the
+	 * owner sees, replayed toward their mirror. The replayed drops NEVER grant the
+	 * item (markVisualItemDrop neutralizes collectItem): the owner already received
+	 * the real item on their client through the native chain / applyLoot. No-op when
+	 * the owner has no live mirror here (they left the map mid-pickup). */
+	public applyDropFx(fx: { player: string, item: number, amount: number, x: number, y: number, z: number, kind: string, snd?: number }): void {
+		try {
+			if (!fx || typeof fx.player !== 'string' || !fx.player) return;
+			if (fx.player === this.main.name) return;            // our own pickups play natively
+			const item = Number(fx.item);
+			if (!isFinite(item) || item < 0) return;
+			const n = Math.max(1, Math.min(24, Math.round(Number(fx.amount) || 1)));
+			if (typeof fx.x !== 'number' || !isFinite(fx.x) || Math.abs(fx.x) > 1e6) return;
+			if (typeof fx.y !== 'number' || !isFinite(fx.y) || Math.abs(fx.y) > 1e6) return;
+			if (typeof fx.z !== 'number' || !isFinite(fx.z) || Math.abs(fx.z) > 1e6) return;
+			const pl: any = this.main.players[fx.player];
+			const mirror: any = pl && pl.entity;
+			if (!mirror || mirror._killed || !mirror.coll) return; // owner not visible here
+			const scAny: any = sc as any;
+			if (!scAny.ItemDropEntity || !scAny.ITEM_DROP_TYPE) return;
+			const dropType = fx.kind === 'prop' ? scAny.ITEM_DROP_TYPE.PROP : scAny.ITEM_DROP_TYPE.ENEMY;
+			this.spawnVisualItemDrops(fx.x, fx.y, fx.z, mirror, item, n, dropType, fx.snd === 1);
+		} catch (_) { /* never let a drop-fx packet crash the frame */ }
+	}
+
+	/** Spawn `amount` visual-only ItemDrop entities at (x, y, z) flying to `target`
+	 * (a remote player's mirror). Mirrors the engine's sc.ItemDropEntity.spawnDrops
+	 * fan-out (game.compiled.js): one entity per unit; a single non-fly drop pops
+	 * out in a random direction, a multi-drop fans out in a rotating ring; fly-type
+	 * drops hover in place. Every spawned entity is neutralized by markVisualItemDrop
+	 * so it can never grant the item to US. Spawning goes through ig.game.spawnEntity
+	 * directly (NOT spawnDrops), so the sender-side wrap never re-relays these. */
+	private spawnVisualItemDrops(x: number, y: number, z: number, target: any, item: number, amount: number, dropType: any, playCatchSound: boolean): void {
+		const scAny: any = sc as any;
+		const igAny: any = ig as any;
+		const ID: any = scAny.ItemDropEntity;
+		const fly = !!(dropType && dropType.fly);
+		const vel = { x: 0, y: 0 };
+		if (amount === 1) {
+			if (!fly) {
+				const ang0 = Math.random() * Math.PI * 2;    // the engine's (0,40) random rotation
+				vel.x = -40 * Math.sin(ang0);
+				vel.y = 40 * Math.cos(ang0);
+			}
+		} else {
+			vel.x = fly ? 20 : 40;
+		}
+		for (let n = amount; n--;) {
+			let ent: any = null;
+			try {
+				ent = igAny.game.spawnEntity(ID, x - 8, y - 2, z, {
+					target, item, amount: 1, dropType, vel: { x: vel.x, y: vel.y }, skipHook: true,
+				});
+			} catch (_) { ent = null; }
+			if (ent) this.markVisualItemDrop(ent, playCatchSound);
+			if (n > 0) {
+				const ang = Math.PI * 2 * (1 / amount) * (0.8 + Math.random() * 0.4);
+				const cs = Math.cos(ang), sn = Math.sin(ang);
+				const nx = vel.x * cs - vel.y * sn, ny = vel.x * sn + vel.y * cs;
+				vel.x = nx; vel.y = ny;
+			}
+		}
+	}
+
+	/** Neutralize a replayed ItemDrop: `collectItem` becomes a latch-only no-op (no
+	 * item grant, no pickup toast, no stat bumps — the owner got the real item), and
+	 * `onKill` is replaced so the STOCK jingle (always at ig.game.playerEntity) can
+	 * neither sound like OUR pickup nor re-relay through observePlayerHitSound.
+	 * When `playCatchSound` (the owner's grant was a silent addItem, so no jingle
+	 * rides the playerSound relay) the rarity catch jingle plays at the DROP'S
+	 * TARGET — the owner's mirror; otherwise the copy stays silent (the owner's
+	 * native onKill already relayed the jingle). Ends with the genuine
+	 * ig.AnimatedEntity.onKill parent so the kill chain completes. */
+	private markVisualItemDrop(ent: any, playCatchSound: boolean): void {
+		try {
+			ent._mpVisualDrop = true;
+			ent.collectItem = function (this: any) { this.collected = true; };
+			const scAny: any = sc as any;
+			const igAny: any = ig as any;
+			const parentOnKill = (igAny.AnimatedEntity && igAny.AnimatedEntity.prototype
+				&& igAny.AnimatedEntity.prototype.onKill) || null;
+			if (!parentOnKill) return;   // keep the stock onKill — collectItem is already neutralized
+			ent.onKill = function (this: any, a: any) {
+				try {
+					this.collectItem();
+					if (playCatchSound) {
+						const S = scAny.ITEMS_RARITY;
+						let snd: any = null;
+						try {
+							const info = scAny.inventory.getItem(this.item);
+							const r = info && info.rarity;
+							if (r == S.LOW) snd = this.sounds.catchLow;
+							else if (r == S.NORMAL) snd = this.sounds.catchNormal;
+							else if (r == S.RARE) snd = this.sounds.catchRare;
+							else if (r == S.LEGENDARY) snd = this.sounds.catchLegendary;
+							else if (r == S.UNIQUE || r == S.BACKER) snd = this.sounds.catchUnique;
+						} catch (_) { /* no jingle */ }
+						// No playerEntity fallback: if the owner's mirror is gone,
+						// sounding at OUR player would read as our own pickup (and
+						// would re-relay through observePlayerHitSound).
+						const t = (this.target && !this.target._killed && this.target.coll) ? this.target : null;
+						if (snd && t && igAny.SoundHelper) igAny.SoundHelper.playAtEntity(snd, t);
+					}
+				} catch (_) { /* cosmetic */ }
+				try { parentOnKill.call(this, a); } catch (_) { /* never break the kill chain */ }
+			};
+		} catch (_) { /* ignore */ }
 	}
 
 	/** MEMBER side — the host reported an enemy sound. Rebuild + play it on our same-uid
@@ -5745,6 +6388,23 @@ export class NetSync {
 			} catch (_) { /* keep defaults */ }
 			snap.ef = ef;
 			snap.df = df;
+			// Elemental STATUS snapshot: [burn, chill, jolt, mark] charge as integer
+			// percent + an active bitmask — teammates' mirrors replay our real status
+			// bar + debuff FX from this (previously only the host's husk showed it).
+			try {
+				if (p.params && Array.isArray(p.params.statusStates)) {
+					let stMask = 0;
+					const stArr: number[] = [];
+					for (let si = 0; si < 4; si++) {
+						const sts: any = p.params.statusStates[si];
+						const ch = sts && typeof sts.charge === 'number' ? sts.charge : 0;
+						stArr.push(Math.max(0, Math.min(999, Math.round(ch * 100))));
+						if (sts && sts.active) stMask |= (1 << si);
+					}
+					stArr.push(stMask);
+					snap.st = stArr;
+				}
+			} catch (_) { /* status is cosmetic — never break the snap */ }
 			// Change-gate the guard EDGE (press / release) so the host sees it at network
 			// latency instead of waiting for the 10Hz floor. tok folds in the guard bit
 			// (×1000) plus defense, so any guard-edge or defense change flips tok, bumps
@@ -5836,6 +6496,16 @@ export class NetSync {
 		if (snap.anim !== prev.anim) return true;
 		if (snap.xa !== prev.xa || snap.xf !== prev.xf) return true;
 		if (snap.ggt !== prev.ggt) return true; // Round 27 (item 4): guard edge / defense change
+		// Status: an activation/clear (mask flip) or a >=5pt charge swing ships
+		// immediately so teammates see the debuff the frame it lands.
+		if (snap.st || prev.st) {
+			const a = snap.st, b = prev.st;
+			if (!a !== !b) return true;
+			if (a && b) {
+				if (a[4] !== b[4]) return true;
+				for (let si = 0; si < 4; si++) if (Math.abs((a[si] || 0) - (b[si] || 0)) >= 5) return true;
+			}
+		}
 		if (snap.face && prev.face && (snap.face.x !== prev.face.x || snap.face.y !== prev.face.y)) return true;
 		if (snap.pos && prev.pos) {
 			const dx = snap.pos.x - prev.pos.x;
@@ -5870,6 +6540,9 @@ export class NetSync {
 
 	/** Cached EffectSheets on the receiving side (new ig.EffectSheet per path). */
 	private _fxSheets: { [path: string]: any } = {};
+	/** 1.71.11: member-side replayed enemy-telegraph effect handles per puppet uid,
+	 * so the host's stop relay can end looping glows (see applyEnemyFxStop). */
+	private _enemyTelegraphFx: { [uid: number]: Array<{ sheet: string, key: string, handle: any }> } = {};
 	/** Fix 3: cached guard-dome sheet (same "guard" sheet the owner's GUARD action
 	 * uses; loaded once and shared across mirrors). */
 	private _guardSheet: any = null;
@@ -5922,6 +6595,102 @@ export class NetSync {
 					}
 				} catch (_) { /* visuals must never break sync */ }
 			});
+		} catch (_) { /* ignore */ }
+	}
+
+	/** HOST side: a whitelisted effect just spawned on one of OUR real enemies
+	 * (an action SHOW_EFFECT — charge telegraphs like the snowman's coldMegaCharge).
+	 * Relay {uid, sheet, key, params} so every member replays it on the same-uid
+	 * puppet. Params whitelisted to serializable fields (same list as skillFx). */
+	public broadcastEnemyFx(sheetPath: string, key: string, ent: any, fixed: { x: number, y: number, z: number } | null, params: any): void {
+		try {
+			if (!this.main.connection || !this.main.connection.isOpen()) return;
+			if (typeof (this.main as any).isSoloInstance === 'function' && (this.main as any).isSoloInstance()) return;
+			const uid = ent && ent.uid;
+			if (typeof uid !== 'number' || uid <= 0) return;
+			const p: any = {};
+			if (params && typeof params === 'object') {
+				const keep = ['offset', 'rotOffset', 'align', 'angle', 'flipX', 'rotateFace',
+					'flipLeftFace', 'duration', 'group', 'noMultiGroup'];
+				for (const k of keep) if (params[k] !== undefined) p[k] = params[k];
+			}
+			const conn: any = this.main.connection;
+			if (typeof conn.enemyFx === 'function') conn.enemyFx({ uid, sheet: sheetPath, key, f: fixed, p });
+		} catch (_) { /* ignore */ }
+	}
+
+	/** HOST side (1.71.11): a relayed telegraph effect just ended locally (action
+	 * end / CLEAR_EFFECTS / kill — all funnel through Effect.stop). Relay the stop
+	 * so members end their replayed copy; looping glows (enemy/angry2 is
+	 * blinkCount:-1) would otherwise stay red on the puppet forever. */
+	public broadcastEnemyFxStop(uid: number, sheet: string, key: string): void {
+		try {
+			if (!this.main.connection || !this.main.connection.isOpen()) return;
+			if (typeof uid !== 'number' || uid <= 0 || !sheet || !key) return;
+			const conn: any = this.main.connection;
+			if (typeof conn.enemyFxStop === 'function') conn.enemyFxStop({ uid, sheet, key });
+		} catch (_) { /* ignore */ }
+	}
+
+	/** MEMBER side: replay a host enemy's action effect on our same-uid puppet.
+	 * Same cached-sheet pattern as applySkillFx; a first-time sheet arrives a frame
+	 * late, invisible at LAN latency. */
+	private applyEnemyFx(uid: number, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
+		try {
+			if (!fx || !fx.sheet || !fx.key) return;
+			const e: any = this.puppets[uid];
+			if (!e || e._killed) return;
+			const ES: any = (ig as any).EffectSheet;
+			if (!ES) return;
+			let sheet = this._fxSheets[fx.sheet];
+			if (!sheet) { sheet = this._fxSheets[fx.sheet] = new ES(fx.sheet); }
+			sheet.load(() => {
+				try {
+					if (!sheet.loaded || e._killed) return;
+					// Muted replay: embedded PLAY_SOUND steps are silenced by the
+					// playAtEntity wrap while this flag is up (they arrive through the
+					// enemySound channel instead — single channel, no doubling).
+					this._mpFxMuteSpawn = true;
+					let handle: any = null;
+					try {
+						if (fx.f) handle = sheet.spawnFixed(fx.key, fx.f.x, fx.f.y, fx.f.z, e, fx.p || {});
+						else handle = sheet.spawnOnTarget(fx.key, e, fx.p || {});
+					} finally { this._mpFxMuteSpawn = false; }
+					// Track the replayed handle so the host's stop relay
+					// (applyEnemyFxStop) can end LOOPING telegraphs (enemy/angry2 blinks
+					// forever otherwise — the host ends its copy via CLEAR_EFFECTS /
+					// action end, which members never run). Prune finished entries lazily.
+					if (handle) {
+						const list = (this._enemyTelegraphFx[uid] = this._enemyTelegraphFx[uid] || []);
+						for (let i = list.length; i--;) {
+							const h: any = list[i].handle;
+							if (!h || h._killed || (typeof h.isDone === 'function' && h.isDone())) list.splice(i, 1);
+						}
+						list.push({ sheet: fx.sheet, key: fx.key, handle });
+						if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER tracked uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' list=' + list.length);
+					} else if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER spawn returned null uid=' + uid + ' ' + fx.sheet + '/' + fx.key);
+				} catch (_) { /* visuals must never break sync */ }
+			});
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.71.11: the host's telegraph effect ended — stop our matching replayed
+	 * copy/copies on the puppet (Effect.stop runs the entries' finish, so the red
+	 * BLINK_COLOR overlay clears exactly like on the host). Sheet/key narrow the
+	 * match; an empty sheet stops every tracked telegraph on that uid. */
+	private applyEnemyFxStop(uid: number, sheet: string, key: string): void {
+		try {
+			const list = this._enemyTelegraphFx[uid];
+			if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER stop recv uid=' + uid + ' ' + sheet + '/' + key + ' list=' + (list ? list.length : -1));
+			if (!list || !list.length) return;
+			for (let i = list.length; i--;) {
+				const rec = list[i];
+				if (sheet && rec.sheet !== sheet) continue;
+				if (key && rec.key !== key) continue;
+				try { if (rec.handle && !rec.handle._killed) rec.handle.stop(); } catch (_) { /* best-effort */ }
+				list.splice(i, 1);
+			}
+			if (!list.length) delete this._enemyTelegraphFx[uid];
 		} catch (_) { /* ignore */ }
 	}
 
@@ -6001,21 +6770,40 @@ export class NetSync {
 		} catch (_) { /* visuals must never break sync */ }
 	}
 
-	// ---- round 16 (issue 4): party-size monster HP scaling (HOST side only) ----
+	// ---- round 16 (issue 4): party-size monster stat scaling (HOST side only) ----
 	//
 	// The server sends `hpScale` = the extra max-HP fraction per ADDITIONAL party
-	// member (handshakeResponse, config monsterHpPerPlayer, default 0.5). The HOST
-	// scales every enemy it spawns:  maxHp' = maxHp * (1 + hpScale * (partySize - 1)),
-	// currentHp' = currentHp * the same factor (spawns full at the scaled value).
+	// member (handshakeResponse, config monsterHpPerPlayer, default 0.7), plus
+	// attackScale/defenseScale/focusScale (default 0.1) and resistFlat/resistPercent
+	// (default 0). The HOST scales every enemy it spawns:
+	//   maxHp'     = maxHp * (1 + hpScale * (partySize - 1)) — currentHp likewise
+	//   stat'      = stat * (1 + statScale * (partySize - 1)) for attack/defense/focus
+	//   resistance R = 1 - elemFactor; R' = (R + flat*(n-1)) * (positive ? 1+pct*(n-1)
+	//   : 1) — the percentage boost never touches a weakness.
 	// Members NEVER scale — their puppets are locked mirrors of host enemies, and the
 	// host streams the authoritative (already-scaled) HP via the entityState block
 	// (`m` = maxHp, `h` = currentHp).
 
 	/** Store the server-provided per-extra-member HP fraction (clamped [0, 10]). */
 	public setHpScale(f: number): void {
-		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.5;
+		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.7;
 		v = Math.max(0, Math.min(10, v));
 		this._mpHpScale = v;
+	}
+
+	/** Store the server-provided per-extra-member attack/defense/focus fractions
+	 * (clamped [0, 10]) and the flat/percentage resistance adjustments (flat
+	 * clamped [0, 1], percent clamped [0, 10]). */
+	public setStatScales(atk: number, def: number, foc: number, resFlat: number, resPct: number): void {
+		const cl = (v: any, defVal: number, max: number): number => {
+			const n = (typeof v === 'number' && isFinite(v)) ? v : defVal;
+			return Math.max(0, Math.min(max, n));
+		};
+		this._mpAttackScale = cl(atk, 0.1, 10);
+		this._mpDefenseScale = cl(def, 0.1, 10);
+		this._mpFocusScale = cl(foc, 0.1, 10);
+		this._mpResistFlat = cl(resFlat, 0, 1);
+		this._mpResistPercent = cl(resPct, 0, 10);
 	}
 
 	/** Round 21: set the host enemy-block send interval (seconds). Ignored unless
@@ -6038,17 +6826,52 @@ export class NetSync {
 		}
 	}
 
-	/** The HOST's current party-size HP multiplier = 1 + hpScale * (partySize - 1).
-	 * partySize counts every party member INCLUDING native bots (bots are party
-	 * members on the server and fight too). No party / size <= 1 -> 1 (no scaling). */
-	private currentHpMultiplier(): number {
+	/** Extra party-member count beyond the first (0 when solo). partySize counts
+	 * every party member INCLUDING native bots (bots are party members on the
+	 * server and fight too). */
+	private currentExtraCount(): number {
 		try {
 			const pm = this.main.partyMembers;
 			const bots = this.main.partyBots;
 			const size = (pm && pm.length || 0) + (bots && bots.length || 0);
-			if (size <= 1) return 1;
-			return 1 + this._mpHpScale * (size - 1);
-		} catch (_) { return 1; }
+			return size <= 1 ? 0 : size - 1;
+		} catch (_) { return 0; }
+	}
+
+	/** Generic party-size multiplier = 1 + perPlayer * extra (1 when solo). */
+	private currentStatMultiplier(perPlayer: number): number {
+		const extra = this.currentExtraCount();
+		return extra <= 0 ? 1 : 1 + perPlayer * extra;
+	}
+
+	/** The HOST's current party-size HP multiplier = 1 + hpScale * (partySize - 1).
+	 * No party / size <= 1 -> 1 (no scaling). */
+	private currentHpMultiplier(): number {
+		return this.currentStatMultiplier(this._mpHpScale);
+	}
+
+	/** Forward resistance adjustment on an elemFactor value (elem < 1 = positive
+	 * resistance). R = 1 - elem; R' = (R + flat) * (R + flat > 0 ? 1 + pct : 1) —
+	 * the percentage boost NEVER applies to a negative (weakness) resistance.
+	 * Result clamped to elem >= 0 (full immunity) and <= 10. */
+	private adjustElemFactor(elem: number, flatAmt: number, pctAmt: number): number {
+		let r = 1 - elem;
+		r += flatAmt;
+		if (r > 0 && pctAmt > 0) r = r * (1 + pctAmt);
+		const out = 1 - r;
+		return Math.max(0, Math.min(10, out));
+	}
+
+	/** Exact inverse of adjustElemFactor (used by the live rescale to recover the
+	 * ORIGINAL elemFactor before re-applying the new amounts). Since flat/pct are
+	 * non-negative, pct was applied at spawn iff the post-flat R was positive,
+	 * which is exactly the case R' > 0 — so the inverse is unambiguous. Not
+	 * clamped: recovering the true original matters more than bounding it. */
+	private unadjustElemFactor(elem: number, flatAmt: number, pctAmt: number): number {
+		let r = 1 - elem;
+		if (r > 0 && pctAmt > 0) r = r / (1 + pctAmt);
+		r -= flatAmt;
+		return 1 - r;
 	}
 
 	/** HOST side: scale a freshly-spawned enemy's max + current HP by the party-size
@@ -6067,19 +6890,53 @@ export class NetSync {
 			const maxHp = (typeof p.getStat === 'function') ? p.getStat('hp') : (p.baseParams && p.baseParams.hp);
 			if (typeof maxHp !== 'number' || maxHp <= 0) { e._mpHpScaled = 1; return; }
 			const mult = this.currentHpMultiplier();
+			const atkM = this.currentStatMultiplier(this._mpAttackScale);
+			const defM = this.currentStatMultiplier(this._mpDefenseScale);
+			const focM = this.currentStatMultiplier(this._mpFocusScale);
+			const extra = this.currentExtraCount();
+			const flatAmt = this._mpResistFlat * extra;
+			const pctAmt = this._mpResistPercent * extra;
 			if (mult > 1) {
 				const newMax = Math.round(maxHp * mult);
 				if (p.baseParams) p.baseParams.hp = newMax;              // max HP (getStat('hp'))
 				const cur = (typeof p.currentHp === 'number') ? p.currentHp : maxHp;
 				p.currentHp = Math.round(cur * mult);                    // current HP (spawns full)
-				// element-mode enemies carry per-element param copies that setElementMode
-				// re-applies — scale those hp values too so a mode switch keeps the scaled max.
+			}
+			// Attack/defense/focus and elemental resistance (flat + positive-only
+			// percentage) — same per-extra-member scheme as HP.
+			if (p.baseParams) {
+				if (atkM > 1 && typeof p.baseParams.attack === 'number') p.baseParams.attack = Math.max(1, Math.round(p.baseParams.attack * atkM));
+				if (defM > 1 && typeof p.baseParams.defense === 'number') p.baseParams.defense = Math.max(1, Math.round(p.baseParams.defense * defM));
+				if (focM > 1 && typeof p.baseParams.focus === 'number') p.baseParams.focus = Math.max(1, Math.round(p.baseParams.focus * focM));
+				if ((flatAmt > 0 || pctAmt > 0) && Array.isArray(p.baseParams.elemFactor)) {
+					for (let i = 0; i < 4; i++) {
+						if (typeof p.baseParams.elemFactor[i] !== 'number') continue;
+						p.baseParams.elemFactor[i] = this.adjustElemFactor(p.baseParams.elemFactor[i], flatAmt, pctAmt);
+					}
+				}
+			}
+			// element-mode enemies carry per-element param copies that setElementMode
+			// re-applies — scale those copies too so a mode switch keeps every
+			// scaled value (hp, attack/defense/focus, elemFactor).
+			if (mult > 1 || atkM > 1 || defM > 1 || focM > 1 || flatAmt > 0 || pctAmt > 0) {
 				if (e.elementModes && e.elementModes.modes) {
 					for (const k in e.elementModes.modes) {
 						const md = e.elementModes.modes[k];
-						if (md && typeof md.hp === 'number') md.hp = Math.round(md.hp * mult);
+						if (!md) continue;
+						if (mult > 1 && typeof md.hp === 'number') md.hp = Math.round(md.hp * mult);
+						if (atkM > 1 && typeof md.attack === 'number') md.attack = Math.max(1, Math.round(md.attack * atkM));
+						if (defM > 1 && typeof md.defense === 'number') md.defense = Math.max(1, Math.round(md.defense * defM));
+						if (focM > 1 && typeof md.focus === 'number') md.focus = Math.max(1, Math.round(md.focus * focM));
+						if ((flatAmt > 0 || pctAmt > 0) && Array.isArray(md.elemFactor)) {
+							for (let i = 0; i < 4; i++) {
+								if (typeof md.elemFactor[i] !== 'number') continue;
+								md.elemFactor[i] = this.adjustElemFactor(md.elemFactor[i], flatAmt, pctAmt);
+							}
+						}
 					}
 				}
+			}
+			if (mult > 1) {
 				// Round 18 (issue 1): the round-16 scale writes above run AFTER
 				// EnemyType.initEntity's parent() already snapped the in-world StatusBar to
 				// the UNSCALED hp in initWithParams — the bar caches U while max became S, so
@@ -6090,6 +6947,9 @@ export class NetSync {
 				try { if ((e as any).statusGui && typeof (e as any).statusGui.setHp === 'function') (e as any).statusGui.setHp(p.currentHp, true); } catch (_) { /* best-effort */ }
 			}
 			e._mpHpScaled = mult;
+			// Baseline for the mid-fight live rescale (see rescaleLiveEnemies): the
+			// multipliers/amounts THIS entity was spawned with.
+			e._mpStatScaled = { atk: atkM, def: defM, foc: focM, flat: flatAmt, pct: pctAmt };
 		} catch (_) { /* never break an enemy spawn */ }
 	}
 
@@ -6097,11 +6957,21 @@ export class NetSync {
 	 * Walk the live host enemies on the current map and proportionally adjust current
 	 * HP + max HP from the stored old factor (_mpHpScaled) to the new one
 	 * (newHp = hp * newFactor / oldFactor). Keeps hp <= new max, never below 1 unless
-	 * already dead. Members no-op (their puppets mirror host enemies). */
+	 * already dead. Attack/defense/focus rescale by the same ratio from the stored
+	 * per-entity baseline (_mpStatScaled); elemental resistance is re-derived by
+	 * exactly inverting the old flat/percent adjustment and applying the new one.
+	 * Element-mode param copies follow suit. Members no-op (their puppets mirror
+	 * host enemies). */
 	public rescaleLiveEnemies(): void {
 		try {
 			if (!this.main.host) return;
 			const mult = this.currentHpMultiplier();
+			const atkM = this.currentStatMultiplier(this._mpAttackScale);
+			const defM = this.currentStatMultiplier(this._mpDefenseScale);
+			const focM = this.currentStatMultiplier(this._mpFocusScale);
+			const extra = this.currentExtraCount();
+			const flatAmt = this._mpResistFlat * extra;
+			const pctAmt = this._mpResistPercent * extra;
 			const g: any = ig.game;
 			const list = g && g.entities;
 			if (!list) return;
@@ -6109,21 +6979,63 @@ export class NetSync {
 			for (let i = 0; i < list.length; i++) {
 				const e: any = list[i];
 				if (!(e instanceof Enemy) || e._mpMirror || e._killed || !e.params) continue;
-				const oldF = e._mpHpScaled;
-				if (typeof oldF !== 'number' || oldF <= 0 || oldF === mult) continue;
 				const p: any = e.params;
 				if (typeof p.currentHp === 'number' && p.currentHp <= 0) continue; // already dead
-				const maxHp = (typeof p.getStat === 'function') ? p.getStat('hp') : (p.baseParams && p.baseParams.hp);
-				if (typeof maxHp !== 'number' || maxHp <= 0) continue;
-				const newMax = Math.max(1, Math.round(maxHp * mult / oldF));
-				if (p.baseParams) p.baseParams.hp = newMax;
-				const cur = (typeof p.currentHp === 'number') ? p.currentHp : maxHp;
-				p.currentHp = Math.min(newMax, Math.max(1, Math.round(cur * mult / oldF)));
-				// Round 18 (issue 1): the direct currentHp write above leaves the in-world
-				// StatusBar desynced (it only re-reads via model observer notifications) —
-				// covers mid-fight join/leave AND party shrinking to solo. Re-snap it.
-				try { if ((e as any).statusGui && typeof (e as any).statusGui.setHp === 'function') (e as any).statusGui.setHp(p.currentHp, true); } catch (_) { /* best-effort */ }
-				e._mpHpScaled = mult;
+				const oldF = e._mpHpScaled;
+				const oldS = e._mpStatScaled || { atk: 1, def: 1, foc: 1, flat: 0, pct: 0 };
+				const hpChanged = !(typeof oldF !== 'number' || oldF <= 0 || oldF === mult);
+				const statsChanged = oldS.atk !== atkM || oldS.def !== defM || oldS.foc !== focM
+					|| oldS.flat !== flatAmt || oldS.pct !== pctAmt;
+				if (!hpChanged && !statsChanged) continue;
+				if (hpChanged) {
+					const maxHp = (typeof p.getStat === 'function') ? p.getStat('hp') : (p.baseParams && p.baseParams.hp);
+					if (typeof maxHp !== 'number' || maxHp <= 0) continue;
+					const newMax = Math.max(1, Math.round(maxHp * mult / oldF));
+					if (p.baseParams) p.baseParams.hp = newMax;
+					const cur = (typeof p.currentHp === 'number') ? p.currentHp : maxHp;
+					p.currentHp = Math.min(newMax, Math.max(1, Math.round(cur * mult / oldF)));
+					// Round 18 (issue 1): the direct currentHp write above leaves the in-world
+					// StatusBar desynced (it only re-reads via model observer notifications) —
+					// covers mid-fight join/leave AND party shrinking to solo. Re-snap it.
+					try { if ((e as any).statusGui && typeof (e as any).statusGui.setHp === 'function') (e as any).statusGui.setHp(p.currentHp, true); } catch (_) { /* best-effort */ }
+					e._mpHpScaled = mult;
+				}
+				if (statsChanged && p.baseParams) {
+					// Stats rescale by ratio (stat' = stat * newMult / oldMult); resistance
+					// by exact inverse-then-reapply of the flat+percent adjustment.
+					if (oldS.atk !== atkM && typeof p.baseParams.attack === 'number') p.baseParams.attack = Math.max(1, Math.round(p.baseParams.attack * atkM / oldS.atk));
+					if (oldS.def !== defM && typeof p.baseParams.defense === 'number') p.baseParams.defense = Math.max(1, Math.round(p.baseParams.defense * defM / oldS.def));
+					if (oldS.foc !== focM && typeof p.baseParams.focus === 'number') p.baseParams.focus = Math.max(1, Math.round(p.baseParams.focus * focM / oldS.foc));
+					if ((oldS.flat !== flatAmt || oldS.pct !== pctAmt) && Array.isArray(p.baseParams.elemFactor)) {
+						for (let fi = 0; fi < 4; fi++) {
+							if (typeof p.baseParams.elemFactor[fi] !== 'number') continue;
+							p.baseParams.elemFactor[fi] = this.adjustElemFactor(
+								this.unadjustElemFactor(p.baseParams.elemFactor[fi], oldS.flat, oldS.pct), flatAmt, pctAmt);
+						}
+					}
+				}
+				// Element-mode param copies follow the same adjustments so a mode
+				// switch after the party change keeps every scaled value.
+				if (e.elementModes && e.elementModes.modes && (hpChanged || statsChanged)) {
+					for (const k in e.elementModes.modes) {
+						const md = e.elementModes.modes[k];
+						if (!md) continue;
+						if (hpChanged && typeof md.hp === 'number') md.hp = Math.max(1, Math.round(md.hp * mult / oldF));
+						if (statsChanged) {
+							if (oldS.atk !== atkM && typeof md.attack === 'number') md.attack = Math.max(1, Math.round(md.attack * atkM / oldS.atk));
+							if (oldS.def !== defM && typeof md.defense === 'number') md.defense = Math.max(1, Math.round(md.defense * defM / oldS.def));
+							if (oldS.foc !== focM && typeof md.focus === 'number') md.focus = Math.max(1, Math.round(md.focus * focM / oldS.foc));
+							if ((oldS.flat !== flatAmt || oldS.pct !== pctAmt) && Array.isArray(md.elemFactor)) {
+								for (let fi = 0; fi < 4; fi++) {
+									if (typeof md.elemFactor[fi] !== 'number') continue;
+									md.elemFactor[fi] = this.adjustElemFactor(
+										this.unadjustElemFactor(md.elemFactor[fi], oldS.flat, oldS.pct), flatAmt, pctAmt);
+								}
+							}
+						}
+					}
+				}
+				e._mpStatScaled = { atk: atkM, def: defM, foc: focM, flat: flatAmt, pct: pctAmt };
 			}
 		} catch (_) { /* never break the frame */ }
 	}
@@ -6306,6 +7218,9 @@ export class NetSync {
 			// 1.71.2: ship the ORIGINAL enemyInfo.attribs so a handoff respawn can
 			// reconstruct them even for mapId-less EnemySpawner bots (Temple Mine).
 			ats: this.encodeEnemyAttribs(e),
+			// Elemental status (burn/chill/jolt/mark charge + active) so members see
+			// the monster's status bar + debuff FX. Undefined when all zero.
+			st: this.encodeEnemyStatus(e),
 			// ROUND 66: active shields (poise/state guards) — the puppet's native
 			// isShielded needs them to reduce the member's damage exactly like the host.
 			sh: this.encodeEnemyShields(e),
@@ -6620,6 +7535,10 @@ export class NetSync {
 		if ((a.tos || 0) !== (b.tos || 0)) return true;
 		// 1.71.2: original enemyInfo.attribs must survive handoff too.
 		if ((a.ats || '') !== (b.ats || '')) return true;
+		// Elemental status: a fill/decay/activation changes the member's puppet bar.
+		const ast = a.st, bst = b.st;
+		if ((ast ? 1 : 0) !== (bst ? 1 : 0)) return true;
+		if (ast && bst) { for (let i = 0; i < 5; i++) if ((ast[i] || 0) !== (bst[i] || 0)) return true; }
 		// ROUND 66: a shield attach/detach mid-windup (hedgehog roll-up) changes the
 		// damage the member's hit should deal — ship it immediately.
 		const ash = a.sh, bsh = b.sh;
@@ -6647,6 +7566,28 @@ export class NetSync {
 	 * (hitResist/stableOverride/strength) are sent as-is — the member assigns them
 	 * directly onto the reconstructed instance. Returns undefined when no shield is
 	 * active (keeps the wire payload lean). */
+	/** Elemental-status snapshot for the enemy stream: [burn, chill, jolt, mark]
+	 * charge in integer percent + the active bitmask at [4]. Returns undefined when
+	 * every status sits at zero so idle enemies ship nothing extra. */
+	private encodeEnemyStatus(e: any): number[] | undefined {
+		try {
+			const ss: any = e.params && e.params.statusStates;
+			if (!Array.isArray(ss)) return undefined;
+			let mask = 0; let any = false;
+			const arr: number[] = [];
+			for (let i = 0; i < 4; i++) {
+				const st: any = ss[i];
+				const ch = st && typeof st.charge === 'number' ? st.charge : 0;
+				const v = Math.max(0, Math.min(999, Math.round(ch * 100)));
+				arr.push(v);
+				if (v > 0) any = true;
+				if (st && st.active) { mask |= (1 << i); any = true; }
+			}
+			arr.push(mask);
+			return any ? arr : undefined;
+		} catch (_) { return undefined; }
+	}
+
 	private encodeEnemyShields(e: any): IShieldSnap[] | undefined {
 		try {
 			const conns: any[] = e && e.shieldsConnections;
@@ -8259,6 +9200,13 @@ export class NetSync {
 			// respawn next to them. Any all-dead latch is cancelled — their being alive
 			// means the party is NOT wiped.
 			this._mpAllDeadAt = 0;
+			// 1.72.0: a live teammate cancels a latched wipe — reverse the skull morph
+			// (updateDeathGui setWipe(false)) and hand the line back to the countdown.
+			if (this._mpDeathShrinkArmed === 'wipe') {
+				this._mpDeathShrinkArmed = null;
+				this._mpDeathShrinkAt = 0;
+				try { if (this._mpDeathGui && this._mpDeathGui.cancelShrink) this._mpDeathGui.cancelShrink(); } catch (_) { /* ignore */ }
+			}
 			// Round 14 (fix 4): LMB/RMB become spectate-switch while dead, BUT a menu
 			// being open must restore the real mouse bindings instead — every GUI click
 			// resolves through getGuiClick() = keyupd("aim"), which spectate bindings
@@ -8270,10 +9218,20 @@ export class NetSync {
 			if (this._mpCorpseHidden) this.followMirror(mirror, true);
 			// Round 11: LMB/RMB cycles the spectate target among live party members.
 			this.checkSpectateSwitch();
+			if (inCombat) this._mpDeathWasCombat = true;
 			this.updateDeathGui(waited, inCombat, false);
-			// 3s out of combat (was 2s): let the camera glide + spectate breathe a bit.
-			const canRespawn = !inCombat ? waited >= 3000 : waited >= 30000;
-			if (canRespawn) this.respawn(p);
+			// 1.72.0: the combat-end quick revive is HUD-driven now (eased shrink ->
+			// _mpDeathLineDone), not the old instant 3s clock; the plain countdown
+			// still fires on the clock — by then the line has reached the center.
+			if (this._mpDeathShrinkArmed) {
+				// Safety ceiling: the shrink callback should land within ~1s. If the
+				// HUD was lost mid-shrink, fire on the clock instead of hanging dead.
+				if (Date.now() - this._mpDeathShrinkAt > 3000) this._mpDeathLineDone(this._mpDeathShrinkArmed);
+			} else if (!(this._mpDeathGui && typeof this._mpDeathGui.setTarget === 'function' && !inCombat && this._mpDeathWasCombat)) {
+				// 3s out of combat (was 2s): let the camera glide + spectate breathe a bit.
+				const canRespawn = !inCombat ? waited >= 3000 : waited >= 30000;
+				if (canRespawn) this.respawn(p);
+			}
 		} else {
 			// No live teammate mirror: the WHOLE party is down. Like vanilla single
 			// player, that means defeat — everyone reads their last checkpoint together
@@ -8286,7 +9244,14 @@ export class NetSync {
 			}
 			if (this._mpPlayerCamDetached || this._mpSpecHandle) this.dropSpectate(false);
 			this.updateDeathGui(waited, inCombat, true);
-			if (Date.now() - this._mpAllDeadAt >= 2000) this.respawnAtCheckpoint(p);
+			// 1.72.0: with the line HUD the wipe fires when the eased shrink lands at
+			// the center (heart already morphed to skull) — _mpDeathLineDone('wipe').
+			// HUD-less fallback keeps the old 2s latch; the ceiling covers a lost
+			// shrink callback.
+			if (this._mpDeathShrinkArmed === 'wipe') {
+				if (Date.now() - this._mpDeathShrinkAt > 3000) this._mpDeathLineDone('wipe');
+			} else if (!(this._mpDeathGui && typeof this._mpDeathGui.setTarget === 'function')
+				&& Date.now() - this._mpAllDeadAt >= 2000) this.respawnAtCheckpoint(p);
 		}
 	}
 
@@ -8562,6 +9527,20 @@ export class NetSync {
 	}
 
 	private showDeathGui(inCombat: boolean): void {
+		this._mpDeathWasCombat = !!inCombat;
+		this._mpDeathShrinkArmed = null;
+		this._mpDeathShrinkAt = 0;
+		// 1.72.0: prefer the combat-rank-style converging line HUD; fall back to
+		// the legacy countdown text only if the HUD can't be built.
+		try {
+			const hud: DeathLineHud | null = createDeathLineHud();
+			if (hud) {
+				this._mpDeathGui = hud;
+				this._mpDeathGuiText = '';
+				this.updateDeathGui(0, inCombat, false);
+				return;
+			}
+		} catch (_) { /* fall through to the legacy text */ }
 		try {
 			// NOTE: TextGui has no `fontSize` option (valid: font/speed/textAlign/
 			// maxWidth/...) and setText takes ONE arg — don't pass extras.
@@ -8583,6 +9562,45 @@ export class NetSync {
 	}
 
 	private updateDeathGui(waitedMs: number, inCombat: boolean, allDead?: boolean): void {
+		// 1.72.0: line-HUD mode. The HUD owns the countdown FLOW; the fast shrink
+		// (combat-end quick revive / party wipe) eases to the center and its onDone
+		// callback (_mpDeathLineDone) executes the revive / wipe logic.
+		if (this._mpDeathGui && typeof this._mpDeathGui.setTarget === 'function') {
+			try {
+				const hud: DeathLineHud = this._mpDeathGui;
+				if (allDead) {
+					hud.setWipe(true);
+					// 1.72.0 (sound-loop fix): once respawnAtCheckpoint has FIRED
+					// (_mpCheckpointReloading) the shrink callback cleared the armed
+					// flag — re-arming here re-fired the whole vanilla defeat flow
+					// every ~0.8s (infinite defeat-sound spam until the teleport).
+					if (!this._mpCheckpointReloading && this._mpDeathShrinkArmed !== 'wipe') {
+						this._mpDeathShrinkArmed = 'wipe';
+						this._mpDeathShrinkAt = Date.now();
+						hud.startShrink(() => this._mpDeathLineDone('wipe'));
+					}
+					return;
+				}
+				hud.setWipe(false);
+				if (!inCombat && this._mpDeathWasCombat) {
+					// Combat ended while dead: eased fast shrink -> quick revive.
+					if (this._mpDeathShrinkArmed !== 'revive') {
+						this._mpDeathShrinkArmed = 'revive';
+						this._mpDeathShrinkAt = Date.now();
+						hud.startShrink(() => this._mpDeathLineDone('revive'));
+					}
+					return;
+				}
+				if (this._mpDeathShrinkArmed === 'revive' && inCombat) {
+					// Combat re-started mid-shrink: hand the flow back to the countdown.
+					this._mpDeathShrinkArmed = null;
+					this._mpDeathShrinkAt = 0;
+					hud.cancelShrink();
+				}
+				hud.setTarget(Math.min(1, waitedMs / (inCombat ? 30000 : 3000)));
+			} catch (_) { /* ignore */ }
+			return;
+		}
 		if (!this._mpDeathGui || typeof this._mpDeathGui.setText !== 'function') return;
 		try {
 			// Round 14 (fix 2): countdown-only prompt. The old spectator-hint prose
@@ -8607,11 +9625,58 @@ export class NetSync {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.72.0: the death-line HUD's eased shrink reached the center — execute the
+	 * queued revive / team-wipe logic now. Guarded against races: a stale or
+	 * cancelled shrink is dropped, a wipe that gained a live teammate mid-shrink
+	 * cancels, and a revive that turned into a wipe defers to the wipe branch. */
+	private _mpDeathLineDone(kind: 'revive' | 'wipe'): void {
+		try {
+			if (this._mpDeathShrinkArmed !== kind) return;
+			this._mpDeathShrinkArmed = null;
+			this._mpDeathShrinkAt = 0;
+			if (!this._mpDead) return;
+			const p: any = (ig as any).game && (ig as any).game.playerEntity;
+			if (!p || p._killed) return;
+			if (kind === 'wipe') {
+				if (this.firstLiveMirror()) return;
+				this.respawnAtCheckpoint(p);
+			} else {
+				if (!this.firstLiveMirror()) return;
+				this.respawn(p);
+			}
+		} catch (_) { /* ignore */ }
+	}
+
 	private removeDeathGui(): void {
 		if (!this._mpDeathGui) return;
-		try { this._mpDeathGui.remove(); } catch (_) { /* ignore */ }
+		try {
+			if (typeof this._mpDeathGui.dispose === 'function') this._mpDeathGui.dispose();
+			else if (typeof this._mpDeathGui.remove === 'function') this._mpDeathGui.remove();
+		} catch (_) { /* ignore */ }
 		this._mpDeathGui = null;
 		this._mpDeathGuiText = '';
+		this._mpDeathShrinkArmed = null;
+		this._mpDeathShrinkAt = 0;
+	}
+
+	/** True while a BOSS-flagged enemy is actively engaged: present (and alive)
+	 * in sc.combat's active ENEMY combatant list. enemyType.boss is the database
+	 * boss flag (the same one the engine reads for BOSS_KILL score). Used to
+	 * soften the soft-revive heal during boss fights. */
+	private bossBattleActive(): boolean {
+		try {
+			const combat: any = (sc as any).combat;
+			const party: any = (sc as any).COMBATANT_PARTY;
+			const list: any[] = (combat && party && combat.activeCombatants) ? combat.activeCombatants[party.ENEMY] : null;
+			if (!list || !list.length) return false;
+			for (let i = 0; i < list.length; i++) {
+				const e = list[i];
+				if (!e || !e.enemyType || !e.enemyType.boss) continue;
+				if (typeof e.isDefeated === 'function' && e.isDefeated()) continue;
+				return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
 	}
 
 	private respawn(p: any, keepPos?: boolean): void {
@@ -8707,22 +9772,26 @@ export class NetSync {
 		// hp restored via increaseHp(getStat('hp')), healStatus(). We deliberately do
 		// NOT use doManualRevive() — it also fires sc.combat.notifyCombatantDefeated,
 		// a defeat broadcast that is the wrong signal for a soft revival.
+		// Boss-battle revive penalty: reviving while a boss is still engaged
+		// restores only 1/4 of max HP instead of full HP (revive(f) heals
+		// round(maxHp * f)). Out-of-combat / non-boss revives stay full.
+		const reviveFrac = this.bossBattleActive() ? 0.25 : 1;
 		try {
 			p.manualKill = null; // release the death-hold armed in enterDeath()
 			p.dying = 0; // sc.DYING_STATE.ALIVE
 			if (p.params && typeof p.params.revive === 'function') {
-				p.params.revive(1); // 1 = full HP fraction
+				p.params.revive(reviveFrac); // 1 = full HP fraction, 0.25 mid-boss-fight
 			} else if (p.params) {
 				p.params.defeated = false;
 				const maxHp = p.params.getStat ? p.params.getStat('hp') : 0;
-				p.params.currentHp = maxHp > 0 ? maxHp : 1;
+				p.params.currentHp = maxHp > 0 ? Math.max(1, Math.round(maxHp * reviveFrac)) : 1;
 			}
 		} catch (_) {
 			try {
 				if (p.params) {
 					p.params.defeated = false;
 					const maxHp = p.params.getStat ? p.params.getStat('hp') : 0;
-					p.params.currentHp = maxHp > 0 ? maxHp : 1;
+					p.params.currentHp = maxHp > 0 ? Math.max(1, Math.round(maxHp * reviveFrac)) : 1;
 				}
 			} catch (__) { /* ignore */ }
 		}
@@ -8736,7 +9805,8 @@ export class NetSync {
 		// coll already restored above). The per-frame pump rebuilds the own tag at the
 		// new spot next frame. Internally guarded — a wipe failure never breaks revival.
 		try { this.main.wipeTags(); } catch (_) { /* ignore */ }
-		console.log('[multiplayer] respawned (soft revive)' + (mirror ? ' next to teammate' : (keepPos ? ' (teleport)' : '')));
+		console.log('[multiplayer] respawned (soft revive)' + (mirror ? ' next to teammate' : (keepPos ? ' (teleport)' : ''))
+			+ (reviveFrac < 1 ? ' at ' + Math.round(reviveFrac * 100) + '% HP (boss fight)' : ''));
 	}
 
 	/**
@@ -8943,6 +10013,9 @@ export class NetSync {
 			// gd/gst/gws arrive with the guard packet; gw/gm/ga/def are cached when present
 			// (they ride the same payload but are omitted when unchanged — opt 3).
 			this._applyCombatStash(ent, s);
+			// Elemental status (chill etc.): replay the OWNER's real status bar +
+			// debuff FX on their mirror — the host's husk no longer fills alone.
+			if (Array.isArray(s.st)) this.applySyncedStatus(ent, s.st);
 			if (s.pos) {
 				// Fix 3: store the network position as an INTERPOLATION TARGET instead of
 				// writing it directly — direct per-packet writes = visible jitter on bad
@@ -9097,6 +10170,9 @@ export class NetSync {
 				// the fresh entity RIGHT NOW if the spawn was synchronous. (The async case
 				// is covered by the next packet: these fields now ride EVERY playerState.)
 				try { if (fresh.entity) this._applyCombatStash(fresh.entity, s); } catch (_) { /* ignore */ }
+				// Same cache-coherence story for elemental status (a chilled owner's fresh
+				// mirror should spawn already showing the chill).
+				try { if (fresh.entity && Array.isArray(s.st)) this.applySyncedStatus(fresh.entity, s.st); } catch (_) { /* ignore */ }
 			}
 		}
 		// Party HUD model (top-left HP/SP bars read the MODEL, not the mirror).
@@ -9127,6 +10203,48 @@ export class NetSync {
 	 * mirror never learned def/gm/ga/df/ef/fc and the host recomputed damage against the
 	 * husk's stats). Now the fields ride EVERY playerState, so every call re-stamps them;
 	 * this helper just makes the spawn packet apply immediately too. Never throws. */
+	/** Apply a synced elemental-status snapshot ([burn, chill, jolt, mark] charge
+	 * in integer percent + active bitmask) to a MIRROR or enemy PUPPET. The entity's
+	 * native inflict/update are suppressed on mirrors/puppets (see the
+	 * CombatStatusBase wraps in install()), so this is the SOLE driver of their
+	 * status display: fresh activations run the engine's native activate() (label
+	 * popup + status FX + status-bar stick + chill slow influence), clears run the
+	 * native clear(), and plain charge changes just move the status bar. */
+	private applySyncedStatus(ent: any, arr: number[]): void {
+		try {
+			if (!ent || ent._killed || !ent.params || !Array.isArray(arr) || arr.length < 5) return;
+			const states: any[] = ent.params.statusStates;
+			if (!Array.isArray(states)) return;
+			const mask = arr[4] || 0;
+			for (let i = 0; i < 4; i++) {
+				const st: any = states[i];
+				if (!st) continue;
+				const v = (typeof arr[i] === 'number' ? arr[i] : 0) / 100;
+				const active = ((mask >> i) & 1) === 1;
+				if (active && !st.active) {
+					// Fresh activation on the owner/host — replay the native activation.
+					// A zero-stub attackerParams is exact: gear modifiers (COND_EFFECT_*)
+					// don't exist on husks, and effectiveness only scales the debuff strength.
+					try {
+						st.activate(ent, ent.params, { element: i + 1, attackerParams: { getModifier: () => 0 } });
+					} catch (_) { st.charge = 1; st.active = true; }
+					try { st.charge = v > 0 ? v : 1; } catch (_) { /* ignore */ }
+				} else if (!active && st.active) {
+					try { st.clear(ent); } catch (_) { st.active = false; st.charge = 0; }
+				} else if (Math.abs((typeof st.charge === 'number' ? st.charge : 0) - v) > 0.001) {
+					st.charge = v;
+					try {
+						const sg: any = ent.statusGui;
+						if (sg && st.statusBarEntry) {
+							if (active && typeof sg.updateStatusEntry === 'function') sg.updateStatusEntry(st.statusBarEntry, v);
+							else if (!active && typeof sg.setStatusEntry === 'function') sg.setStatusEntry(st.statusBarEntry, v);
+						}
+					} catch (_) { /* bar is cosmetic */ }
+				}
+			}
+		} catch (_) { /* never break the state packet */ }
+	}
+
 	private _applyCombatStash(ent: any, s: any): void {
 		try {
 			// Round 27 (item 4): guard state + timing for the host's damage judge.
@@ -9401,29 +10519,32 @@ export class NetSync {
 							else if ('broken' in gui) gui.broken = brokenNow;
 							else if (gui.spBar && 'broken' in gui.spBar) gui.spBar.broken = brokenNow;
 						}
-						// ROUND 63 (break FX): replay the "BREAK!" dramatic effect (label +
-						// speedlines + blur) on the member's puppet the moment the host enemy
-						// breaks. The meerkat's reaction break (CHARGE_WEAK -> STUN) never
-						// touched the statusGui bar, so this was the missing annotation the
-						// member never saw. doDramaticEffect on a non-player target skips the
-						// camera/slow-mo, so only the visible break FX + "BREAK!" label play.
-						if (brokenNow) { try { this._mpPlayBreakFx(e); } catch (_) { /* best-effort */ } }
+						// 1.71.11: NO dramatic "BREAK!" replay here any more. The brk flag
+						// flips for ANY broken/stun state — including script-driven stuns
+						// like the buffalo's wall crash (WALL_HIT reaction, no
+						// dramaticEffect) where the host shows NOTHING — so guessing from
+						// brk invented a phantom "BREAK!" caption on members. The real
+						// break presentation is host-authoritative now: the host's actual
+						// doDramaticEffect call relays 'ebreak:<variant>' (combatFx) and
+						// members replay exactly that (see observeDramaticEffect).
 						this._sfxLog('brk.sync', 'uid=' + s.i + ' broken=' + (brokenNow ? 1 : 0));
 					}
 				} catch (_) { /* best-effort */ }
 			}
-			// ROUND 63 (meerkat red-flash): mirror the host enemy's VULNERABLE annotation
-			// (the 2s "charge light" red blink a charged ball can break through). The old
-			// readEnemyBroken probed the guard/break bar, but the meerkat has maxSp 0 and
-			// no bar — its "red flash" is the annotate.passive VULNERABLE window, driven by
-			// CHANGE_ENEMY_ANNOTATION during SpecialAttack. Replay the red blink on the
-			// puppet when it flips; stop it when the host leaves the window (or it breaks).
+			// Elemental status: mirror the host enemy's burn/chill/jolt/mark charge +
+			// active states onto the puppet — members see the monster's status bar fill
+			// and the debuff FX (burn flames, chill slow tint) exactly like the host.
+			if (isFull && Array.isArray(s.st)) this.applySyncedStatus(e, s.st);
+			// Meerkat VULNERABLE annotation: still tracked (s.vul drives _mpVulSynced)
+			// but the red "charge light" blink itself is NO LONGER replayed from here —
+			// the meerkat's SpecialAttack spawns 'charge/light' via SHOW_EFFECT on the
+			// host, which the 1.71.11 telegraph relay (ENEMY_TELEGRAPH_SHEETS) replays
+			// with the host's exact params, and stops via the Effect.stop relay the
+			// moment the host's own glow ends. The annotation path used to spawn a
+			// SECOND copy on top of the relayed one (double glow).
 			if (isFull) {
 				const vulNow = (s.vul || 0) === 1;
-				if (e._mpVulSynced !== vulNow) {
-					e._mpVulSynced = vulNow;
-					this._mpApplyVulnerable(e, vulNow);
-				}
+				if (e._mpVulSynced !== vulNow) e._mpVulSynced = vulNow;
 			}
 			// ROUND 66 (poise/shield damage sync): mirror the host enemy's ACTIVE shields
 			// onto the puppet. Without them the puppet's native isShielded finds nothing,
@@ -9569,61 +10690,6 @@ export class NetSync {
 			}
 		} catch (_) { /* ignore */ }
 	}
-
-	/**
-	 * ROUND 63 (meerkat red flash): replay the host's "charge light" BLINK_COLOR on the
-	 * puppet when its VULNERABLE annotation flips. Uses the same cached EffectSheet path
-	 * as applySkillFx — the sheet may not be resident on the member (the puppet never
-	 * runs its own SpecialAttack, so nothing pre-loaded "charge"), so it loads async and
-	 * the spawn lands a frame late. The real effect auto-stops after its 2s duration; we
-	 * also stop() it early if the host leaves the window before then. Best-effort visual.
-	 */
-	private _mpApplyVulnerable(e: any, on: boolean): void {
-		try {
-			if (on) {
-				try {
-					const ES: any = (ig as any).EffectSheet;
-					if (ES) {
-						let sheet = this._fxSheets['charge'];
-						if (!sheet) sheet = this._fxSheets['charge'] = new ES('charge');
-						const target = e;
-						sheet.load(() => {
-							try {
-								if (!sheet.loaded || !target || target._killed) return;
-								if (target._mpVulSynced !== true) return; // flipped off before the load landed
-								target._mpVulFx = sheet.spawnOnTarget('light', target, { duration: 2 });
-							} catch (_) { /* visual only */ }
-						});
-					}
-				} catch (_) { /* visual only */ }
-				this._sfxLog('vul.on', 'uid=' + (e._mpUid || 0));
-			} else {
-				try { if (e._mpVulFx) e._mpVulFx.stop(); } catch (_) { /* ignore */ }
-				e._mpVulFx = null;
-				this._sfxLog('vul.off', 'uid=' + (e._mpUid || 0));
-			}
-		} catch (_) { /* best-effort visual */ }
-	}
-
-	/**
-	 * ROUND 63 (break FX): replay the host's "BREAK!" dramatic effect on the member's
-	 * puppet. The host plays it natively when a guard-bar or reaction break triggers
-	 * (sc.combat.doDramaticEffect(BREAK) in the hit-reaction path); the member's locked
-	 * puppet never runs reactions, so we replay the label + speedlines + blur here. Passing
-	 * the puppet as both source and target skips camera/slow-mo (no alwaysFocus), so only
-	 * the visible break FX + "BREAK!" annotation play. Best-effort visual.
-	 */
-	private _mpPlayBreakFx(e: any): void {
-		try {
-			const combat: any = (sc as any).combat;
-			const BREAK = (sc as any).DRAMATIC_EFFECT && (sc as any).DRAMATIC_EFFECT.BREAK;
-			if (combat && BREAK && typeof combat.doDramaticEffect === 'function') {
-				combat.doDramaticEffect(e, e, BREAK);
-			}
-			this._sfxLog('brk.fx', 'uid=' + (e._mpUid || 0));
-		} catch (_) { /* best-effort visual */ }
-	}
-
 	/** Round 23: MEMBER-side stale-puppet reap (replaces the old per-block reap pass
 	 * inside applyEntityState). On a member every live non-mirror enemy must be
 	 * host-owned; anything else is a divergent local ghost and is killed silently

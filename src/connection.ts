@@ -106,13 +106,13 @@ export interface IConnection {
      * the member applies VERBATIM — `perfect` = a perfect guard (0 damage + counter
      * window), `regular` = a regular guard (chip damage + guard-bar), `knockback` =
      * whether the engine knockback fires. PvP hits (mirror-to-mirror) omit these. */
-    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number }): void;
+    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void;
     /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
      * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
      * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
      * fixed MEDIUM. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void;
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number }): void;
     /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
      * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
      * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
@@ -143,6 +143,19 @@ export interface IConnection {
      * resolveItemDrops). uid = the dead enemy's uid; credit = the granted credits
      * (0 when none); boosterState = the enemy's booster state (number, default 0). */
     emitLoot(loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }): void;
+    /** ROUND 100 (drop-pickup visibility): any client -> its instance — the LOCAL
+     * player just obtained an item drop (monster kill or plant/prop destruction).
+     * Purely cosmetic: every OTHER same-instance client spawns a visual-only
+     * ItemDrop entity at (x, y, z) that falls and flies to OUR mirror of that
+     * player, so teammates can see each other's pickups. `item` = the engine
+     * item id, `amount` = how many drop entities the engine fanned out (1..24),
+     * `kind` = 'enemy' | 'prop' (matches sc.ITEM_DROP_TYPE). `snd` = 1 asks the
+     * receiver to play the rarity catch jingle at the mirror (used when the
+     * owner's grant was a silent addItem, so no native onKill jingle rides the
+     * playerSound relay); 0/absent = silent visual (native drops already relay
+     * their jingle via observePlayerHitSound). The server stamps the sender as
+     * `player`. */
+    emitDropFx(fx: { item: number, amount: number, x: number, y: number, z: number, kind: string, snd?: number }): void;
     /** 1.71.7 (quest kill-progress sync): the map-instance HOST just completed a REAL
      * enemy death chain (`sc.combat.notifyCombatantDefeated` ran locally, so the
      * killer's own quest KILL progress is already native). The server routes this:
@@ -297,11 +310,24 @@ export interface IConnection {
     /** Round 11: a player CAST a special skill — replay its effect sheet on the
      * sender's mirror (f = fixed world pos for spawnFixed effects). */
     skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void;
+    /** Elemental-status build-up: a whitelisted effect sheet spawned on a
+     * HOST-side real enemy (charge-up telegraphs like the snowman's
+     * coldMegaCharge). Receivers replay it on the same-uid puppet. */
+    enemyFx?(fx: { uid: number, sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void;
+    /** 1.71.11: the host's relayed enemy telegraph effect STOPPED (action end /
+     * CLEAR_EFFECTS) — members end their replayed copy, or looping red glows
+     * (enemy/angry2 is blinkCount:-1) would stay on the puppet forever. */
+    enemyFxStop?(fx: { uid: number, sheet: string, key: string }): void;
+    onEnemyFxStop?(cb: (uid: number, sheet: string, key: string) => void): void;
+    onEnemyFx?(callback: (uid: number, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void;
     /** Round 27 (item 2): publish OUR current map to the party so teammates' HUDs
-     * can hide our HP/SP/EXP bars + grey our net diamond while we're off their map. */
-    memberMap?(map: string): void;
-    /** Round 27 (item 2): a party member relayed their current map. */
-    onMemberMap?(cb: (name: string, map: string) => void): void;
+     * can hide our HP/SP/EXP bars + grey our net diamond while we're off their map.
+     * `area` carries the engine-resolved current area path (map names do NOT always
+     * start with the area key — "autumn.path-3-1" is in area "autumn-area" — so the
+     * world-map marker cannot derive it from the map name alone). */
+    memberMap?(map: string, area?: string): void;
+    /** Round 27 (item 2): a party member relayed their current map (+ area path). */
+    onMemberMap?(cb: (name: string, map: string, area?: string) => void): void;
     saveUpload(slot: string, data: string): void;
     /** Round 23: one part of a chunked, rate-limited save UPLOAD. The client splits
      * the save into 8192-char parts and paces them (~512 kb/s) through the
@@ -384,6 +410,11 @@ export interface IConnection {
      * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
      * via broadcastHostState. */
     onLoot(callback: (loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }) => void): void;
+    /** ROUND 100 (drop-pickup visibility): a same-instance player obtained an
+     * item drop (see emitDropFx). Server-stamped `player` (sender excluded).
+     * Replay the drop-fall + fly-to-player animation on OUR mirror of them —
+     * visual only, never grants the item. */
+    onDropFx(callback: (fx: { player: string, item: number, amount: number, x: number, y: number, z: number, kind: string, snd?: number }) => void): void;
     /** 1.71.7: a same-instance player (non-sync mode) or any story-sync party member
      * relayed a real enemy defeat for quest KILL progress. Server-stamped/validated;
      * `map` is the map the enemy died on. */

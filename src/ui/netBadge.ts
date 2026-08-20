@@ -84,10 +84,10 @@ interface HoverTarget {
     level?: number;
     /** Round 27 (item 2): this member is off our map — grey diamond + tooltip. */
     offMap?: boolean;
-    /** 1.71.9 (issue 5): member badge quality = RELATIVE link latency
-     * (my RTT/2 to the server + the member's RTT/2 to the server). */
-    relPing?: number;
-    myPing?: number;
+    /** Member badge tooltip = the MEMBER's own server link only: their ping
+     * (relayed ~1/s via playerPing) plus the loss %, in the same format as the
+     * self badge. (The diamond TIER still uses the relative link — see
+     * collectMemberHud — only the hover text changed.) */
     peerPing?: number;
     lossPct?: number;
 }
@@ -193,10 +193,11 @@ function collectMemberHud(gui: any, renderer: any): void {
     const model: any = gui.model;
     const offMap = memberOffMap(model);
     const name: string = model ? String(model._mpName || model.name || '') : '';
-    // 1.71.9 (issue 5): member diamonds describe the RELATIVE link between us and
-    // that member, not just our own route to the server. The member's route is
-    // `main.remotePings[name]` (their own server RTT, ~1/s); the relative RTT is
-    // the sum of both half-trips.
+    // 1.71.9 (issue 5): member DIAMONDS still tier on the RELATIVE link between
+    // us and that member (my RTT/2 to the server + the member's RTT/2, the sum of
+    // both half-trips). The hover TOOLTIP, however, reports only the member's own
+    // server link: their route is `main.remotePings[name]` (their own server RTT,
+    // ~1/s), so resolve it even when our own probe hasn't answered yet.
     let relPing: number | undefined;
     let myPing: number | undefined;
     let peerPing: number | undefined;
@@ -209,11 +210,11 @@ function collectMemberHud(gui: any, renderer: any): void {
                 ? m.connection.getNetQuality() : null;
             const local = q && q.known ? q : null;
             const peer = m && m.remotePings && typeof m.remotePings[name] === 'number' ? m.remotePings[name] : -1;
+            if (peer >= 0) peerPing = Math.round(peer);
             if (local) {
                 myPing = local.ping >= 0 ? Math.round(local.ping) : undefined;
                 lossPct = local.lossPct || 0;
-                if (peer >= 0) {
-                    peerPing = Math.round(peer);
+                if (peerPing != null) {
                     relPing = Math.round((Number(myPing) + Number(peerPing)) / 2);
                 } else {
                     relPing = myPing; // peer probe unknown -> fall back to our route
@@ -257,7 +258,7 @@ function collectMemberHud(gui: any, renderer: any): void {
         hoverTargets.push({
             x: sc.x + BADGE_OFF_MEMBER - pad, y: sc.y + BADGE_OFF_MEMBER - pad,
             w: pad * 2, h: pad * 2, kind: 'badge', offMap,
-            name: name || undefined, relPing, myPing, peerPing, lossPct,
+            name: name || undefined, peerPing, lossPct,
         });
     }
 }
@@ -413,15 +414,13 @@ function pumpNetBadges(): void {
         // level — the user asked for that to never change to the room warning.
         if (hit.offMap) {
             text = t('notInSameRoom');
-        } else if (hit.name && typeof hit.relPing === 'number') {
-            // 1.71.9 (issue 5): a MEMBER badge reports the relative link quality
-            // between our client and that member, with both server hops spelled out.
-            const rel = Math.round(hit.relPing);
-            const parts = t('netPingParts')
-                .replace('{a}', hit.myPing != null ? String(Math.round(hit.myPing)) : '—')
-                .replace('{b}', hit.peerPing != null ? String(Math.round(hit.peerPing)) : '—');
-            text = t('netRelPingLabel') + ': ' + rel + 'ms  '
-                + parts + '  '
+        } else if (hit.name) {
+            // A MEMBER badge reports ONLY the teammate's own link to the server
+            // (their ping, relayed ~1/s) plus the loss % — the same one-line
+            // format as the self badge below. Peer report not arrived yet (or
+            // our probe still unknown) -> a dash, mirroring the self tooltip.
+            const peer = typeof hit.peerPing === 'number' ? Math.round(hit.peerPing) + 'ms' : '—';
+            text = t('netPingLabel') + ': ' + peer + '  '
                 + t('netLossLabel') + ': ' + (hit.lossPct != null ? hit.lossPct : 0) + '%';
         } else {
             const q = mpQuality;

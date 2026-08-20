@@ -132,9 +132,15 @@ export function ensureStorySyncStyle(): void {
 	font-size: 13px; box-shadow: 0 0 12px rgba(111,199,255,0.35); }
 .mpTriggerBanner .mpTriggerTag { color: #6fc7ff; font-weight: bold; white-space: nowrap; }
 .mpTriggerBanner .mpTriggerState { color: #ffd98c; white-space: nowrap; }
-.mpTriggerBanner .mpTriggerRows { display: flex; align-items: center; gap: 6px; }
-.mpTriggerBanner .mpDiamond { width: 12px; height: 12px; transform: rotate(45deg);
-	display: inline-block; image-rendering: pixelated; }
+/* ROUND 122: a 12px square rotated 45deg visually spans ~17px (12*sqrt2), so
+   it bleeds ~2.5px past its layout box on both sides — with the old 6px gap the
+   diamonds nearly touched, and the first one's corner crept into the state text.
+   Wider gap + side margins keep clear visual separation; padding-left lifts the
+   row off the text; flex-shrink:0 stops the pill squeezing them at max-width. */
+.mpTriggerBanner .mpTriggerRows { display: flex; align-items: center; gap: 8px;
+	padding-left: 6px; flex-shrink: 0; }
+.mpTriggerBanner .mpDiamond { width: 12px; height: 12px; margin: 0 1px;
+	transform: rotate(45deg); flex-shrink: 0; display: inline-block; image-rendering: pixelated; }
 .mpTriggerBanner .mpDiamond.on { background: #5be36e; box-shadow: 0 0 6px rgba(91,227,110,0.8); }
 .mpTriggerBanner .mpDiamond.off { background: #66727a; box-shadow: none; }
 .mpTriggerBanner button { background: #155a86; color: #eaf7ff; border: 1px solid #6fc7ff;
@@ -200,13 +206,18 @@ export function ensureStorySyncStyle(): void {
 		-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 		filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 24px rgba(255,196,80,0.6));
 	}
-	.mpStoryPartyTitle { -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+	/* Same single-rule structure as .mpStoryCommTitle: the background shorthand
+	   RESETS background-clip to border-box, so the clip longhands MUST come after
+	   it inside the SAME rule — a standalone lower-specificity clip rule loses to
+	   the variant shorthand and the gradient paints as a box behind the text. */
 	.mpStoryParty.light .mpStoryPartyTitle {
 		background: linear-gradient(180deg, #f4fcff 10%, #d5ecff 38%, #8fc1ee 62%, #46719e 96%);
+		-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 		filter: drop-shadow(0 2px 1px rgba(10,30,50,0.55)) drop-shadow(0 0 20px rgba(140,200,255,0.6));
 	}
 	.mpStoryParty.full .mpStoryPartyTitle {
 		background: linear-gradient(180deg, #fff8dc 10%, #ffe9a8 36%, #f5b32e 62%, #9a5f14 96%);
+		-webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 		filter: drop-shadow(0 2px 1px rgba(60,30,0,0.55)) drop-shadow(0 0 20px rgba(255,196,80,0.6));
 	}
 }
@@ -261,6 +272,8 @@ export class StorySyncController {
 	 * already solved the synced quest, so they can follow the shared progress
 	 * without ever receiving another reward. Removed on mode exit. */
 	private virtualQuestId = '';
+	/** Throttle for the per-second virtual-entry self-heal in tick(). */
+	private virtualHealAt = 0;
 	private isPendingStart = false;
 	private pendingReqId = '';
 	private pendingQuest = '';
@@ -269,6 +282,10 @@ export class StorySyncController {
 	private stateTimer = 0;
 	private stateHeartbeat = 0;
 	private leaderCompleteAt = 0;
+	/** ROUND 118: member-side cache of the leader's latest streamed state — the
+	 * 1s convergence pump re-applies it whenever the live quest state diverges
+	 * (dropped mid-load packet, save-load rebuild from a pre-sync checkpoint). */
+	private lastLeaderState: any = null;
 	private finishedSynced = false;
 
 	private currentEventSeq = 0;
@@ -342,6 +359,7 @@ export class StorySyncController {
 	private questModelHooksInstalled = false;
 	private eventStepsHooksInstalled = false;
 	private menuHooksInstalled = false;
+	private questVarHookInstalled = false;
 	private partyStoryMarkerInstalled = false;
 	private storyIntegrityCheckedAt = 0;
 	private storyIntegrityToastAt = 0;
@@ -567,10 +585,17 @@ export class StorySyncController {
 			const lbl = q.getQuestName(id);
 			if (lbl === null || lbl === undefined) return id;
 			if (typeof lbl === 'string') return lbl;
-			if ((ig as any).LangLabel && typeof (ig as any).LangLabel.getText === 'function') {
-				return String((ig as any).LangLabel.getText(lbl));
+			// getQuestName returns an ig.LangLabel INSTANCE (sc.Quest.name), but the
+			// static ig.LangLabel.getText expects the raw Data map ({en_US, zh_CN,
+			// ...}). Handing it the instance made every language lookup miss — the
+			// instance carries only value/data/langUid/originFile — so the label
+			// fell through to non-Chinese text. Resolve from lbl.data instead so
+			// the CURRENT game language (zh_CN) wins; the instance's baked .value
+			// (resolved at construction in the same language) is the fallback.
+			if ((ig as any).LangLabel && typeof (ig as any).LangLabel.getText === 'function' && lbl.data) {
+				return String((ig as any).LangLabel.getText(lbl.data));
 			}
-			return String(lbl && lbl.data ? lbl.data : lbl);
+			return String(lbl && lbl.value ? lbl.value : (lbl && lbl.data ? lbl.data : lbl));
 		} catch (_) { return id; }
 	}
 
@@ -578,6 +603,35 @@ export class StorySyncController {
 
 	private virtualSyncId(): string {
 		return 'mp.sync.' + this.quest;
+	}
+
+	/** ROUND 119: repair a CORRUPT dual quest state — the same quest present in
+	 * finishedQuests AND activeQuests at once. The engine's onStoragePreLoad
+	 * rebuilds active states without checking the solved record, so once a save
+	 * carries both (a crash mid-write, an older sync bug), the REAL quest shows
+	 * up as an unprefixed ACTIVE duplicate next to its SOLVED record — and every
+	 * live save (1.71.10) persists the corruption. The solved record is
+	 * authoritative: drop the active residue. */
+	private repairDualQuestState(id: string): void {
+		try {
+			if (!id || this.isPlotQuest(id)) return;
+			const q = this.questManager();
+			if (!q || !q.finishedQuests || !q.finishedQuests[id]) return; // not solved — nothing to repair
+			const idx = q._activeQuestIndex ? q._activeQuestIndex[id] : undefined;
+			if (typeof idx !== 'number' || !q.activeQuests[idx]) return; // not dual
+			console.warn('[storysync] dual quest state detected for ' + id + ' — dropping the stale ACTIVE copy (the quest is already solved)');
+			q.activeQuests.splice(idx, 1);
+			for (const k in q._activeQuestIndex) {
+				if (typeof q._activeQuestIndex[k] === 'number' && q._activeQuestIndex[k] > idx) q._activeQuestIndex[k] = q._activeQuestIndex[k] - 1;
+			}
+			delete q._activeQuestIndex[id];
+			// A dual state also breaks marking (markQuest refuses solved quests while
+			// an active entry confuses the HUD tracker) — drop stale marks of the id.
+			if (Array.isArray(q.markedQuests)) {
+				for (let i = q.markedQuests.length; i--;) if (q.markedQuests[i] === id) q.markedQuests.splice(i, 1);
+			}
+			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+		} catch (_) { /* a repair pass must never break the sync flow */ }
 	}
 
 	/** Issue 9: for a member who ALREADY solved the synced side quest, register a
@@ -589,50 +643,134 @@ export class StorySyncController {
 			if (!this.active || this.isPlotQuest(this.quest)) return;
 			const q = this.questManager();
 			if (!q || typeof q.isQuestSolved !== 'function' || !q.isQuestSolved(this.quest)) return;
-			if (this.virtualQuestId) return;
+			// ROUND 119: a solved member must NOT also carry an ACTIVE copy of the
+			// real quest — that residue is exactly the "duplicate without the [同步]
+			// prefix that never disappears" report. Drop it before registering the
+			// prefixed view entry.
+			try { this.repairDualQuestState(this.quest); } catch (_) { /* ignore */ }
 			const id = this.virtualSyncId();
-			if (q.staticQuests[id]) { this.virtualQuestId = id; return; }
-			const db: any = (ig as any).database;
-			const raw: any = db && typeof db.get === 'function' ? db.get('quests') : null;
-			const src = raw && raw[this.quest];
-			if (!src) {
-				console.warn('[storysync] virtual quest skipped: no database entry for ' + this.quest);
+			// Idempotency must check the LIVE state, not our flag: a mid-sync save
+			// load rebuilds the quest model from the guarded snapshot (no virtual
+			// entry) without telling us, and an ejected state leaves the static
+			// entry behind — both used to suppress re-creation forever.
+			const liveIdx = q._activeQuestIndex ? q._activeQuestIndex[id] : undefined;
+			if (typeof liveIdx === 'number' && q.activeQuests[liveIdx]
+				&& q.activeQuests[liveIdx].quest && q.activeQuests[liveIdx].quest.id === id) {
+				this.virtualQuestId = id;
 				return;
 			}
-			// Clone the raw quest definition, strip rewards/parent linkage and mark
-			// it as the sync-view copy.
-			const clone: any = {};
-			for (const k in src) clone[k] = src[k];
-			const prefix = t('storySyncVirtualPrefix');
-			if (clone.name && typeof clone.name === 'object') {
-				const names: any = {};
-				for (const lang in clone.name) {
-					const base = String(clone.name[lang] || '');
-					names[lang] = prefix + base;
+			// Drop leftovers of a previous copy: a stale solved marker would list the
+			// entry under SOLVED, and a queued solved-dialog would pop a stray
+			// QuestSolved cutscene for it later.
+			if (q.finishedQuests && q.finishedQuests[id]) { try { delete q.finishedQuests[id]; } catch (_) { /* ignore */ } }
+			if (Array.isArray(q._solvedQueue)) {
+				for (let i = q._solvedQueue.length; i--;) {
+					if (q._solvedQueue[i] === id) q._solvedQueue.splice(i, 1);
 				}
-				names.en_US = names.en_US || prefix + this.questLabel(this.quest);
-				names.zh_CN = names.zh_CN || names.en_US;
-				clone.name = names;
-			} else {
-				clone.name = { en_US: prefix + this.questLabel(this.quest), zh_CN: prefix + this.questLabel(this.quest) };
 			}
-			clone.rewards = {};
-			clone.hideRewards = true;
-			clone.noTrack = true;
-			clone.parent = undefined;
-			clone.extension = false;
 			const Quest: any = (sc as any).Quest;
 			const QuestState: any = (sc as any).QuestState;
 			if (!Quest || !QuestState) return;
-			const virt = new Quest(clone, id);
-			q.staticQuests[id] = virt;
-			const st = new QuestState(virt);
+			let virt = q.staticQuests[id];
+			if (!virt) {
+				const db: any = (ig as any).database;
+				const raw: any = db && typeof db.get === 'function' ? db.get('quests') : null;
+				const src = raw && raw[this.quest];
+				if (!src) {
+					console.warn('[storysync] virtual quest skipped: no database entry for ' + this.quest);
+					return;
+				}
+				// Clone the raw quest definition, strip rewards/parent linkage and mark
+				// it as the sync-view copy.
+				const clone: any = {};
+				for (const k in src) clone[k] = src[k];
+				const prefix = t('storySyncVirtualPrefix');
+				if (clone.name && typeof clone.name === 'object') {
+					const names: any = {};
+					for (const lang in clone.name) {
+						const base = String(clone.name[lang] || '');
+						names[lang] = prefix + base;
+					}
+					names.en_US = names.en_US || prefix + this.questLabel(this.quest);
+					names.zh_CN = names.zh_CN || names.en_US;
+					clone.name = names;
+				} else {
+					clone.name = { en_US: prefix + this.questLabel(this.quest), zh_CN: prefix + this.questLabel(this.quest) };
+				}
+				clone.rewards = {};
+				clone.hideRewards = true;
+				clone.noTrack = true;
+				clone.parent = undefined;
+				clone.extension = false;
+				try {
+					virt = new Quest(clone, id);
+				} catch (qe) {
+					// ROUND 119: some db entries (hubSettings/subQuests/odd fields) may
+					// not survive cloning — fall back to a minimal view copy so the
+					// prefixed entry ALWAYS appears instead of silently missing.
+					console.warn('[storysync] virtual quest clone failed for ' + this.quest + ' — retrying minimal copy', qe);
+					virt = new Quest({
+						name: clone.name,
+						description: src.description,
+						briefing: src.briefing,
+						level: src.level,
+						order: src.order,
+						area: src.area,
+						tasks: src.tasks,
+						rewards: {},
+						hideRewards: true,
+						noTrack: true,
+					}, id);
+				}
+				q.staticQuests[id] = virt;
+			}
+			// Skip native initState (2nd ctor arg): a solved member's local facts
+			// (owned COLLECT items, unlocked LANDMARKs) would instantly auto-advance —
+			// even natively FINISH — the entry before the leader's first state packet
+			// arrives. Seed the per-task data skeleton directly; KILL/CONDITION/QUEST
+			// initState are safe zeros, COLLECT/LANDMARK stay empty until the stream
+			// fills them (first leader packet lands within 0.25s).
+			const st = new QuestState(virt, true);
+			st.labels = {};
+			st.done = [];
+			const tasks = Array.isArray(virt.tasks) ? virt.tasks : [];
+			for (let ti = 0; ti < tasks.length; ti++) {
+				const subs = (tasks[ti] && tasks[ti].subTasks) || [];
+				const row: any[] = [];
+				for (let si = 0; si < subs.length; si++) {
+					const data: any = {};
+					const sub = subs[si];
+					try {
+						if (sub && (sub.type === 'KILL' || sub.type === 'CONDITION' || sub.type === 'QUEST')
+							&& typeof sub.initState === 'function') sub.initState(data, st.labels);
+					} catch (_) { /* ignore */ }
+					row.push(data);
+				}
+				st.done.push(row);
+			}
+			/* VIEW-ONLY CONTRACT: local engine pumps (combat kill relays, item and
+			 * landmark updates, condition solves) iterate EVERY active quest state —
+			 * including this one. Without these overrides a locally fulfilled final
+			 * task runs the engine's native finish path (increaseTaskIndex ->
+			 * setQuestFinished) and EJECTS the entry from the active list mid-sync.
+			 * The leader's streamed setLoadData (applyVirtualQuestState) is the single
+			 * source of truth for this entry. */
+			st.updateState = function () { /* view-only: driven by the leader stream */ };
+			st.increaseTaskIndex = function () { /* view-only */ };
+			st.resetTaskIndex = function () { /* view-only */ };
 			q.activeQuests.push(st);
 			if (!q._activeQuestIndex) q._activeQuestIndex = {};
 			q._activeQuestIndex[id] = q.activeQuests.length - 1;
 			this.virtualQuestId = id;
 			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
-			console.log('[storysync] virtual quest registered: ' + id);
+			// ROUND 119: log the RESOLVED display name — if a member ever reports a
+			// missing [同步] prefix again, this line proves what the entry shows.
+			let resolvedName = '';
+			try { resolvedName = String((virt.name && virt.name.value) || virt.name || ''); } catch (_) { /* ignore */ }
+			console.log('[storysync] virtual quest registered: ' + id + ' name="' + resolvedName + '"');
+			// ROUND 103: (re)created the virtual entry — point the HUD mark at it
+			// (also covers the mid-sync reload rebuild path via the 1s heal pump).
+			try { this.autoMarkSyncedQuest(); } catch (_) { /* ignore */ }
 		} catch (_) { /* a UI helper must never break the sync */ }
 	}
 
@@ -643,11 +781,24 @@ export class StorySyncController {
 			if (!q) return;
 			const st = q.getQuestState ? q.getQuestState({ id: this.virtualQuestId }) : null;
 			if (!st) return;
+			const quest: any = st.quest;
+			const taskCount = quest && Array.isArray(quest.tasks) ? quest.tasks.length : 0;
+			let task = Number(state.task) || 0;
+			let highest = Number(state.highest) || 0;
+			if (taskCount > 0) {
+				// The leader's solved serialization reports task == tasks.length (one
+				// past the end) — clamp so the menu never reads an out-of-bounds task.
+				task = Math.min(task, taskCount - 1);
+				highest = Math.min(highest, taskCount - 1);
+			}
+			// The finish packet carries an EMPTY completed array; keep the last known
+			// per-task data so the entry still renders its final task text.
+			const completed = (Array.isArray(state.completed) && state.completed.length) ? state.completed : st.done;
 			st.setLoadData({
 				finished: !!state.finished,
-				task: Number(state.task) || 0,
-				highest: Number(state.highest) || 0,
-				completed: state.completed || [],
+				task,
+				highest,
+				completed,
 				labels: state.labels || {},
 			});
 			try { (sc as any).Model.notifyObserver(q, 1, st); } catch (_) { /* ignore */ }
@@ -657,22 +808,50 @@ export class StorySyncController {
 
 	private removeVirtualQuest(): void {
 		try {
-			const id = this.virtualQuestId;
 			this.virtualQuestId = '';
-			if (!id) return;
 			const q = this.questManager();
 			if (!q) return;
-			const idx = q._activeQuestIndex ? q._activeQuestIndex[id] : -1;
-			if (typeof idx === 'number' && idx >= 0 && q.activeQuests[idx] && q.activeQuests[idx].quest && q.activeQuests[idx].quest.id === id) {
-				q.activeQuests.splice(idx, 1);
-				for (const k in q._activeQuestIndex) {
-					if (q._activeQuestIndex[k] > idx) q._activeQuestIndex[k] = q._activeQuestIndex[k] - 1;
-				}
+			// ROUND 119: never trust just the tracked id field — recompute the
+			// expected id and SWEEP for any 'mp.sync.*' residue, so a lost field (or
+			// an entry left behind by an older build) can never outlive the mode.
+			const ids: string[] = [];
+			if (this.quest) ids.push(this.virtualSyncId());
+			try {
+				for (const k in (q.staticQuests || {})) if (typeof k === 'string' && k.indexOf('mp.sync.') === 0 && ids.indexOf(k) === -1) ids.push(k);
+				if (q._activeQuestIndex) for (const k in q._activeQuestIndex) if (typeof k === 'string' && k.indexOf('mp.sync.') === 0 && ids.indexOf(k) === -1) ids.push(k);
+			} catch (_) { /* ignore */ }
+			for (let n = 0; n < ids.length; n++) {
+				const id = ids[n];
+				try {
+					const idx = q._activeQuestIndex ? q._activeQuestIndex[id] : -1;
+					if (typeof idx === 'number' && idx >= 0 && q.activeQuests[idx] && q.activeQuests[idx].quest && q.activeQuests[idx].quest.id === id) {
+						q.activeQuests.splice(idx, 1);
+						for (const k in q._activeQuestIndex) {
+							if (q._activeQuestIndex[k] > idx) q._activeQuestIndex[k] = q._activeQuestIndex[k] - 1;
+						}
+					}
+					if (q._activeQuestIndex) delete q._activeQuestIndex[id];
+					// If the engine ever natively finished the entry (a local pump before
+					// the view-only hardening), drop the stale solved marker + queued
+					// solved dialog too — otherwise they outlive the mode and corrupt the
+					// SOLVED tab.
+					if (q.finishedQuests && q.finishedQuests[id]) { try { delete q.finishedQuests[id]; } catch (_) { /* ignore */ } }
+					if (Array.isArray(q._solvedQueue)) {
+						for (let i = q._solvedQueue.length; i--;) {
+							if (q._solvedQueue[i] === id) q._solvedQueue.splice(i, 1);
+						}
+					}
+					if (Array.isArray(q.markedQuests)) {
+						for (let i = q.markedQuests.length; i--;) if (q.markedQuests[i] === id) q.markedQuests.splice(i, 1);
+					}
+					try { delete q.staticQuests[id]; } catch (_) { /* ignore */ }
+					console.log('[storysync] virtual quest removed: ' + id);
+				} catch (_) { /* ignore */ }
 			}
-			if (q._activeQuestIndex) delete q._activeQuestIndex[id];
-			try { delete q.staticQuests[id]; } catch (_) { /* ignore */ }
+			// If the HUD focus pointed at (or past) a removed entry, clamp it — a
+			// stale focusQuest would keep the tracker pinned to a vanished quest.
+			try { if (typeof q.focusQuest === 'number' && (q.focusQuest < 0 || q.focusQuest >= q.activeQuests.length)) q.focusQuest = -1; } catch (_) { /* ignore */ }
 			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
-			console.log('[storysync] virtual quest removed: ' + id);
 		} catch (_) { /* ignore */ }
 	}
 
@@ -726,7 +905,13 @@ export class StorySyncController {
 			try {
 				const tmp: any = {};
 				self.rawQuestSave.call(q, tmp);
-				if (self.active && !self.committed && self.snapshot) {
+				// ROUND 102 (inherit synced progress): the snapshot substitution now
+				// applies to MAIN-STORY sync only. For side quests the live (leader-
+				// synced) progress is written into every save even mid-sync — the exit
+				// matrix commits that progress, so persisting it continuously removes
+				// the whole "last guarded save reloads to pre-sync progress" class of
+				// bugs (area autosaves fire constantly while a party plays).
+				if (self.active && !self.committed && self.snapshot && self.isPlotQuest(self.quest)) {
 					box.quests = self.plainClone(self.snapshot);
 				} else {
 					box.quests = tmp.quests;
@@ -821,6 +1006,55 @@ export class StorySyncController {
 	}
 
 	// --------------------------------------------------------- start handshake
+
+	/** ROUND 102: lift the ROUND 101 view-only hardening off the synced quest
+	 * state (mode ended with a commit). Instance-level `delete` restores the
+	 * prototype methods, so the inherited progress can advance natively again.
+	 * No-op when the state is gone (finished quests leave the active list) or was
+	 * never hardened (leader / already-solved virtual path). */
+	private unhardenSyncedQuestState(): void {
+		try {
+			const q = this.questManager();
+			if (!q || typeof q.getStaticQuest !== 'function' || typeof q.getQuestState !== 'function') return;
+			const quest = q.getStaticQuest(this.quest);
+			const st = quest && q.getQuestState(quest);
+			if (!st || !st._mpStoryViewOnly) return;
+			delete st.updateState;
+			delete st.increaseTaskIndex;
+			delete st.resetTaskIndex;
+			delete st._mpStoryViewOnly;
+			console.log('[storysync] member quest state unhardened (inherited progress is live): ' + this.quest);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 102: write the inherited (leader-synced) quest progress to the local
+	 * auto slot AND upload it to the server, checkpoint-safe (never moves the
+	 * respawn checkpoint — same approach as multiplayer.saveWithoutMovingCheckpoint).
+	 * Prefers multiplayer.saveNow so the upload rides the normal reason-stamped
+	 * hook; without a connection (session teardown after a server loss) it still
+	 * persists LOCALLY so a reload keeps the progress. Skipped mid-cutscene: a
+	 * save there could persist half-run event vars (the progress stays in memory
+	 * and the next normal save captures it). Never throws — this runs inside the
+	 * exit path. */
+	private persistSyncedProgress(): void {
+		try {
+			const model: any = (sc as any).model;
+			if (model && typeof model.isCutscene === 'function' && model.isCutscene()) return;
+			const storage: any = (ig as any).storage;
+			if (!storage || !ig.game || !(ig.game as any).playerEntity) return;
+			const m: any = this.main as any;
+			const conn = m && m.connection;
+			if (m && typeof m.saveNow === 'function' && conn && conn.isOpen && conn.isOpen()) {
+				m.saveNow('storySyncCommit');   // maps to 'other' — never throttled server-side
+				console.log('[storysync] inherited quest progress persisted (save + upload)');
+				return;
+			}
+			const state: any = {};
+			storage._saveState(state);
+			if (typeof storage.saveAutoSlot === 'function') storage.saveAutoSlot(state);
+			console.log('[storysync] inherited quest progress persisted (local slot only)');
+		} catch (_) { /* a save must never break the exit path */ }
+	}
 
 	/** 1.71.7: netSync reads this to decide whether a relayed questKill may cross
 	 * maps (story-sync party relay) or must stay same-map (normal instance relay). */
@@ -973,6 +1207,10 @@ export class StorySyncController {
 			// A mid-way joiner handshake push also refreshes membership.
 			this.leader = data.leader;
 			this.members = Array.isArray(data.members) ? data.members.slice() : [];
+			// A same-quest (re)start while we are still active skips the full start
+			// path below — re-verify the solved-member view entry explicitly (a save
+			// load or an ejected state may have removed it without clearing our flag).
+			try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
 			return;
 		}
 		if (this.active) this.exitLocal('replaced', true);
@@ -998,6 +1236,7 @@ export class StorySyncController {
 		this.waitingOpen = false;
 		this.lastSent = '';
 		this.leaderCompleteAt = 0;
+		this.lastLeaderState = null;
 
 		const captured = this.captureSnapshot();
 		this.active = true;
@@ -1014,11 +1253,18 @@ export class StorySyncController {
 		// 1.71.9 (issue 9): a member whose save already solved this quest gets a
 		// virtual "[同步] …" quest entry for the duration of the mode (no rewards).
 		try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
-		this.lockQuestHud();
+		// ROUND 103: auto-mark + HUD-focus the synced quest for EVERY client —
+		// unfinished players track the real quest, already-solved members track
+		// the virtual "[同步]" entry (created just above, so the id exists).
+		try { this.autoMarkSyncedQuest(); } catch (_) { /* ignore */ }
 		if (this.isLocalLeader()) {
 			this.markStateDirty();
 			showMpToast({ title: t('storySyncStartedLeader'), subtitle: this.questLabel(this.quest) });
 		} else {
+			// ROUND 101: pin the synced quest view-only IMMEDIATELY — even in the
+			// window before the first leader packet lands, a local pump must not
+			// move our own progress off the leader's.
+			try { this.hardenSyncedQuestState(); } catch (_) { /* ignore */ }
 			showMpToast({ title: t('storySyncStartedMember'), subtitle: this.questLabel(this.quest) });
 		}
 		try { this.refreshQuestButton(); } catch (_) { /* ignore */ }
@@ -1029,21 +1275,51 @@ export class StorySyncController {
 		try { this.playCommencementBanner(); } catch (_) { /* ignore */ }
 	}
 
-	private lockQuestHud(): void {
-		if (this.isPlotQuest(this.quest)) return; // main story has no quest-star lock
-		const q = this.questManager();
-		if (!q || typeof q.isMarkedQuest !== 'function' || typeof q.markQuest !== 'function') return;
+	/** ROUND 103: auto-mark the synced quest and POINT THE HUD AT IT (Q top-right
+	 * tracker). Two target ids: an unfinished player tracks the REAL quest; a member
+	 * who already solved it tracks the virtual "[同步]" entry instead (the engine
+	 * can never mark a solved quest — markQuest erases those). markQuest is a
+	 * TOGGLE, so membership is only ever pushed when absent; and since marking
+	 * alone resets focusQuest to -1 (HUD blank), the focus index is set explicitly
+	 * via the engine's own setFavQuestOld. This runs at MODE START and whenever the
+	 * virtual entry is (re)created — afterwards the mark is free: the mid-sync
+	 * markQuest member-lock is gone, so a player may unmark or switch any time. */
+	private autoMarkSyncedQuest(): void {
 		try {
-			const st = this.questStatus(this.quest);
-			if (st.active && !st.solved && !q.isMarkedQuest(this.quest)) q.markQuest(this.quest);
-		} catch (_) { /* ignore */ }
+			if (!this.active || this.isPlotQuest(this.quest)) return; // main story has no quest entry
+			const q = this.questManager();
+			if (!q || typeof q.isMarkedQuest !== 'function' || typeof q.markQuest !== 'function') return;
+			const solved = typeof q.isQuestSolved === 'function' && q.isQuestSolved(this.quest);
+			const id = (solved && this.virtualQuestId) ? this.virtualQuestId : this.quest;
+			if (!id) return;
+			if (solved && !this.virtualQuestId) return;    // virtual entry not up yet — the creation path re-calls us
+			if (!q.isMarkedQuest(id)) {
+				try { q.markQuest(id); } catch (_) { /* ignore */ }
+			}
+			const marked: any[] = Array.isArray(q.markedQuests) ? q.markedQuests : [];
+			const idx = marked.indexOf(id);
+			if (idx < 0 || q.focusQuest === idx) return;
+			if (typeof q.setFavQuestOld === 'function') {
+				q.setFavQuestOld(idx);
+			} else {
+				q.focusQuest = idx;
+				try { (sc as any).Model.notifyObserver(q, (sc as any).QUEST_MODEL_EVENT.FAV_QUEST_CHANGED, -1); } catch (_) { /* ignore */ }
+			}
+			try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			console.log('[storysync] auto-marked synced quest for the HUD: ' + id);
+		} catch (_) { /* a HUD nicety must never break the sync */ }
 	}
 
 	// ------------------------------------------------------------- state relay
 
 	public markStateDirty(): void {
 		this.stateTimer = 0;
-		this.stateHeartbeat = STATE_HEARTBEAT;
+		// ROUND 118: do NOT rewind stateHeartbeat here. Combat/vars pumps notify
+		// quest-model UPDATE events even when nothing actually changed, and every
+		// such event used to restart the 1.5s countdown — under sustained activity
+		// the forced re-send (the ONLY thing that re-heals a member who missed a
+		// packet mid-load) was starved indefinitely. The forced send is cheap and
+		// idempotent; let the heartbeat run its course.
 	}
 
 	private sendStateIfLeader(force: boolean): void {
@@ -1092,11 +1368,26 @@ export class StorySyncController {
 				this.tryFinishSyncedQuest(state);
 				return;
 			}
+			// ROUND 118: cache the leader's latest state for the 1s convergence pump.
+			// This MUST happen before the st-null early return below — a packet that
+			// lands mid-load is deliberately dropped here, and without the cache the
+			// member would sit at its own (possibly AHEAD) progress until the leader's
+			// state actually changes again.
+			this.lastLeaderState = state;
 			let st = typeof q.getQuestState === 'function' ? q.getQuestState(quest) : null;
 			if (!st) {
 				if (this.questStatus(this.quest).active) {
-					// Wait for the next packet rather than re-activating (the game
-					// state may be mid-load).
+					// Wait for the 1s convergence pump rather than re-activating (the
+					// game state may be mid-load).
+					return;
+				}
+				// ROUND 119: never RE-ACTIVATE a quest this client has already solved
+				// (defense in depth — the isQuestSolved branch above normally returns
+				// first, but a dual-state residue or a transient finishedQuests gap
+				// must never create an unprefixed ACTIVE duplicate).
+				if (typeof q.isQuestSolved === 'function' && q.isQuestSolved(this.quest)) {
+					try { this.repairDualQuestState(this.quest); } catch (_) { /* ignore */ }
+					try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
 					return;
 				}
 				if (typeof q.activateStaticQuest === 'function') {
@@ -1104,6 +1395,13 @@ export class StorySyncController {
 					st = q.getQuestState(quest);
 				}
 				if (!st) return;
+			}
+			// Pin the synced quest as view-only BEFORE loading the leader's data, so
+			// no local pump can mutate the state we are about to adopt.
+			this.hardenSyncedQuestState();
+			if (st.currentTask !== (Number(state.task) || 0) || st.highestTask !== (Number(state.highest) || 0)) {
+				console.log('[storysync] member quest re-aligned to leader: task ' + st.currentTask + ' -> ' + (Number(state.task) || 0)
+					+ ' (highest ' + st.highestTask + ' -> ' + (Number(state.highest) || 0) + ') ' + this.quest);
 			}
 			st.setLoadData({
 				finished: false,
@@ -1117,6 +1415,83 @@ export class StorySyncController {
 		} catch (err) {
 			console.warn('[storysync] apply state failed', err);
 		}
+	}
+
+	/** ROUND 101 (quest progress alignment): while story sync is active a MEMBER's
+	 * synced quest is VIEW-ONLY — the leader's stream is the single source of truth
+	 * (the same contract the virtual "[同步]" entry already uses). Without this,
+	 * LOCAL quest pumps keep advancing the member's own state between leader
+	 * packets and the party's progress diverges: COLLECT on the member's own item
+	 * pickups, LANDMARK triggers, the questKill relay, CONDITION solves, and the
+	 * ITEM_REMOVED/EQUIP_CHANGE undo path (resolveActiveQuestChanges) ALL reach the
+	 * state through updateState/increaseTaskIndex/resetTaskIndex — no-op those
+	 * three and the member can only ever show the leader's progress. The overrides
+	 * are instance-level: cancel/leave restores the snapshot (onStoragePreLoad
+	 * rebuilds fresh states) and completion removes the state from the active list
+	 * via setQuestFinished, so nothing about them outlives the mode. Guards:
+	 * member-side only, side quests only (plot sync clamps plot.line instead), the
+	 * quest must be active-and-unsolved (solved members follow via the virtual
+	 * entry, which is hardened separately). Idempotent via _mpStoryViewOnly. */
+	/** ROUND 118 (member-ahead-of-leader fix): member-side CONVERGENCE. The
+	 * leader's stream is the source of truth, but a state packet can be lost on
+	 * the member (deliberately dropped while the quest model is mid-load) and a
+	 * mid-sync save LOAD rebuilds quest states from a checkpoint that may predate
+	 * the sync — both leave the member stuck at its own (possibly FURTHER-ALONG)
+	 * progress, and the view-only hardening then freezes it there. The leader's
+	 * 0.25s stream skips unchanged states, so nothing re-heals that. This pump
+	 * (1s, member side only) re-applies the cached leader state whenever the live
+	 * quest state has drifted from it — INCLUDING regressing a member who is
+	 * ahead of the leader. */
+	private convergeSyncedQuest(): void {
+		try {
+			const want = this.lastLeaderState;
+			if (!want || !this.active || this.isLocalLeader() || this.isPlotQuest(this.quest)) return;
+			if (want.finished) return; // the completion path (tryFinishSyncedQuest) owns that transition
+			const q = this.questManager();
+			if (!q || typeof q.getStaticQuest !== 'function' || typeof q.getQuestState !== 'function') return;
+			if (typeof q.isQuestSolved === 'function' && q.isQuestSolved(this.quest)) return; // solved members converge via the virtual entry
+			const quest = q.getStaticQuest(this.quest);
+			const st = quest && q.getQuestState(quest);
+			if (!st) return;
+			const task = Number(want.task) || 0;
+			const highest = Number(want.highest) || 0;
+			const sameCore = st.currentTask === task && st.highestTask === highest && !st.finished;
+			let sameDetail = true;
+			try {
+				sameDetail = JSON.stringify(st.done) === JSON.stringify(want.completed || [])
+					&& JSON.stringify(st.labels) === JSON.stringify(want.labels || {});
+			} catch (_) { sameDetail = false; }
+			if (sameCore && sameDetail) return;
+			this.hardenSyncedQuestState();
+			console.log('[storysync] member quest converged to leader: task ' + st.currentTask + ' -> ' + task
+				+ ' (highest ' + st.highestTask + ' -> ' + highest + ') ' + this.quest);
+			st.setLoadData({
+				finished: false,
+				task,
+				highest,
+				completed: want.completed || [],
+				labels: want.labels || {},
+			});
+			try { (sc as any).Model.notifyObserver(q, 1, st); } catch (_) { /* ignore */ }
+			try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+		} catch (_) { /* a convergence pump must never break the frame */ }
+	}
+
+	private hardenSyncedQuestState(): void {
+		try {
+			if (!this.active || this.isLocalLeader() || this.isPlotQuest(this.quest)) return;
+			const q = this.questManager();
+			if (!q || typeof q.getStaticQuest !== 'function' || typeof q.getQuestState !== 'function') return;
+			if (typeof q.isQuestSolved === 'function' && q.isQuestSolved(this.quest)) return;
+			const quest = q.getStaticQuest(this.quest);
+			const st = quest && q.getQuestState(quest);
+			if (!st || st._mpStoryViewOnly) return;
+			st._mpStoryViewOnly = true;
+			st.updateState = function () { /* view-only: driven by the leader stream */ };
+			st.increaseTaskIndex = function () { /* view-only */ };
+			st.resetTaskIndex = function () { /* view-only */ };
+			console.log('[storysync] member quest state hardened view-only: ' + this.quest);
+		} catch (_) { /* ignore */ }
 	}
 
 	/** Apply the FINAL completed progress through the game's own finish path so
@@ -1165,6 +1540,24 @@ export class StorySyncController {
 			this.ensureEngineHooks();
 			this.ensureStoryIntegrity();
 			if (this.active) {
+				// Self-heal the solved-member view entry once a second: a mid-sync save
+				// LOAD rebuilds the quest model from the guarded snapshot (which has no
+				// virtual entry) without notifying us — recreate it so it always returns.
+				if (!this.isLocalLeader()) {
+					const now = Date.now();
+					if (now - this.virtualHealAt > 1000) {
+						this.virtualHealAt = now;
+						try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
+						// ROUND 101: keep the synced quest view-only too — a mid-sync
+						// save LOAD rebuilds the quest model from the guarded snapshot
+						// (fresh QuestState instances without the overrides).
+						try { this.hardenSyncedQuestState(); } catch (_) { /* ignore */ }
+						// ROUND 118: and re-converge onto the cached leader state — the
+						// rebuild above may have restored a PRE-SYNC (or further-along)
+						// progress that the leader's unchanged-state stream never re-sends.
+						try { this.convergeSyncedQuest(); } catch (_) { /* ignore */ }
+					}
+				}
 				if (this.isLocalLeader()) {
 					this.stateTimer -= ig.system.tick || 0;
 					this.stateHeartbeat -= ig.system.tick || 0;
@@ -1173,7 +1566,13 @@ export class StorySyncController {
 						this.sendStateIfLeader(false);
 					} else if (this.stateHeartbeat <= 0) {
 						this.stateHeartbeat = STATE_HEARTBEAT;
-						this.sendStateIfLeader(false);
+						// FORCE the heartbeat re-send: the 0.25s path above skips an
+						// unchanged state, so without force a member that drifted
+						// (missed packet, mid-load join, a local pump that fired before
+						// the view-only hardening latched) would NEVER re-align until
+						// the leader's next actual progress. The heartbeat exists to
+						// self-heal exactly that divergence.
+						this.sendStateIfLeader(true);
 					}
 					if (this.leaderCompleteAt && Date.now() >= this.leaderCompleteAt) {
 						this.leaderCompleteAt = 0;
@@ -1225,6 +1624,7 @@ export class StorySyncController {
 		this.installTriggerHooks();
 		this.installEventStepHooks();
 		this.installQuestMenuHooks();
+		this.installQuestVarHook();
 		this.installPartyStoryMarkerHook();
 	}
 
@@ -1357,30 +1757,13 @@ export class StorySyncController {
 					if (ev) ev._mpStoryQuestSolvedEvent = true;
 					return ev;
 				},
-				markQuest(this: any, id: string) {
-					const ctl: StorySyncController = (window as any).__mpStory;
-					if (ctl && ctl.isLocalMember() && ctl.isQuestLockedForMembers()) {
-						if (id !== ctl.quest) {
-							if (Date.now() - ctl.lastLockToastAt > SUPPRESS_TOAST_COOLDOWN) {
-								ctl.lastLockToastAt = Date.now();
-								showMpToast({ title: t('storySyncQuestLocked') });
-							}
-							return;
-						}
-						if (ctl.questManager() && ctl.questManager().isMarkedQuest(id)) return; // can't un-lock
-					}
-					return this.parent(id);
-				},
+				// ROUND 103: the markQuest member-lock was REMOVED (user decision) —
+				// side-quest sync no longer locks the star/favorite mark. The synced
+				// quest is auto-marked at mode start (autoMarkSyncedQuest), but every
+				// player keeps the right to unmark it or mark any other quest.
 			});
 			console.log('[storysync] QuestModel hooks installed');
 		} catch (_) { /* ignore */ }
-	}
-
-	public lastLockToastAt = 0;
-	public isQuestLockedForMembers(): boolean {
-		// Only the SIDE-quest sync mode locks the star/favorite mark. Main-story
-		// sync must leave the quest tab fully usable.
-		return this.isLocalMember() && !this.isPlotQuest(this.quest);
 	}
 
 	/** True when the member's LOCAL attempt to start a story cutscene must be
@@ -2485,9 +2868,12 @@ export class StorySyncController {
 			try { raw = JSON.stringify(task.data || task); } catch (_) { raw = String(task.data || task); }
 			if (raw.indexOf('First Scholars HQ') !== -1 && raw.indexOf('Schneider') !== -1
 				&& raw.indexOf('Follow') !== -1) return true;
-			// Fallback for a localized-only task payload.
+			// Fallback for a localized-only task payload. permaTask may be an
+			// ig.LangLabel instance — getText needs its raw Data map (see
+			// questLabel), so unwrap .data when present.
+			const taskData = task && task.data ? task.data : task;
 			const text = (ig as any).LangLabel && typeof (ig as any).LangLabel.getText === 'function'
-				? String((ig as any).LangLabel.getText(task)) : '';
+				? String((ig as any).LangLabel.getText(taskData)) : '';
 			return text.indexOf('第一学者') !== -1 && text.indexOf('剪刀手') !== -1 && text.indexOf('跟着') !== -1;
 		} catch (_) { return false; }
 	}
@@ -2645,8 +3031,24 @@ export class StorySyncController {
 				this.hideTriggerBanner();
 				this.clearLeaderCamera();
 				this.leaderCompleteAt = 0;
+				this.lastLeaderState = null;
 				this.finishedSynced = false;
 				try { closeStoryWindows(); } catch (_) { /* ignore */ }
+				// ROUND 102 (inherit synced progress): side-quest exits COMMIT the live
+				// (leader-synced) progress — persist it NOW. In-sync saves already wrote
+				// pre-sync blocks to the local slot AND the server (area autosaves fire
+				// constantly), so without an immediate commit-save a reload before the
+				// next autosave — or a quit mid-sync, whose exit save is built before the
+				// session teardown commits — silently rolled the quest back for everyone,
+				// leader included. Plot mode restores instead: its pre-sync state is what
+				// every pre-existing save already carries.
+				if (!this.isPlotQuest(this.quest)) {
+					// Undo the ROUND 101 view-only hardening FIRST: the inherited quest
+					// must be locally progressable again from here on (deleting the
+					// instance overrides restores the prototype methods).
+					try { this.unhardenSyncedQuestState(); } catch (_) { /* ignore */ }
+					try { this.persistSyncedProgress(); } catch (_) { /* ignore */ }
+				}
 			}
 			if (force || !this.active) this.pendingStartReset();
 			try { this.refreshQuestButton(); } catch (_) { /* ignore */ }
@@ -2656,10 +3058,100 @@ export class StorySyncController {
 			this.active = false;
 			this.committed = true;
 			this.snapshot = null;
+			// …and never leave the ROUND 101 view-only hardening latched either.
+			try { this.unhardenSyncedQuestState(); } catch (_) { /* ignore */ }
 		}
 	}
 
 	// ------------------------------------------------------------ trigger steps
+
+	/** ROUND 120 (solved-member story dialogue): a member who ALREADY solved the
+	 * synced quest reads quest vars through the engine's finishedQuests branch —
+	 * `quest.<id>.currentTask` reports the FINAL stage and `isTaskDone` answers
+	 * true for every task. Replayed NPC/story dialogue events branch on exactly
+	 * these vars, so a solved member saw their own post-quest lines instead of
+	 * the leader's current stage. While the mode is active, route quest-var and
+	 * task queries for the synced quest through the virtual "[同步]" state (the
+	 * leader's streamed progress). Unsolved members need nothing — their real
+	 * state is already pinned to the leader. */
+	private installQuestVarHook(): void {
+		try {
+			if (this.questVarHookInstalled) return;
+			const QM: any = (sc as any).QuestModel;
+			if (!QM || typeof QM.inject !== 'function') return;
+			this.questVarHookInstalled = true;
+			QM.inject({
+				onVarAccess(this: any, a: any, b: any) {
+					try {
+						const ctl: StorySyncController = (window as any).__mpStory;
+						if (ctl && Array.isArray(b) && b[0] === 'quest' && b[1] === ctl.currentQuest()) {
+							const st = ctl.syncedQuestView();
+							if (st) {
+								const v = ctl.questVarValue(st, b);
+								if (v.handled) return v.value;
+							}
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(a, b);
+				},
+				isTaskDone(this: any, a: any, b: any) {
+					try {
+						const ctl: StorySyncController = (window as any).__mpStory;
+						if (ctl && a && a.id === ctl.currentQuest()) {
+							const st = ctl.syncedQuestView();
+							if (st) return st.currentTask > b;
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(a, b);
+					},
+				getCurrentTask(this: any, a: any, b: any) {
+					try {
+						const ctl: StorySyncController = (window as any).__mpStory;
+						if (ctl && a && a.id === ctl.currentQuest()) {
+							const st = ctl.syncedQuestView();
+							if (st) return b ? st.highestTask : st.currentTask;
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(a, b);
+				},
+			});
+			console.log('[storysync] quest var hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** The leader-synced view of the synced quest for a member who already solved
+	 * it: the virtual entry's QuestState. Null for leaders, unsolved members (their
+	 * real state already tracks the leader), plot sync, or while the virtual entry
+	 * is momentarily down (mid-load — the 1s heal pump recreates it). */
+	public syncedQuestView(): any {
+		try {
+			if (!this.active || !this.isLocalMember() || this.isPlotQuest(this.quest)) return null;
+			const q = this.questManager();
+			if (!q || typeof q.isQuestSolved !== 'function' || !q.isQuestSolved(this.quest)) return null;
+			if (!this.virtualQuestId) return null;
+			return typeof q.getQuestState === 'function' ? q.getQuestState({ id: this.virtualQuestId }) : null;
+		} catch (_) { return null; }
+	}
+
+	/** Answer one `quest.<id>.<field>[.n]` var read against the synced view state,
+	 * mirroring the engine's ACTIVE-branch semantics exactly (so a solved member
+	 * computes the same branch results as the leader). */
+	public questVarValue(st: any, b: any[]): { handled: boolean, value: any } {
+		try {
+			const n = (b[3] as any) * 1;
+			switch (b[2]) {
+				case 'started': return { handled: true, value: true };
+				case 'solved': return { handled: true, value: !!st.finished };
+				case 'task': return { handled: true, value: st.currentTask === n };
+				case 'currentTask': return { handled: true, value: st.currentTask };
+				case 'subtask': return { handled: true, value: typeof st.isSubTaskSolved === 'function' ? !!st.isSubTaskSolved(n) : false };
+				case 'subvalue': return { handled: true, value: (typeof st.getCurrentSubTaskValue === 'function' ? st.getCurrentSubTaskValue(n) : 0) + '' };
+				case 'subrequire': return { handled: true, value: (typeof st.getCurrentSubTaskValue === 'function' ? st.getCurrentSubTaskValue(n, true) : 0) + '' };
+				case 'label': return { handled: true, value: st.labels ? st.labels[b[3]] : undefined };
+				default: return { handled: true, value: undefined };
+			}
+		} catch (_) { return { handled: false, value: undefined }; }
+	}
 
 	private installEventStepHooks(): void {
 		try {
@@ -2924,11 +3416,11 @@ export class StorySyncController {
 			// FF14 quest-accept fanfare for EVERY party member (onStart ran on all
 			// clients at once).
 			this.playStorySound('accept');
-			// Parties of 4+: after the commencement banner has faded, follow up with
+			// Parties of 3+: after the commencement banner has faded, follow up with
 			// the light/full party banner + the FF14 duty-enter jingle.
 			const count = this.members.length;
 			const quest = this.quest;
-			if (count >= 4) {
+			if (count >= 3) {
 				const kind = count >= 8 ? 'full' : 'light';
 				(window as any).setTimeout(() => {
 					try {
@@ -2977,12 +3469,15 @@ export class StorySyncController {
 			light: 'media/sound/storysync/light-party.ogg',
 			full: 'media/sound/storysync/full-party.ogg',
 		};
+		// 1.71.9 (QoL 3): the FF14 fanfares ship quiet — 1.75x makes the sync-start
+		// audio clearly audible over BGM without clipping (WebAudio volume is not
+		// clamped at construction; SoundHandle applies its own squared falloff).
+		// The light/full-party jingles play right after that fanfare and felt too
+		// loud at the same gain — halved to 50% of the accept fanfare (0.875).
+		const volumes: { [key: string]: number } = { accept: 1.75, light: 0.875, full: 0.875 };
 		let snd = this.storySounds[key];
 		if (!snd) {
-			// 1.71.9 (QoL 3): the FF14 fanfares ship quiet — 1.75x makes the sync-start
-			// audio clearly audible over BGM without clipping (WebAudio volume is not
-			// clamped at construction; SoundHandle applies its own squared falloff).
-			snd = new (ig as any).Sound(paths[key], 1.75);
+			snd = new (ig as any).Sound(paths[key], volumes[key]);
 			this.storySounds[key] = snd;
 		}
 		return snd;

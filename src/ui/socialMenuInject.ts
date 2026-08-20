@@ -1476,6 +1476,52 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         } catch (e) { /* ignore */ }
     }
 
+    /** ROUND 116: the native header NumberGuis are constructed with maxNumber = 4
+     * (the compiler inlined PARTY_MAX_MEMBERS+1) and NumberGui.setNumber CLAMPS to
+     * maxNumber — so updatePartyHeaderCount's /8 rewrite silently displayed /4
+     * (the "1/4" the user saw even though the party cap really is 8 server-side).
+     * Rebuild both header numbers with the true 8-slot cap, same style + anchors
+     * as the native ones (both are single-digit, so the layout is unchanged). */
+    function fixPartyHeaderNumberCaps(lea: any): void {
+        try {
+            if (!lea || !lea.isLea) return;
+            const opts = { size: (sc as any).NUMBER_SIZE.TINY, color: (sc as any).GUI_NUMBER_COLOR.GREY };
+            const rebuild = (old: any, posX: number, value: number) => {
+                if (!old || typeof old.maxNumber !== 'number' || old.maxNumber >= MP_PARTY_CAP) return old;
+                try { old.remove(); } catch (e) { /* ignore */ }
+                const g = new (sc as any).NumberGui(MP_PARTY_CAP, opts);
+                g.setAlign(ig.GUI_ALIGN.X_RIGHT, ig.GUI_ALIGN.Y_TOP);
+                g.setPos(posX, 2);
+                g.setNumber(Math.min(MP_PARTY_CAP, value), true);
+                lea.addChildGui(g);
+                return g;
+            };
+            lea.maxValue = rebuild(lea.maxValue, 6, MP_PARTY_CAP);
+            lea.currentValue = rebuild(lea.currentValue, 20, 1);
+        } catch (_) { /* header cosmetics must never break the box */ }
+    }
+
+    /** ROUND 116: party-leader gold — wrap a party-row name in the engine's own
+     * font color code. PURPLE(3), NOT ORANGE(5): the party row's name TextGui
+     * uses the default 16px font, which only registers RED/GREEN/PURPLE/GREY
+     * color sets — ORANGE exists only on the small/tiny fonts, so \\c[5] here
+     * silently fell back to white (the "leader name never turns gold" bug).
+     * PURPLE maps to hall-fetica-bold-purple.png, the game's gold (#FFE430) —
+     * the same index the gold overworld name tags use (mpOptions.ts). */
+    function goldLeaderText(name: string): string {
+        return '\\c[' + (((sc as any).FONT_COLORS && (sc as any).FONT_COLORS.PURPLE) || 3) + ']' + name + '\\c[0]';
+    }
+    /** Paint a party member row's name gold when it belongs to the party leader.
+     * Row name text = the account name (getCharacterName override) — wrap it. */
+    function paintLeaderRowGold(row: any, isLeader: boolean): void {
+        try {
+            if (!isLeader || !row || !row.info || !row.info.name || !row.info.name.setText) return;
+            const cur = row.info.name.text || '';
+            if (!cur || cur.indexOf('\\c[') === 0) return; // already colored
+            row.info.name.setText(goldLeaderText(cur));
+        } catch (_) { /* ignore */ }
+    }
+
     /** Detach the wheel listener + scrollbar from the party box (idempotent). */
     function removePartyWheel(box: any): void {
         if (!box._mpWheelOn) return;
@@ -1621,7 +1667,9 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             // each call made the whole box flicker. The rows read the live models,
             // so HP/SP keep updating without any rebuild.
             const bots: string[] = (m as any).partyBots || [];
-            const key = m.partyMembers.filter((n) => !!n).join('|') + '#' + bots.join('|');
+            // ROUND 116: the leader name rides the rebuild key — a leadership
+            // transfer must repaint rows so the gold name follows the new leader.
+            const key = m.partyMembers.filter((n) => !!n).join('|') + '#' + bots.join('|') + '#' + (m.partyLeader || '');
             if (box._mpRosterKey === key && box.members.length && !box._mpForceRebuild) {
                 updatePartyHeaderCount(box, m, bots);
                 updatePartyScrollbar(box);
@@ -1641,9 +1689,12 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             const player: any = (sc as any).model && (sc as any).model.player;
             if (player) {
                 const lea = new sc.SocialPartyMember(true, player);
+                fixPartyHeaderNumberCaps(lea); // ROUND 116: un-clamp the N/8 header
                 box.addChildGui(lea);
                 box.members.push(lea);
                 lea.show();
+                // ROUND 116: gold name for the local player when THEY are the leader.
+                paintLeaderRowGold(lea, !!(m.partyLeader && m.partyLeader === m.name));
             }
 
             // Every other entry, in order: real members, then synced bots.
@@ -1673,6 +1724,8 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                 box.addChildGui(row);
                 box.members.push(row);
                 row.show();
+                // ROUND 116: gold name for the party leader's row.
+                paintLeaderRowGold(row, !!(m.partyLeader && e.name === m.partyLeader));
                 y += row.hook.size.y + 3;
             }
 
@@ -1758,7 +1811,7 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         return true;
     }
 
-    function rebuildSocialOptions(menu: any, isMp: boolean, inPartyWith: boolean, isLeader: boolean, isLocalBot: boolean, synced: boolean, host: boolean, full: boolean, botBlocked: boolean, storyLocked: boolean, followerOfRemoteLeader?: boolean): void {
+    function rebuildSocialOptions(menu: any, isMp: boolean, inPartyWith: boolean, isLeader: boolean, isLocalBot: boolean, synced: boolean, host: boolean, full: boolean, botBlocked: boolean, storyLocked: boolean, followerOfRemoteLeader?: boolean, offlineMp?: boolean): void {
         const opts = menu && menu.options;
         if (!opts) return;
         // Clear EVERY button: gui child + buttongroup focus entry + array slot.
@@ -1805,6 +1858,12 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
             // 1.71.0: mirror the vanilla Social menu — a story-locked companion
             // renders a DISABLED kick (the native button key is "locked").
             if (storyLocked && btn && typeof btn.setActive === 'function') btn.setActive(false);
+        } else if (offlineMp) {
+            // ROUND 117: an offline mp target (logged-off player OR a bot account —
+            // bots are offline by definition) is UNINVITABLE — disabled button, no
+            // more offline->bot fallback (inviteMember blocks it too, belt+braces).
+            const btn = add(t('optOffline'), 0);
+            if (btn && typeof btn.setActive === 'function') btn.setActive(false);
         } else if (full) {
             const btn = add(t('partyFull'), 0);                // party at the 8-slot cap
             if (btn && typeof btn.setActive === 'function') btn.setActive(false);
@@ -2077,17 +2136,14 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                     setInviteGuard(true);
                     conn.partyInvite(b);
                 } else {
-                    // Round 12: an OFFLINE friend can't network-join, so invite them
-                    // as a synced follower "mod bot" instead — the host adds them to
-                    // its own party and checkBotRoster broadcasts the name; member
-                    // clients spawn their own follower copies (applyPartyBots). This
-                    // is what makes the mod's own bots visible to the whole party.
-                    if (botInviteBlocked()) return;
-                    const party: any = (sc as any).party;
-                    if (partyIsFull()) return;
-                    if (party.currentParty.indexOf(b) === -1) {
-                        try { party.addPartyMember(b, null, false, true); } catch (e) { /* ignore */ }
-                    }
+                    // ROUND 117: the round-12 offline->mod-bot fallback is REMOVED (user
+                    // decision): an OFFLINE mp target — a real player who logged off OR a
+                    // bot account (bots.js seeds never log in, so they are offline by
+                    // definition) — must NOT be invitable at all. Getting an AI clone of
+                    // an offline friend read exactly like inviting the real person. The
+                    // options-popup button is disabled up front; this toast covers any
+                    // stale/alternate trigger so the intent is still visible.
+                    showMpToast({ title: t('partyInviteOffline') });
                 }
                 return;
             }
@@ -2170,7 +2226,9 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                     // invited, so it counts as a bot target too.
                     const partyOpts: any = (sc as any).PARTY_OPTIONS;
                     const isOfficialBot = !isMp && Array.isArray(partyOpts) && partyOpts.indexOf(key) !== -1;
-                    const botTarget = isLocalBot || (isMp && !isOnlineMp(key)) || isOfficialBot;
+                    // ROUND 117: offline mp targets are no longer "bot targets" —
+                    // they are simply uninvitable (the offlineMp branch below).
+                    const botTarget = isLocalBot || isOfficialBot;
                     const botBlocked = botTarget && inParty && !(m && m.partyLeader === m.name);
                     // ROUND 32 (item 5): the old round-22 disabled-kick rule keyed ONLY off
                     // `!host` (the local INSTANCE-host flag). When a party leader carries a bot
@@ -2183,7 +2241,10 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                     const followerOfRemoteLeader = inParty && !!m && m.partyLeader !== m.name;
                     const storyLocked = !isMp && !!party && typeof party.isPartyMemberLocked === 'function'
                         && !!party.isPartyMemberLocked(key);
-                    rebuildSocialOptions(this, isMp, inPartyWith, isLeader, isLocalBot, synced, hostFlag, partyIsFull(), !!botBlocked, storyLocked, followerOfRemoteLeader);
+                    // ROUND 117: an mp target that is OFFLINE (logged-off player or
+                    // bot account) is uninvitable — disabled "不在线" button.
+                    const offlineMp = isMp && !inPartyWith && !isOnlineMp(key);
+                    rebuildSocialOptions(this, isMp, inPartyWith, isLeader, isLocalBot, synced, hostFlag, partyIsFull(), !!botBlocked, storyLocked, followerOfRemoteLeader, offlineMp);
                 }
             } catch (e) { /* ignore */ }
         },
@@ -2367,7 +2428,8 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                 const player: any = (sc as any).model && (sc as any).model.player;
                 // Only the local player's own row (b is the real PlayerModel).
                 if (me && b && player && b === player && this.name && this.name.setText) {
-                    this.name.setText(me);
+                    // ROUND 116: gold when the local player leads the party.
+                    this.name.setText((m.partyLeader && m.partyLeader === me) ? goldLeaderText(me) : me);
                     // The name TextGui is mod-tracked (per-frame overwrite); pin the
                     // account name back each frame so it doesn't revert to "莉亚".
                     if (!this._mpPlayerNamePinned) {
@@ -2379,8 +2441,11 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                             const mm = main();
                             const acc = mm && mm.name;
                             const pl: any = (sc as any).model && (sc as any).model.player;
-                            if (acc && pl && self._mpRowModel === pl && self.name && self.name.text !== acc) {
-                                self.name.setText(acc);
+                            // ROUND 116: keep the leader's name gold — the pin's
+                            // comparison target is the gold-wrapped name then.
+                            const want = (acc && mm && mm.partyLeader && mm.partyLeader === acc) ? goldLeaderText(acc) : acc;
+                            if (acc && pl && self._mpRowModel === pl && self.name && self.name.text !== want) {
+                                self.name.setText(want);
                             }
                         };
                     }

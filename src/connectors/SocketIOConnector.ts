@@ -392,13 +392,18 @@ export class SocketIoConnector implements IConnection {
                 // version string so the client can show the "server updated" popup.
                 version?: string,
                 hpScale?: number,
+                attackScale?: number,
+                defenseScale?: number,
+                focusScale?: number,
+                resistFlat?: number,
+                resistPercent?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -750,8 +755,29 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('throwBall', ballInfo);
 	}
 
-	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }): void {
+	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void {
 		this.syncEmit('combatHit', hit);
+	}
+
+	/** Elemental-status-era enemy action FX: a whitelisted sheet spawned on a
+	 * HOST-side real enemy (charge telegraphs). Relayed as `enemyFx`; receivers
+	 * re-spawn it on the same-uid puppet. */
+	public enemyFx(fx: { uid: number, sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
+		this.syncEmit('enemyFx', fx);
+	}
+	public onEnemyFx(callback: (uid: number, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void {
+		this.socket.on('enemyFx', (data: any) => {
+			if (data && typeof data.uid === 'number') callback(data.uid, data);
+		});
+	}
+	/** 1.71.11: relay the host's telegraph-effect stop (see connection.ts). */
+	public enemyFxStop(fx: { uid: number, sheet: string, key: string }): void {
+		this.syncEmit('enemyFxStop', fx);
+	}
+	public onEnemyFxStop(callback: (uid: number, sheet: string, key: string) => void): void {
+		this.socket.on('enemyFxStop', (data: any) => {
+			if (data && typeof data.uid === 'number') callback(data.uid, typeof data.sheet === 'string' ? data.sheet : '', typeof data.key === 'string' ? data.key : '');
+		});
 	}
 
 	public partyRegroup(target?: string): void {
@@ -856,13 +882,13 @@ export class SocketIoConnector implements IConnection {
 
 	// Round 27 (item 2): tell the party which map WE are on so off-map teammates'
 	// HUD bars hide + net diamonds grey. Tiny packet, ~1/s while partied.
-	public memberMap(map: string): void {
-		this.socket.emit('memberMap', { map });
+	public memberMap(map: string, area?: string): void {
+		this.socket.emit('memberMap', { map, area });
 	}
-	public onMemberMap(callback: (name: string, map: string) => void): void {
+	public onMemberMap(callback: (name: string, map: string, area?: string) => void): void {
 		this.socket.on('memberMap', (data: any) => {
 			if (!data || typeof data.from !== 'string') return;
-			callback(data.from, typeof data.map === 'string' ? data.map : '');
+			callback(data.from, typeof data.map === 'string' ? data.map : '', typeof data.area === 'string' ? data.area : '');
 		});
 	}
 
@@ -901,7 +927,7 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
-	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
+	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number }): void {
 		this.syncEmit('enemyDamage', hit);
 	}
 
@@ -936,6 +962,14 @@ export class SocketIoConnector implements IConnection {
 	// members roll their OWN drops with their OWN stats (not the host's).
 	public emitLoot(loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }): void {
 		this.syncEmit('loot', loot);
+	}
+
+	// ROUND 100 (drop-pickup visibility): any client -> its instance — the local
+	// player just obtained an item drop (monster kill / plant break). Every other
+	// same-instance client replays the visual (drop falls, then flies to that
+	// player's mirror). Cosmetic only; syncEmit skips solo instances.
+	public emitDropFx(fx: { item: number, amount: number, x: number, y: number, z: number, kind: string }): void {
+		this.syncEmit('dropFx', fx);
 	}
 
 	// 1.71.7 (quest kill-progress sync): plain socket.emit (NOT syncEmit) on purpose —
@@ -1196,6 +1230,19 @@ export class SocketIoConnector implements IConnection {
 	public onLoot(callback: (loot: { uid: number, credit: number, boosterState: number, drops: ILootDrop[] }) => void): void {
 		this.socket.on('loot', (data: any) => {
 			if (data && typeof data.uid === 'number' && Array.isArray(data.drops)) {
+				callback(data);
+			}
+		});
+	}
+	/** ROUND 100 (drop-pickup visibility): a same-instance player obtained an item
+	 * drop — replay the fall + fly-to-mirror animation (see NetSync.applyDropFx).
+	 * Server stamps `player` and validates the payload field-by-field. */
+	public onDropFx(callback: (fx: { player: string, item: number, amount: number, x: number, y: number, z: number, kind: string }) => void): void {
+		this.socket.on('dropFx', (data: any) => {
+			if (data && typeof data.player === 'string'
+				&& typeof data.item === 'number' && typeof data.amount === 'number'
+				&& typeof data.x === 'number' && typeof data.y === 'number' && typeof data.z === 'number'
+				&& typeof data.kind === 'string') {
 				callback(data);
 			}
 		});
