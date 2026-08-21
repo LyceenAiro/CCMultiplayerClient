@@ -62,6 +62,12 @@ interface IPuzzleEntry {
 	own?: string;
 	/** 1.71.2: local claim timestamp for same-time grab arbitration. */
 	ot?: number;
+	/** ROUND 130: PushPullDest placement event. pl=1 marks "this box just locked
+	 * into a plate"; dl = the plate's (PushPullDest) mapId. Relayed through the
+	 * long-whitelisted server fields so a box sinks into stairs on EVERY client,
+	 * not just the pusher's. */
+	pl?: number;
+	dl?: number;
 }
 
 interface IPuzzlePacket {
@@ -266,6 +272,12 @@ class PuzzleSync implements IPuzzleSync {
 				const e = byId.get(s.mi);
 				if (!e) continue;
 				const push = this.isPushPull(e);
+				// ROUND 130: a box locked into a plate on a peer — reproduce the sink
+				// (plate lowers, box snaps on, becomes stairs) on THIS client too.
+				if (push && s.pl === 1 && typeof s.dl === 'number') {
+					this.applyPlacement(e, byId.get(s.dl));
+					continue;
+				}
 				// Personal save progress wins: a solved-in-this-save box must keep
 				// its lowered plate position and must never follow another client's
 				// still-unsolved copy (and vice versa).
@@ -389,6 +401,45 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { return false; }
 	}
 
+	/** 1.72.x (Temple Mine g/room1 risen pillar): the OneTimeSwitch raises an
+	 * OLPlatform with a PushPullBlock riding it. The block's vertical link to the
+	 * platform (_collData.groundEntry) is fragile under network sync — the
+	 * follower interp setPos() marks zBaseUncertain and baseZPos only ever moves
+	 * DOWN, so a synced copy can sit at the risen z with no groundEntry at all.
+	 * Vanilla PushPullable.onUpdate then reads the terrain under a resting block
+	 * via ig.terrain.getTerrain, which WITHOUT a groundEntry falls through to the
+	 * MAP terrain at that tile — the HOLE the platform covers — and respawns the
+	 * block into the pit the moment you grip or push it. Find a platform whose
+	 * top surface the block is standing on (x/y overlap + z match) so the link
+	 * can be repaired (or the bogus respawn vetoed). */
+	private findSupportingPlatform(e: any): any {
+		try {
+			const c = e && e.coll;
+			const g: any = ig.game;
+			if (!c || !g || !Array.isArray(g.entities)) return null;
+			const E: any = ig.ENTITY as any;
+			if (!E) return null;
+			const bx1 = c.pos.x, by1 = c.pos.y;
+			const bx2 = bx1 + c.size.x, by2 = by1 + c.size.y, bz = c.pos.z;
+			const list: any[] = g.entities;
+			for (let i = 0; i < list.length; i++) {
+				const ent = list[i];
+				if (!ent || ent._killed || !ent.coll) continue;
+				const isPlat = (E.OLPlatform && ent instanceof E.OLPlatform)
+					|| (E.DynamicPlatform && ent instanceof E.DynamicPlatform)
+					|| (E.ExtractPlatform && ent instanceof E.ExtractPlatform);
+				if (!isPlat) continue;
+				const pc = ent.coll;
+				const top = pc.pos.z + (pc.size.z || 0);
+				if (Math.abs(top - bz) > 6) continue; // riding = block bottom at platform top (±interp lag)
+				if (bx2 <= pc.pos.x || bx1 >= pc.pos.x + pc.size.x) continue;
+				if (by2 <= pc.pos.y || by1 >= pc.pos.y + pc.size.y) continue;
+				return ent;
+			}
+		} catch (_) { /* ignore */ }
+		return null;
+	}
+
 	/** 1.71.8: true on the map-instance host. Used to decide whether a box whose
 	 * remote grip just ended should return to local gravity (host) or stay a
 	 * network follower (everyone else, who still follows the host's fall). */
@@ -485,6 +536,24 @@ class PuzzleSync implements IPuzzleSync {
 					}
 				} catch (_) { /* ignore */ }
 			}
+			// 1.72.x: re-link a broken/missing groundEntry to the platform the
+			// block is actually standing on (risen-pillar case — see
+			// findSupportingPlatform). Without it the vanilla resting-terrain
+			// check reads the HOLE the platform covers and "respawns" the block
+			// into the pit on grip.
+			try {
+				const ge = c._collData && c._collData.groundEntry;
+				const geEnt = ge && ge.entity;
+				if (!geEnt || geEnt._killed) {
+					const plat = this.findSupportingPlatform(e);
+					if (plat && plat.coll && typeof c.setGroundEntry === 'function') {
+						c.setGroundEntry(plat.coll);
+						const top = plat.coll.pos.z + (plat.coll.size.z || 0);
+						if (typeof c.baseZPos === 'number' && top > c.baseZPos) c.baseZPos = top;
+						if (typeof plat.coll.level === 'number') c.level = plat.coll.level;
+					}
+				}
+			} catch (_) { /* ignore */ }
 		} catch (_) { /* ignore */ }
 	}
 
@@ -573,7 +642,25 @@ class PuzzleSync implements IPuzzleSync {
 		if (typeof e.remainingHits === 'number') s.hits = e.remainingHits;
 		if (typeof e.state === 'number') s.st = e.state;
 		if (typeof e.blockState === 'number') s.st = e.blockState;
-		if (typeof e.currentAnim === 'string' && e.currentAnim) s.anim = e.currentAnim;
+		// ROUND 131 (Temple Chamber 2): do NOT sync the raw animation for
+		// state-driven entities whose anims are CHAINED TRANSITIONS — the toggle
+		// Switch (off->switchOn->on) and the bounce-puzzle core/blocks (rolling->
+		// rollingEnd->flyDown->impact->on). Force-feeding a mid-transition frame
+		// every snapshot re-triggers the chain from frame 0 and deadlocks it (the
+		// "stuck in the switching animation" / "core stuck about to retract"
+		// reports). These entities sync STATE only; each client renders its own
+		// animation natively (varsChanged for the Switch, resolveGroup for the
+		// bounce group). Position/one-time/WaterBlock anims are unaffected.
+		const E: any = (ig.ENTITY as any);
+		const chainedAnim = !!(E && ((E.Switch && e instanceof E.Switch)
+			|| (E.BounceSwitch && e instanceof E.BounceSwitch)
+			|| (E.BounceBlock && e instanceof E.BounceBlock)));
+		if (!chainedAnim && typeof e.currentAnim === 'string' && e.currentAnim) s.anim = e.currentAnim;
+		// ROUND 131: the bounce core's authoritative state is the GROUP-RESOLVED
+		// var, not isOn (isOn flips at the FIRST ball hit, long before retract).
+		if (E && E.BounceSwitch && e instanceof E.BounceSwitch) {
+			try { s.on = (sc as any).bounceSwitchGroups.isGroupResolved(e.group) ? 1 : 0; } catch (_) { /* ignore */ }
+		}
 		if (typeof e.phased === 'boolean') s.ph = e.phased ? 1 : 0;
 		if (e.pushPullable && typeof e.pushPullable.active === 'boolean') s.act = e.pushPullable.active ? 1 : 0;
 		if (typeof e.moving === 'boolean') s.mv = e.moving ? 1 : 0;
@@ -610,6 +697,51 @@ class PuzzleSync implements IPuzzleSync {
 				try { (e as any)._mpPuzzleFollow = true; } catch (_) { /* ignore */ }
 				this.followers.set(e.mapId || 0, e);
 			}
+		}
+		// ROUND 131 (Temple Chamber 2): state-driven entities with chained
+		// transition animations — apply STATE and let THIS client render its own
+		// animation natively, instead of force-feeding a transition frame (which
+		// deadlocks the chain). Each branch returns early so the generic anim/isOn
+		// force-feed below never runs for these types.
+		const ED: any = (ig.ENTITY as any);
+		if (ED && ED.Switch && e instanceof ED.Switch) {
+			// Toggle lever: purely var-driven. Setting the var fires the entity's own
+			// varsChanged, which plays switchOn/switchOff -> on/off. (Melee and ball
+			// both go through ballHit -> vars.set, so this single path fixes the melee
+			// desync where the linked slider never moved.)
+			try {
+				if (typeof s.on === 'number' && typeof e.variable === 'string' && e.variable) {
+					(ig as any).vars.set(e.variable, s.on === 1);
+				}
+				if (typeof s.hits === 'number' && typeof e.currentHits === 'number') e.currentHits = s.hits;
+			} catch (_) { /* ignore */ }
+			return;
+		}
+		if (ED && ED.BounceSwitch && e instanceof ED.BounceSwitch) {
+			// Bounce-puzzle core: resolve/reset the whole GROUP natively — resolveGroup
+			// retracts every block AND the core (sets the var, rolls each block's
+			// retract timer, runs the core's rolling->flyDown->impact->on chain).
+			try {
+				if (typeof s.on === 'number' && e.group) {
+					const grp: any = (sc as any).bounceSwitchGroups;
+					const resolved = grp && grp.isGroupResolved(e.group);
+					if (s.on === 1 && !resolved && typeof grp.resolveGroup === 'function') grp.resolveGroup(e.group);
+					else if (s.on === 0 && resolved && typeof grp.resetGroup === 'function') grp.resetGroup(e.group);
+				}
+			} catch (_) { /* ignore */ }
+			return;
+		}
+		if (ED && ED.BounceBlock && e instanceof ED.BounceBlock) {
+			// Individual bounce block: mirror the LIT state only (blockState 0/1). The
+			// final retract (blockState 2) is driven by the group's resolveGroup above;
+			// never overwrite an already-resolved block from a stale echo.
+			try {
+				if (typeof s.st === 'number' && (s.st === 0 || s.st === 1) && e.blockState !== 2 && e.blockState !== s.st) {
+					e.blockState = s.st;
+					if (typeof e.setCurrentAnim === 'function') e.setCurrentAnim(s.st ? 'on' : 'off');
+				}
+			} catch (_) { /* ignore */ }
+			return;
 		}
 		// WaterBlock: state transitions have real effects (freeze/break).
 		const WB: any = (ig.ENTITY as any).WaterBlock;
@@ -767,6 +899,26 @@ class PuzzleSync implements IPuzzleSync {
 				} catch (_) { /* fall through to vanilla */ }
 				return origBlocked.apply(this, arguments as any);
 			};
+			// 1.72.x (risen-pillar fall veto): PushPullable.onUpdate respawns a
+			// RESTING block (pos.z == baseZPos) standing on fall terrain via
+			// resetPos() — no args. With the groundEntry link broken by network
+			// sync, that check reads the HOLE under a risen platform and teleports
+			// the block into the pit on grip/push ("柱子坠入地板"). Veto the
+			// respawn while a platform genuinely supports the block. Pushing the
+			// block OFF the platform (or any real hole) still respawns natively —
+			// no platform overlaps then — and no gravity behaviour changes, so the
+			// 1.71.8 ledge-fall fix ("箱子无重力无法从高处推下") is untouched.
+			const origResetPos = P.prototype.resetPos;
+			P.prototype.resetPos = function (this: any, a: any, b: any) {
+				try {
+					if (a === undefined && b === undefined
+						&& self.isPushPull(this.entity)
+						&& self.findSupportingPlatform(this.entity)) {
+						return; // platform-supported: the fall-terrain read is a sync artifact
+					}
+				} catch (_) { /* fall through to vanilla */ }
+				return origResetPos.apply(this, arguments as any);
+			};
 			const origInteraction = P.prototype.onInteraction;
 			P.prototype.onInteraction = function (this: any) {
 				try {
@@ -780,7 +932,79 @@ class PuzzleSync implements IPuzzleSync {
 				} catch (_) { /* ignore */ }
 				return origInteraction.apply(this, arguments as any);
 			};
+			// ROUND 130: when the LOCAL box locks into a PushPullDest plate, relay the
+			// placement so every peer sinks the box into stairs too (not just the
+			// pusher). onPushPullablePlaced is the single funnel the engine uses when a
+			// gripped box reaches its plate (dragState 4 -> getGroundEntity ->
+			// onPushPullablePlaced). Guard with self.applying so a network-applied
+			// placement never echoes back out.
+			const D: any = (ig.ENTITY as any).PushPullDest;
+			if (D && D.prototype && !D.prototype._mpPlacedWrapped) {
+				D.prototype._mpPlacedWrapped = true;
+				const origPlaced = D.prototype.onPushPullablePlaced;
+				D.prototype.onPushPullablePlaced = function (this: any, box: any) {
+					try {
+						if (!self.applying) self.broadcastPlacement(box, this);
+					} catch (_) { /* ignore */ }
+					return origPlaced.apply(this, arguments as any);
+				};
+			}
 			console.log('[puzzlesync] push/pull ownership hooks installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 130: broadcast a box->plate placement. Sent as a one-shot entry
+	 * { mi: boxMapId, pl: 1, dl: destMapId } — the server whitelist has carried
+	 * pl/dl since 1.71.2. Mark the box placed locally right away so this client
+	 * immediately stops shipping its position (refreshPlacedBoxIds would take a
+	 * scan to notice). */
+	private broadcastPlacement(box: any, dest: any): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen()) return;
+			if (!this.inDungeon()) return;
+			const g: any = ig.game;
+			const map = (g && g.mapName) || '';
+			const boxId = box && box.mapId;
+			const destId = dest && dest.mapId;
+			if (!boxId || !destId) return;
+			if (boxId) this.placedBoxIds.add(boxId);
+			try { m.connection.puzzleState(map, [{ mi: boxId, pl: 1, dl: destId }]); } catch (_) { /* ignore */ }
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 130: reproduce a peer's box->plate placement locally. Guards against
+	 * re-triggering an already-solved plate (the 1.71.3 personal-save concern):
+	 * a client that already placed this box keeps its own state and ignores the
+	 * echo, so solved and unsolved saves never fight. For a same-progress peer
+	 * this runs the EXACT native lock-in path (onPushPullablePlaced), so the box
+	 * snaps onto the plate and sinks into stairs identically to the pusher's
+	 * client. */
+	private applyPlacement(box: any, dest: any): void {
+		try {
+			if (!box || !dest) return;
+			// Already solved here -> never re-trigger.
+			if (dest.placed) return;
+			const mi = box.mapId || 0;
+			if (mi && this.placedBoxIds.has(mi)) return;
+			// Detach the box from any network-follow / ownership state so the frozen
+			// follower z-physics can't fight the sink, then hand it back to gravity.
+			if (mi) {
+				this.remoteOwners.delete(mi);
+				this.interp.delete(mi);
+				this.followers.delete(mi);
+				this.ownedLast.delete(mi);
+			}
+			try { (box as any)._mpPuzzleRemote = false; (box as any)._mpPuzzleFollow = false; } catch (_) { /* ignore */ }
+			this.restoreBoxGravity(box);
+			// Mark placed BEFORE triggering so no further position echo is accepted
+			// for this box (apply/tick both skip placedBoxIds).
+			if (mi) this.placedBoxIds.add(mi);
+			// Reproduce the native lock-in: sets the personal save var, plays the
+			// boxLockIn effect + plate sink (placeTimer), and deferredUpdate ->
+			// initPushPullable snaps the box onto the plate + disables pushing.
+			// self.applying is true here, so the wrapped sender does NOT echo.
+			if (typeof dest.onPushPullablePlaced === 'function') dest.onPushPullablePlaced(box);
 		} catch (_) { /* ignore */ }
 	}
 

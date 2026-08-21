@@ -2,6 +2,8 @@ import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 import type { INetQuality, NetTier } from '../connection';
 import { getMpUiScale } from './uiScale';
+import { showMpToast } from './toasts';
+import { openPrivateChannel } from './chatBox';
 
 /**
  * Round 24: network-quality DIAMOND badges on the party-HUD portraits and the
@@ -364,6 +366,192 @@ function hideTooltip(): void {
     if (mpTooltip) { try { mpTooltip.hide().text(''); } catch (_) { /* ignore */ } }
 }
 
+// ------------------------------------------- party-avatar click action menu
+
+/** Latest frame's hover targets, stashed by the pump so the click handler can
+ * hit-test party plates at any moment (hoverTargets itself is cleared every
+ * frame by the gui draws). */
+let lastTargets: HoverTarget[] = [];
+/** The open action menu + the teammate it belongs to (for click-toggle). */
+let mateMenu: HTMLElement | null = null;
+let mateMenuFor = '';
+let mateMenuStyleInstalled = false;
+
+function closeMateMenu(): void {
+    try { if (mateMenu && mateMenu.parentNode) mateMenu.parentNode.removeChild(mateMenu); } catch (_) { /* ignore */ }
+    mateMenu = null;
+    mateMenuFor = '';
+}
+
+function ensureMateMenuStyle(): void {
+    if (mateMenuStyleInstalled) return;
+    mateMenuStyleInstalled = true;
+    const style = document.createElement('style');
+    style.id = 'mpMateMenuStyle';
+    style.textContent = [
+        '.mpMateMenu { position: fixed; z-index: 9100; min-width: 168px; max-width: 240px;',
+        '  padding: 5px; background: rgba(6, 18, 30, 0.97);',
+        '  border: 1px solid #6fc7ff; border-radius: 6px;',
+        '  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55), 0 0 14px rgba(111, 199, 255, 0.25);',
+        "  font-family: 'Noto Sans SC', 'Segoe UI', sans-serif; }",
+        '.mpMateMenu .mpMateMenuName { padding: 5px 8px 7px 8px; font-size: 13px; color: #dff3ff;',
+        '  border-bottom: 1px solid rgba(111, 199, 255, 0.3); margin-bottom: 4px;',
+        '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+        '.mpMateMenu button { display: block; width: 100%; box-sizing: border-box;',
+        '  margin: 2px 0; padding: 7px 9px; background: rgba(18, 50, 72, 0.9); color: #dff3ff;',
+        '  border: 1px solid rgba(111, 199, 255, 0.4); border-radius: 4px;',
+        '  font-size: 12.5px; font-family: inherit; text-align: left; cursor: pointer; }',
+        '.mpMateMenu button:hover { background: rgba(46, 104, 142, 0.95); }',
+        '.mpMateMenu button.mpMateDanger { background: rgba(96, 34, 34, 0.9);',
+        '  border-color: rgba(255, 125, 125, 0.55); color: #ffeaea; }',
+        '.mpMateMenu button.mpMateDanger:hover { background: rgba(140, 48, 48, 0.95); }',
+    ].join('\n');
+    try { if (document.head) document.head.appendChild(style); } catch (_) { /* ignore */ }
+}
+
+/** DOM client px -> engine gui coords (inverse of showTooltip's conversion:
+ * the canvas CSS box scales the internal pixel buffer independently of
+ * ig.system.scale on HiDPI / resized windows). */
+function cssToGui(clientX: number, clientY: number): { x: number, y: number } | null {
+    try {
+        const sys: any = (ig as any).system;
+        const canvas: any = sys && sys.canvas;
+        if (!canvas || typeof canvas.getBoundingClientRect !== 'function') return null;
+        const rect = canvas.getBoundingClientRect();
+        if (!(rect.width > 0) || !(sys.width > 0)) return null;
+        return {
+            x: (clientX - rect.left) * (sys.width / rect.width),
+            y: (clientY - rect.top) * (sys.height / rect.height),
+        };
+    } catch (_) { return null; }
+}
+
+/** Open the teammate action list at the click point: teleport-to-mate, kick
+ * (leader) / leave (member), and add-friend — or 私聊 once already friends. */
+function openMateMenu(name: string, clientX: number, clientY: number): void {
+    try {
+        closeMateMenu();
+        const main: any = mpGetMain && mpGetMain();
+        const conn: any = main && main.connection;
+        if (!main || !conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
+        ensureMateMenuStyle();
+        const menu = document.createElement('div');
+        menu.className = 'mpMateMenu';
+
+        const head = document.createElement('div');
+        head.className = 'mpMateMenuName';
+        head.textContent = name;
+        menu.appendChild(head);
+
+        const addBtn = (label: string, cls: string, onClick: () => void): void => {
+            const b = document.createElement('button');
+            if (cls) b.className = cls;
+            b.textContent = label;
+            b.addEventListener('click', (ev) => {
+                try { ev.stopPropagation(); } catch (_) { /* ignore */ }
+                closeMateMenu();
+                try { onClick(); } catch (_) { /* an action must never break the HUD */ }
+            });
+            menu.appendChild(b);
+        };
+
+        // 传送到队友身边 — requestRegroup carries the full gating (party check,
+        // cutscene stash, cross-map area unlock on the reply).
+        addBtn(t('teleportToMate'), '', () => {
+            if (typeof main.requestRegroup === 'function') main.requestRegroup(name);
+        });
+
+        // 踢出队伍 (I lead) / 退出队伍 (I follow) — same rule as the quick menu.
+        const isLeader = !!(main.partyLeader && main.name && main.partyLeader === main.name);
+        if (isLeader) {
+            addBtn(t('kickParty'), 'mpMateDanger', () => {
+                if (typeof conn.partyKick === 'function') conn.partyKick(name);
+            });
+        } else {
+            addBtn(t('leaveParty'), 'mpMateDanger', () => {
+                if (typeof conn.partyLeave === 'function') conn.partyLeave();
+            });
+        }
+
+        // 加好友 — becomes 私聊 once the target is already a friend.
+        let friend = false;
+        try {
+            const party: any = (sc as any).party;
+            friend = !!(party && typeof party.isFriend === 'function' && party.isFriend(name));
+        } catch (_) { /* ignore */ }
+        if (friend) {
+            addBtn(t('chatPrivate'), '', () => openPrivateChannel(name, true));
+        } else {
+            addBtn(t('addFriend'), '', () => {
+                if (typeof conn.friendAdd === 'function') {
+                    try { conn.friendAdd(name); } catch (_) { /* ignore */ }
+                    showMpToast({ title: t('friendRequestSentToast') });
+                }
+            });
+        }
+
+        document.body.appendChild(menu);
+        mateMenu = menu;
+        mateMenuFor = name;
+        // Zoom-aware placement (same math as the chat name menu: authored
+        // offsets are pre-zoom, getBoundingClientRect/innerWidth post-zoom).
+        const ui = getMpUiScale();
+        const mw = (menu.offsetWidth || 180) * ui;
+        const mh = (menu.offsetHeight || 130) * ui;
+        const pad = 8 * ui;
+        const left = Math.max(pad, Math.min(clientX + 6 * ui, window.innerWidth - mw - pad));
+        let top = clientY + 6 * ui;
+        if (top + mh > window.innerHeight - pad) top = Math.max(pad, clientY - mh - 6 * ui);
+        menu.style.left = left / ui + 'px';
+        menu.style.top = top / ui + 'px';
+    } catch (_) { /* ignore */ }
+}
+
+/** ONE capture-phase mousedown listener handles both sides of the menu: a
+ * click on a teammate plate opens (or re-opens / toggles) the action list;
+ * a click anywhere else closes it; a click INSIDE the menu passes through to
+ * the buttons. Registered once from installNetBadge. */
+function onHudMouseDown(e: MouseEvent): void {
+    try {
+        if (e.button !== 0) return;
+        if (mateMenu && e.target instanceof Node && mateMenu.contains(e.target)) return;
+        let hitName = '';
+        if (netBadgeActive() && !anyMenuOpen() && lastTargets.length) {
+            const p = cssToGui(e.clientX, e.clientY);
+            if (p) {
+                // Topmost wins — badges are pushed after portraits, scan in
+                // reverse (same order the tooltip pump uses).
+                for (let i = lastTargets.length - 1; i >= 0; i--) {
+                    const tr = lastTargets[i];
+                    if (!tr.name) continue;
+                    if (p.x >= tr.x && p.x < tr.x + tr.w && p.y >= tr.y && p.y < tr.y + tr.h) {
+                        hitName = tr.name;
+                        break;
+                    }
+                }
+            }
+        }
+        if (hitName) {
+            const main: any = mpGetMain && mpGetMain();
+            // Only real teammates: never self, never a stale plate after the
+            // party broke up.
+            if (!main || hitName === main.name
+                || !Array.isArray(main.partyMembers) || main.partyMembers.indexOf(hitName) === -1) {
+                if (mateMenu) closeMateMenu();
+                return;
+            }
+            // Consume the click: the engine binds mousedown on the canvas in
+            // the BUBBLE phase, so swallowing it here in document-capture keeps
+            // a plate click from also swinging the melee attack / interacting.
+            try { e.preventDefault(); e.stopPropagation(); } catch (_) { /* ignore */ }
+            if (mateMenu && mateMenuFor === hitName) { closeMateMenu(); return; } // toggle
+            openMateMenu(hitName, e.clientX, e.clientY);
+            return;
+        }
+        if (mateMenu) closeMateMenu();
+    } catch (_) { /* ignore */ }
+}
+
 // --------------------------------------------------------------- pump
 
 /** One per-frame pass: refresh the cached quality and consume the hover targets
@@ -384,7 +572,9 @@ function pumpNetBadges(): void {
 
     const targets = hoverTargets;
     hoverTargets = [];
+    lastTargets = targets; // click hit-testing reads the latest frame's plates
 
+    if (!connected || anyMenuOpen()) closeMateMenu(); // never linger over menus / after drops
     if (!connected || anyMenuOpen() || !targets.length) {
         hideTooltip();
         return;
@@ -457,6 +647,10 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
     }
     installed = true;
     mpGetMain = getMain;
+    // Party-plate click -> teammate action menu (capture so it runs before the
+    // canvas's own handlers; it never consumes the event — the game still sees
+    // every click).
+    try { document.addEventListener('mousedown', onHudMouseDown, true); } catch (_) { /* ignore */ }
     const scAny: any = sc as any;
     if (!scAny.MemberHudGui || !scAny.StatusElementModeGui) {
         console.warn('[multiplayer] net badges: HUD classes not found');
@@ -476,6 +670,129 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
             try { collectElementHud(this, renderer); } catch (_) { /* never break the HUD draw */ }
         },
     });
+
+    // In DUNGEONS the engine hides the WHOLE party HUD
+    // (sc.party.dungeonBlocked -> PartyHudGui HIDDEN) because natively only
+    // follower bots sit in the party and bots never enter dungeons. Online the
+    // same rule also swallowed REMOTE PLAYERS' HP plates — but remote teammates
+    // DO come along. While dungeon-blocked with at least one roster member in
+    // the party, keep the container visible and hide only the BOT plates
+    // (models without a roster name). Solo / bot-only parties keep the native
+    // hide-everything behaviour.
+    if (scAny.PartyHudGui && typeof scAny.PartyHudGui.inject === 'function') {
+        const applyDungeonPlateVisibility = (hud: any): boolean => {
+            let anyOnline = false;
+            try {
+                const m: any = mpGetMain && mpGetMain();
+                const roster: string[] = (m && Array.isArray(m.partyMembers)) ? m.partyMembers : [];
+                const guis: any[] = (hud && hud.memberGuis) || [];
+                for (const g of guis) {
+                    const model: any = g && g.model;
+                    const name: string = model ? String(model._mpName || model.name || '') : '';
+                    const online = !!name && roster.indexOf(name) !== -1;
+                    if (online) anyOnline = true;
+                    try { g.doStateTransition(online ? 'DEFAULT' : 'HIDDEN'); } catch (_) { /* ignore */ }
+                }
+            } catch (_) { /* ignore */ }
+            return anyOnline;
+        };
+        const dungeonOnlineVisible = (): boolean => {
+            try {
+                const m: any = mpGetMain && mpGetMain();
+                const conn: any = m && m.connection;
+                if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return false;
+                const party: any = (sc as any).party;
+                if (!party || typeof party.isDungeonBlocked !== 'function' || !party.isDungeonBlocked()) return false;
+                const g: any = (ig as any).game;
+                return !!(g && g.playerEntity);
+            } catch (_) { return false; }
+        };
+        scAny.PartyHudGui.inject({
+            updateVisibility(this: any) {
+                try {
+                    if (dungeonOnlineVisible() && applyDungeonPlateVisibility(this)) {
+                        // Engine logic minus the dungeon-block clause (level-up
+                        // still hides the HUD).
+                        const model: any = (sc as any).model;
+                        const lvl = !!(model && typeof model.isLevelUp === 'function' && model.isLevelUp());
+                        this.doStateTransition(lvl ? 'HIDDEN' : 'DEFAULT');
+                        return;
+                    }
+                    // NOT blocked (left the dungeon / went offline / bot-only):
+                    // the engine only transitions the CONTAINER — a plate we hid
+                    // would stay HIDDEN forever. Restore any hidden plate first.
+                    const guis: any[] = this.memberGuis || [];
+                    for (const g of guis) {
+                        try { if (g && g.currentStateName === 'HIDDEN') g.doStateTransition('DEFAULT'); } catch (_) { /* ignore */ }
+                    }
+                } catch (_) { /* fall through to native */ }
+                this.parent();
+            },
+            updatePartySubGui(this: any) {
+                this.parent();
+                // Roster changes rebuild the plates with default (visible)
+                // transitions — re-apply the bot-only hiding while blocked.
+                try {
+                    if (dungeonOnlineVisible() && applyDungeonPlateVisibility(this)) {
+                        const model: any = (sc as any).model;
+                        const lvl = !!(model && typeof model.isLevelUp === 'function' && model.isLevelUp());
+                        this.doStateTransition(lvl ? 'HIDDEN' : 'DEFAULT');
+                    }
+                } catch (_) { /* ignore */ }
+            },
+        });
+    }
+
+    // 1.72.0 (dungeon key-HUD overlap): the engine parks the dungeon key counter
+    // (sc.KeyHudGui) at y=53 — directly on top of the FIRST party plate (partyGui
+    // at y=39, 26px per plate) — because vanilla hides the whole party HUD inside
+    // dungeons, so the collision could never happen. Our dungeon override above
+    // keeps ONLINE teammates' plates visible in dungeons, so the plates and the
+    // key counter overlap. While that override is active, slide the key HUD to
+    // just below the lowest visible plate; native y=53 everywhere else.
+    if (scAny.KeyHudGui && typeof scAny.KeyHudGui.inject === 'function') {
+        const repositionKeyHud = (keyHud: any): void => {
+            try {
+                let y = 53; // native
+                const hud: any = scAny.gui && scAny.gui.statusHud;
+                const partyHud: any = hud && hud.partyGui;
+                // Same condition as the PartyHudGui override below: online,
+                // a player exists, and the engine is dungeon-blocking the HUD.
+                let dungeonOverride = false;
+                try {
+                    const m: any = mpGetMain && mpGetMain();
+                    const conn: any = m && m.connection;
+                    const party: any = (sc as any).party;
+                    dungeonOverride = !!(conn && typeof conn.isOpen === 'function' && conn.isOpen()
+                        && party && typeof party.isDungeonBlocked === 'function' && party.isDungeonBlocked()
+                        && (ig as any).game && (ig as any).game.playerEntity);
+                } catch (_) { dungeonOverride = false; }
+                if (partyHud && dungeonOverride) {
+                    let maxBottom = -1;
+                    const guis: any[] = partyHud.memberGuis || [];
+                    for (const g of guis) {
+                        if (g && g.currentStateName !== 'HIDDEN') {
+                            const py = (g.hook && g.hook.pos && typeof g.hook.pos.y === 'number') ? g.hook.pos.y : 0;
+                            const bottom = py + 25; // MemberHudGui height
+                            if (bottom > maxBottom) maxBottom = bottom;
+                        }
+                    }
+                    if (maxBottom >= 0) y = 39 + maxBottom + 2;
+                }
+                if (keyHud.hook && keyHud.hook.pos && keyHud.hook.pos.y !== y) keyHud.setPos(0, y);
+            } catch (_) { /* never break the HUD */ }
+        };
+        scAny.KeyHudGui.inject({
+            update(this: any) {
+                this.parent();
+                repositionKeyHud(this);
+            },
+            updateVisibility(this: any) {
+                this.parent();
+                repositionKeyHud(this);
+            },
+        });
+    }
 
     // ROUND 30 (item 5): the off-map bar hide now lives in collectMemberHud (zero
     // the hpExpSpGui/hpBar/spBar hooks' localAlpha — the engine's draw gate skips

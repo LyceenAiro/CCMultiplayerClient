@@ -81,6 +81,14 @@ let lastReconcileAt = 0;
 let reconcilePending = true;
 let announcePending = false;
 const RECONCILE_MS = 500;
+// 1.72.0 (ghost-chest convergence): slow heartbeat re-announce. Without it, a
+// chest the teammate opened BEFORE the server tracked it (pre-party / earlier
+// session) is never re-reported while they simply stand on the map, so our ghost
+// for it floated until somebody re-entered the area. The server now relays every
+// announced open to the whole party (idempotent set-add), so any member's
+// heartbeat heals everyone else's stale opened-by sets for this map.
+let lastAnnounceAt = 0;
+const REANNOUNCE_MS = 15000;
 
 // ---- install ----
 
@@ -137,6 +145,7 @@ function reset(): void {
 	lastMap = '';
 	lastRosterSize = 0;
 	lastReconcileAt = 0;
+	lastAnnounceAt = 0;
 	reconcilePending = false;
 	announcePending = false;
 }
@@ -223,8 +232,13 @@ function pump(): void {
 			return;
 		}
 
-		// Throttle to ~0.5s, but flush immediately on events (reconcilePending).
+		// 1.72.0: heartbeat re-announce (see REANNOUNCE_MS above).
 		const now = Date.now();
+		if (now - lastAnnounceAt >= REANNOUNCE_MS) {
+			lastAnnounceAt = now;
+			announcePending = true;
+		}
+		// Throttle to ~0.5s, but flush immediately on events (reconcilePending).
 		if (!reconcilePending && now - lastReconcileAt < RECONCILE_MS) return;
 		lastReconcileAt = now;
 		reconcilePending = false;

@@ -191,6 +191,94 @@ export class OnEntitySpawnListener {
 			}
 		}
 
+		// 1.72.0 (assault fix): equipment with the 强袭/ASSAULT modifier fires extra
+		// projectiles from the engine's shared per-element templates
+		// (sc.ASSAULT_PROJECTILES[element]) — never one of the player's proxies, so
+		// the loop above missed them and EVERY swing logged "Could not find type of
+		// ball". Identify by template identity and relay as 'assault:<elementKey>';
+		// the receiver spawns the same template (see onThrowBall).
+		const assault: any = (sc as any).ASSAULT_PROJECTILES;
+		if (assault && settings.ballInfo) {
+			for (const el in assault) {
+				if (Object.prototype.hasOwnProperty.call(assault, el) && assault[el] === settings.ballInfo) {
+					return {
+						ballInfo: 'assault:' + el,
+						combatant:
+							settings.combatant === null
+								? null
+								: (settings.combatant as IMultiplayerEntity).multiplayerId,
+						dir: settings.dir,
+						party: settings.party,
+					};
+				}
+			}
+		}
+
+		// 1.72.0 (dungeon-key fix): standing on an active KeyPanel swaps the
+		// charged shot for the panel's key BallInfo via playerEntity.overrideBall
+		// (the 'DUNGEON_KEY'/'DUNGEON_MASTER_KEY' hinted ball — the mine/temple
+		// key throw). It is never a player proxy, so every key throw logged
+		// 'filterBall returned null' and teammates saw nothing. Match the live
+		// override by identity; the receiver resolves a local KeyPanel's
+		// spawner (onThrowBall 'key:' branch) so the relayed key keeps its real
+		// visuals AND its panel/wall-unlock behaviour.
+		const playerEnt: any = ig.game.playerEntity;
+		const overrideBall: any = playerEnt && playerEnt.overrideBall;
+		if (overrideBall && overrideBall.data === settings.ballInfo) {
+			let kind = 'regular';
+			try {
+				const hints: any = settings.ballInfo.attack && settings.ballInfo.attack.hints;
+				if (hints && hints.indexOf('DUNGEON_MASTER_KEY') !== -1) kind = 'master';
+			} catch (_) { /* default to regular */ }
+			return {
+				ballInfo: 'key:' + kind,
+				combatant:
+					settings.combatant === null
+						? null
+						: (settings.combatant as IMultiplayerEntity).multiplayerId,
+				dir: settings.dir,
+				party: settings.party,
+			};
+		}
+
+		// 1.72.0 (future-proofing): any OTHER unrecognized local ball (inline
+		// event proxies, modded spawners, future override types) must never hit
+		// this log-and-drop path again. Relay it as 'generic:<defaultProxyName>'
+		// — the receiver replays the thrower's default neutral ball as a visual
+		// stand-in (remote balls deal no local damage anyway; combat flows via
+		// the combatHit relay), so the throw is always visible and the warning
+		// below stays reserved for a genuinely broken state (no default proxy).
+		const fallback = this.defaultProxyName(player);
+		if (fallback) {
+			return {
+				ballInfo: 'generic:' + fallback,
+				combatant:
+					settings.combatant === null
+						? null
+						: (settings.combatant as IMultiplayerEntity).multiplayerId,
+				dir: settings.dir,
+				party: settings.party,
+			};
+		}
+
+		return null;
+	}
+
+	/** The proxy name of the player's DEFAULT neutral ball — used as the wire
+	 * stand-in for ball types we cannot identify (see filterBall's generic
+	 * fallback). */
+	private defaultProxyName(player: any): string | null {
+		try {
+			const cfg: any = (sc as any).PlayerConfig;
+			if (!cfg || typeof cfg.getElementBall !== 'function') return null;
+			const root: any = player && player.getCombatantRoot ? player.getCombatantRoot() : player;
+			const def: any = cfg.getElementBall(root, (sc as any).ELEMENT.NEUTRAL, false);
+			if (!def) return null;
+			const proxies = player.proxies;
+			for (const name in proxies) {
+				if (Object.prototype.hasOwnProperty.call(proxies, name) && proxies[name] === def) return name;
+			}
+		} catch (_) { /* ignore */ }
 		return null;
 	}
 

@@ -337,7 +337,7 @@ export class StorySyncController {
 	private npcHookInstalled = false;
 	private npcApplyBypass = false;
 	private hudStar: JQuery | null = null;
-	/** Cached ig.Sound fanfares (quest-accept / light-party / full-party). */
+	/** Cached ig.Sound fanfares (quest-accept / light-party / full-party / quest-complete). */
 	private storySounds: { [key: string]: any } = Object.create(null);
 
 	private updateRegistered = false;
@@ -347,6 +347,33 @@ export class StorySyncController {
 	private plotSaveGuardInstalled = false;
 	private rawVarsGetJson: any = null;
 	private mainPlotSnapshot: number | null = null;
+	/** Main-story sync, member side: latched when our OWN pre-sync plot.line was
+	 * AHEAD of the leader's streamed position (the member is temporarily clamped
+	 * DOWN to the leader). While clamped the main-story objective carries the
+	 * "[同步]" prefix (parity with the side-quest "[同步]" virtual entry); once the
+	 * leader's stream catches up to our real progress the prefix drops and the
+	 * jointly achieved progress becomes the member's own (no rollback on exit). */
+	private plotWasAhead = false;
+	/** The member's REAL perma task (main-story objective) captured at sync start —
+	 * restored on a rollback exit, and written into saves while clamped. */
+	private plotPermaAtStart: any = null;
+	/** The un-prefixed task our "[同步]" clone replaced + the clone itself. */
+	private plotPermaOriginal: any = null;
+	private plotPermaPrefixed: any = null;
+	/** The LEADER's current main-story objective, rebuilt from the streamed
+	 * state (ptask) — what members display while the mode runs. */
+	private plotLeaderTask: any = null;
+	private plotLeaderTaskJson = '';
+	private plotTaskHooksInstalled = false;
+	/** 1.72.0 (quest-world side effects): map/tmp var writes captured while a
+	 * side-quest sync is active, batched to the party. Quest-driven world spawns
+	 * (the miniboss on autumn/path-1-3, the loot chest gated on map.minibossLoot)
+	 * evaluate their spawnConditions against map vars that quest events only set
+	 * LOCALLY — without this relay, a host who never accepted the quest never
+	 * spawns the boss, and members never see the chest. */
+	private mapVarHookInstalled = false;
+	private mapVarQueue: Array<{ b: string, k: string, v: any }> = [];
+	private mapVarFlushAt = 0;
 	/** 1.71.9 (issue 10): the leader's latest relayed plot.line for MAIN-STORY sync.
 	 * Members ahead of the leader are re-clamped to this every frame while the mode
 	 * runs (the leader's story position is the one being played). */
@@ -358,6 +385,8 @@ export class StorySyncController {
 	private dialogApplyBypass = false;
 	private questModelHooksInstalled = false;
 	private eventStepsHooksInstalled = false;
+	private questCrashGuardInstalled = false;
+	private cameraCrashGuardInstalled = false;
 	private menuHooksInstalled = false;
 	private questVarHookInstalled = false;
 	private partyStoryMarkerInstalled = false;
@@ -461,6 +490,7 @@ export class StorySyncController {
 		try { c.onStorySyncStart((data) => this.onStart(data)); } catch (e) { console.error('[storysync] wire start failed', e); }
 		try { c.onStorySyncStartFailed((data) => this.onStartFailed(data)); } catch (e) { console.error('[storysync] wire startFailed failed', e); }
 		try { c.onStorySyncState((data) => this.onState(data)); } catch (e) { console.error('[storysync] wire state failed', e); }
+		try { c.onStorySyncMapVar((data) => this.onMapVar(data)); } catch (e) { console.error('[storysync] wire mapVar failed', e); }
 		try { c.onStorySyncEvent((data) => this.onEvent(data)); } catch (e) { console.error('[storysync] wire event failed', e); }
 		try { c.onStorySyncNpcRequest((data) => this.onNpcRequest(data)); } catch (e) { console.error('[storysync] wire npcRequest failed', e); }
 		try { c.onStorySyncEnd((data) => this.onEnd(data)); } catch (e) { console.error('[storysync] wire end failed', e); }
@@ -485,6 +515,12 @@ export class StorySyncController {
 	public currentQuest(): string { return this.quest; }
 	public isLocalLeader(): boolean { return this.active && this.leader === this.localName(); }
 	public isLocalMember(): boolean { return this.active && this.leader !== this.localName(); }
+	/** ROUND 124: expose the sync target so netSync can scope relayed quest pumps
+	 * (kill credit / relayed-loot collect credit) to the SELECTED quest only —
+	 * non-selected side quests must never receive synced progress. Empty when
+	 * inactive (currentQuest() alone would return a stale id after the mode ends). */
+	public getSyncedQuestId(): string { return this.active ? (this.quest || '') : ''; }
+	public isPlotSyncActive(): boolean { return this.active && this.isPlotQuest(this.quest); }
 	/** 1.70.70: true while a synced story video is actually running (used by
 	 * netSync's mirror-fade decision-maker to hide every non-leader character). */
 	public storyEventActive(): boolean { return this.active && this.inSyncedStoryVideo(); }
@@ -562,6 +598,183 @@ export class StorySyncController {
 			if (!(ig as any).vars || typeof (ig as any).vars.get !== 'function') return null;
 			const v = Number((ig as any).vars.get('plot.line'));
 			return isFinite(v) ? v : null;
+		} catch (_) { return null; }
+	}
+
+	/** True while this member's own main story is AHEAD of the leader's synced
+	 * position: plot.line is clamped down and the objective shows "[同步]". */
+	private plotClampAhead(): boolean {
+		try {
+			if (!this.active || this.isLocalLeader() || !this.isPlotQuest(this.quest)) return false;
+			if (this.mainPlotSnapshot === null || this.plotSyncTarget === null) return false;
+			return this.plotSyncTarget < this.mainPlotSnapshot;
+		} catch (_) { return false; }
+	}
+
+	/** True once a member who STARTED ahead has been reached by the leader's
+	 * stream — the joint progress is now their real progress (no rollback). */
+	private plotCaughtUp(): boolean {
+		try {
+			return this.plotWasAhead && this.plotSyncTarget !== null && this.mainPlotSnapshot !== null
+				&& this.plotSyncTarget >= this.mainPlotSnapshot;
+		} catch (_) { return false; }
+	}
+
+	/** Build a "[同步]"-prefixed clone of a perma-task LangLabel (prefixes every
+	 * language string in its data map; falls back to the baked value). */
+	private prefixedTask(base: any): any {
+		try {
+			const LL: any = (ig as any).LangLabel;
+			if (!LL || !base) return null;
+			const prefix = t('storySyncVirtualPrefix');
+			const data: any = base.data && typeof base.data === 'object' ? base.data : null;
+			const nd: any = {};
+			let anyStr = false;
+			if (data) {
+				for (const lang in data) {
+					if (typeof data[lang] === 'string' && data[lang].length && String(data[lang]).indexOf(prefix) !== 0) {
+						nd[lang] = prefix + data[lang]; anyStr = true;
+					} else nd[lang] = data[lang];
+				}
+			}
+			if (!anyStr) nd.en_US = prefix + String(base.value || '');
+			return new LL(nd);
+		} catch (_) { return null; }
+	}
+
+	/** Drive the member's DISPLAYED main-story objective (sc.model.permaTask —
+	 * the HUD box + the ESC-menu synopsis both read it) from the LEADER's
+	 * streamed objective, so a member whose own story is far ahead (or behind)
+	 * sees the party's real current objective. While this member is AHEAD and
+	 * clamped the objective carries the "[同步]" prefix (parity with the
+	 * side-quest "[同步]" virtual entry); the prefix drops by itself once the
+	 * leader's stream catches up. Leaders with no streamed objective (older
+	 * builds) fall back to just prefixing the member's own task. Idempotent. */
+	private syncPlotTaskDisplay(): void {
+		try {
+			const model: any = (sc as any).model;
+			if (!model) return;
+			const inSync = this.active && !this.isLocalLeader() && this.isPlotQuest(this.quest);
+			const ahead = this.plotClampAhead();
+			if (inSync && this.plotLeaderTask) {
+				let want: any = this.plotLeaderTask;
+				if (ahead) {
+					if (!this.plotPermaPrefixed || this.plotPermaOriginal !== this.plotLeaderTask) {
+						this.plotPermaOriginal = this.plotLeaderTask;
+						this.plotPermaPrefixed = this.prefixedTask(this.plotLeaderTask);
+					}
+					if (this.plotPermaPrefixed) want = this.plotPermaPrefixed;
+				}
+				if (want && model.permaTask !== want) {
+					model.permaTask = want;
+					try { (sc as any).Model.notifyObserver(model, (sc as any).GAME_MODEL_MSG.PERMA_TASK_CHANGED); } catch (_) { /* ignore */ }
+				}
+				return;
+			}
+			if (inSync && ahead) {
+				// No streamed objective: at least mark the member's own task.
+				const cur = model.permaTask;
+				if (!cur) return;
+				if (this.plotPermaPrefixed && cur === this.plotPermaPrefixed) return;
+				const original = (this.plotPermaPrefixed && this.plotPermaOriginal && cur === this.plotPermaPrefixed)
+					? this.plotPermaOriginal : cur;
+				const clone = this.prefixedTask(original);
+				if (!clone) return;
+				this.plotPermaOriginal = original;
+				this.plotPermaPrefixed = clone;
+				model.permaTask = clone;
+				try { (sc as any).Model.notifyObserver(model, (sc as any).GAME_MODEL_MSG.PERMA_TASK_CHANGED); } catch (_) { /* ignore */ }
+				return;
+			}
+			// Not clamped (or not in sync): if our prefixed clone is still live,
+			// restore the base it was built from.
+			if (this.plotPermaPrefixed && model.permaTask === this.plotPermaPrefixed) {
+				model.permaTask = this.plotPermaOriginal;
+				try { (sc as any).Model.notifyObserver(model, (sc as any).GAME_MODEL_MSG.PERMA_TASK_CHANGED); } catch (_) { /* ignore */ }
+			}
+			if (!ahead) { this.plotPermaOriginal = null; this.plotPermaPrefixed = null; }
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Exit path for the main-story objective. Rolled back (still clamped at
+	 * exit): restore the member's own pre-sync objective. Caught up: keep the
+	 * live jointly-achieved objective, minus any "[同步]" prefix. */
+	private finalizePlotTaskOnExit(): void {
+		try {
+			const model: any = (sc as any).model;
+			if (model) {
+				if (!this.plotCaughtUp() && this.plotPermaAtStart) {
+					// Rolled back to the member's own progress: restore the objective
+					// that matches it (replaces whatever the leader's stream showed).
+					model.permaTask = this.plotPermaAtStart;
+					try { (sc as any).Model.notifyObserver(model, (sc as any).GAME_MODEL_MSG.PERMA_TASK_CHANGED); } catch (_) { /* ignore */ }
+				} else if (this.plotPermaPrefixed && model.permaTask === this.plotPermaPrefixed) {
+					// Caught up: keep the live jointly-achieved objective, minus prefix.
+					model.permaTask = this.plotPermaOriginal || this.plotLeaderTask || this.plotPermaAtStart || model.permaTask;
+					try { (sc as any).Model.notifyObserver(model, (sc as any).GAME_MODEL_MSG.PERMA_TASK_CHANGED); } catch (_) { /* ignore */ }
+				}
+				// Caught up with the leader's PLAIN task live: leave it — it IS the
+				// objective the party is genuinely on now.
+			}
+		} catch (_) { /* ignore */ }
+		this.plotPermaOriginal = null;
+		this.plotPermaPrefixed = null;
+		this.plotPermaAtStart = null;
+		this.plotLeaderTask = null;
+		this.plotLeaderTaskJson = '';
+	}
+
+	/** Global GameModel hooks for the "[同步]" objective marker: freshly set
+	 * objectives are re-prefixed while clamped, and saves never persist the
+	 * prefix (a clamped member's save carries their REAL pre-sync objective,
+	 * matching the plot.line the plot save guard already writes). */
+	private installPlotTaskHooks(): void {
+		try {
+			if (this.plotTaskHooksInstalled) return;
+			const GM: any = (sc as any).GameModel;
+			if (!GM || typeof GM.inject !== 'function') return;
+			this.plotTaskHooksInstalled = true;
+			const self = this;
+			GM.inject({
+				setPermaTask(this: any, task: any) {
+					this.parent(task);
+					// A locally-replayed scene just set an objective — re-assert the
+					// leader-streamed display (or the "[同步]" prefix) over it.
+					try { self.syncPlotTaskDisplay(); } catch (_) { /* ignore */ }
+				},
+				onStorageSave(this: any, box: any) {
+					const r = this.parent(box);
+					try {
+						if (box && self.active && !self.committed && self.isPlotQuest(self.quest)
+							&& self.mainPlotSnapshot !== null && !self.plotCaughtUp()
+							&& self.plotPermaAtStart && self.plotPermaAtStart.data) {
+							box.permaTask = self.plotPermaAtStart.data;
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				},
+			});
+			console.log('[storysync] perma-task sync prefix hooks installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** The current main-story objective as a plain {lang: text} map for the
+	 * state stream / start request (bounded; null when there is no objective). */
+	private currentPermaTaskData(): any {
+		try {
+			const pt: any = (sc as any).model && (sc as any).model.permaTask;
+			if (!pt) return null;
+			const data: any = pt.data && typeof pt.data === 'object' ? pt.data : null;
+			const clean: any = {};
+			let n = 0;
+			if (data) {
+				for (const lang in data) {
+					const s = data[lang];
+					if (typeof s === 'string' && s.length && s.length <= 300) { clean[lang] = s; if (++n >= 12) break; }
+				}
+			}
+			if (!n && pt.value) clean.en_US = String(pt.value).slice(0, 300);
+			return n || clean.en_US ? clean : null;
 		} catch (_) { return null; }
 	}
 
@@ -861,7 +1074,13 @@ export class StorySyncController {
 		try {
 			if (this.isPlotQuest(id)) {
 				const line = this.mainPlotLine() || 0;
-				return { id, task: line, highest: line, finished: false, completed: [], labels: {} };
+				const out: any = { id, task: line, highest: line, finished: false, completed: [], labels: {} };
+				// Ship the leader's CURRENT main-story objective text so members
+				// display the party's real task instead of their own further-along
+				// (or behind) one — the visible half of the plot.line clamp.
+				const pt = this.currentPermaTaskData();
+				if (pt) out.ptask = pt;
+				return out;
 			}
 			const q = this.questManager();
 			if (!q) return null;
@@ -938,7 +1157,8 @@ export class StorySyncController {
 				try {
 					const out = self.rawVarsGetJson.call(v);
 					if (out && out.storage && self.active && !self.committed
-						&& self.isPlotQuest(self.quest) && self.mainPlotSnapshot !== null) {
+						&& self.isPlotQuest(self.quest) && self.mainPlotSnapshot !== null
+						&& !self.plotCaughtUp()) {
 						out.storage.plot = out.storage.plot || {};
 						out.storage.plot.line = self.mainPlotSnapshot;
 					}
@@ -966,6 +1186,10 @@ export class StorySyncController {
 				const line = this.mainPlotLine();
 				if (line === null) return false;
 				this.mainPlotSnapshot = line;
+				// …and the member's REAL main-story objective, so a rollback exit
+				// (and any mid-sync save) can restore exactly what their own
+				// progress showed before the temporary clamp.
+				try { this.plotPermaAtStart = (sc as any).model ? (sc as any).model.permaTask : null; } catch (_) { this.plotPermaAtStart = null; }
 			}
 			return true;
 		} catch (err) {
@@ -983,8 +1207,17 @@ export class StorySyncController {
 		try {
 			if (this.isPlotQuest(this.quest) && this.mainPlotSnapshot !== null
 				&& (ig as any).vars && typeof (ig as any).vars.set === 'function') {
-				(ig as any).vars.set('plot.line', this.mainPlotSnapshot);
-				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				if (this.plotCaughtUp()) {
+					// The leader's stream REACHED this member's own pre-sync progress:
+					// everything the party achieved from there on was genuinely played
+					// together, so the live plot.line IS the member's real progress —
+					// keep it (rolling back here would silently undo the joint run).
+					console.log('[storysync] plot sync caught up (own=' + this.mainPlotSnapshot
+						+ ' leader=' + this.plotSyncTarget + ') — keeping the joint progress');
+				} else {
+					(ig as any).vars.set('plot.line', this.mainPlotSnapshot);
+					if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				}
 			}
 		} catch (_) { /* ignore */ }
 		const q = this.questManager();
@@ -1093,7 +1326,13 @@ export class StorySyncController {
 		this.isPendingStart = true;
 		this.installSaveGuard();
 		this.installPlotSaveGuard();
-		try { this.conn.storySyncRequest(id); } catch (e) { this.pendingStartReset(); return t('storySyncNetworkError'); }
+		// Main-story mode piggybacks the leader's CURRENT plot.line so the server
+		// can put it on the start envelope — ahead members then clamp instantly
+		// instead of free-running their own further-along story until the first
+		// state packet lands.
+		const plotLine = this.isPlotQuest(id) ? (this.mainPlotLine() ?? undefined) : undefined;
+		const ptask = this.isPlotQuest(id) ? (this.currentPermaTaskData() ?? undefined) : undefined;
+		try { this.conn.storySyncRequest(id, plotLine, ptask); } catch (e) { this.pendingStartReset(); return t('storySyncNetworkError'); }
 		console.log('[storysync] requested ' + (this.isPlotQuest(id) ? 'MAIN STORY' : 'quest=' + id));
 		return '';
 	}
@@ -1201,7 +1440,7 @@ export class StorySyncController {
 
 	// ------------------------------------------------------------- mode envelope
 
-	private onStart(data: { quest: string, leader: string, members: string[] }): void {
+	private onStart(data: { quest: string, leader: string, members: string[], plotLine?: number, ptask?: { [lang: string]: string } }): void {
 		if (!data || typeof data.quest !== 'string' || typeof data.leader !== 'string') return;
 		if (this.active && this.quest === data.quest) {
 			// A mid-way joiner handshake push also refreshes membership.
@@ -1224,6 +1463,12 @@ export class StorySyncController {
 		this.snapshot = null;
 		this.mainPlotSnapshot = null;
 		this.plotSyncTarget = null;
+		this.plotWasAhead = false;
+		this.plotPermaAtStart = null;
+		this.plotPermaOriginal = null;
+		this.plotPermaPrefixed = null;
+		this.plotLeaderTask = null;
+		this.plotLeaderTaskJson = '';
 		this.committed = false;
 		this.finishedSynced = false;
 		this.currentEventSeq = 0;
@@ -1250,6 +1495,34 @@ export class StorySyncController {
 		}
 		console.log('[storysync] MODE START quest=' + this.quest + ' leader=' + this.leader +
 			' members=' + JSON.stringify(this.members) + ' snapshot=true I-am-leader=' + this.isLocalLeader());
+		// Main-story sync: the start envelope carries the leader's CURRENT plot.line,
+		// so an AHEAD member clamps immediately instead of playing ~1s of their own
+		// (further-along) story triggers while the first state packet is in flight.
+		// captureSnapshot already recorded the member's own line above, so clamping
+		// here cannot contaminate the rollback snapshot.
+		if (!this.isLocalLeader() && this.isPlotQuest(this.quest)) {
+			// The leader's objective text rides the same envelope (ptask), so the
+			// member sees the party's real task from the very first frame.
+			try {
+				const pt: any = (data as any).ptask;
+				if (pt && typeof pt === 'object') {
+					this.plotLeaderTaskJson = JSON.stringify(pt);
+					const LL: any = (ig as any).LangLabel;
+					this.plotLeaderTask = LL ? new LL(pt) : null;
+				}
+			} catch (_) { /* ignore */ }
+			const pl = Number((data as any).plotLine);
+			if (isFinite(pl) && pl >= 0) {
+				this.plotSyncTarget = Math.round(pl);
+				try {
+					(ig as any).vars.set('plot.line', this.plotSyncTarget);
+					if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				} catch (_) { /* ignore */ }
+				if (this.mainPlotSnapshot !== null && this.plotSyncTarget < this.mainPlotSnapshot) this.plotWasAhead = true;
+				console.log('[storysync] immediate plot clamp -> ' + this.plotSyncTarget + ' (own=' + this.mainPlotSnapshot + ')');
+			}
+			try { this.syncPlotTaskDisplay(); } catch (_) { /* ignore */ }
+		}
 		// 1.71.9 (issue 9): a member whose save already solved this quest gets a
 		// virtual "[同步] …" quest entry for the duration of the mode (no rewards).
 		try { this.ensureVirtualQuest(); } catch (_) { /* ignore */ }
@@ -1351,6 +1624,27 @@ export class StorySyncController {
 				this.plotSyncTarget = line;
 				(ig as any).vars.set('plot.line', line);
 				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				// The leader's current main-story objective rides the same packet:
+				// rebuild it when it changed so members SEE the party's real task
+				// instead of their own further-along one.
+				try {
+					const pt: any = (state as any).ptask;
+					if (pt && typeof pt === 'object') {
+						const json = JSON.stringify(pt);
+						if (json !== this.plotLeaderTaskJson) {
+							this.plotLeaderTaskJson = json;
+							const LL: any = (ig as any).LangLabel;
+							this.plotLeaderTask = LL ? new LL(pt) : null;
+							console.log('[storysync] leader objective: ' + String((this.plotLeaderTask && this.plotLeaderTask.value) || ''));
+						}
+					}
+				} catch (_) { /* ignore */ }
+				// Latch "we were ahead" the first time the leader's stream sits BELOW
+				// our own pre-sync progress, and keep the displayed objective (and its
+				// "[同步]" prefix) in sync with the clamp — the prefix drops by itself
+				// once the leader catches up.
+				if (this.mainPlotSnapshot !== null && line < this.mainPlotSnapshot) this.plotWasAhead = true;
+				try { this.syncPlotTaskDisplay(); } catch (_) { /* ignore */ }
 				return;
 			}
 			const q = this.questManager();
@@ -1373,7 +1667,15 @@ export class StorySyncController {
 			// lands mid-load is deliberately dropped here, and without the cache the
 			// member would sit at its own (possibly AHEAD) progress until the leader's
 			// state actually changes again.
+			// 1.72.0: clients whose synced quest is NOT locally active answer quest vars
+			// through the leader-state fallback (quest-gated spawn conditions read them)
+			// and get no QuestModel notification when the stage moves — nudge a var-change
+			// re-evaluation so their map entities spawn/despawn with the leader.
+			const prevTask = this.lastLeaderState ? (Number(this.lastLeaderState.task) || 0) : -1;
 			this.lastLeaderState = state;
+			if ((Number(state.task) || 0) !== prevTask) {
+				try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			}
 			let st = typeof q.getQuestState === 'function' ? q.getQuestState(quest) : null;
 			if (!st) {
 				if (this.questStatus(this.quest).active) {
@@ -1540,6 +1842,7 @@ export class StorySyncController {
 			this.ensureEngineHooks();
 			this.ensureStoryIntegrity();
 			if (this.active) {
+				try { this.flushMapVars(); } catch (_) { /* ignore */ }
 				// Self-heal the solved-member view entry once a second: a mid-sync save
 				// LOAD rebuilds the quest model from the guarded snapshot (which has no
 				// virtual entry) without notifying us — recreate it so it always returns.
@@ -1595,6 +1898,9 @@ export class StorySyncController {
 							if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
 						}
 					} catch (_) { /* ignore */ }
+					// Keep the leader-streamed objective (and its "[同步]" prefix
+					// while we are ahead) in lockstep with the clamp.
+					try { this.syncPlotTaskDisplay(); } catch (_) { /* ignore */ }
 				}
 				// A pending start whose server reply never lands eventually resets.
 				if (this.isPendingStart && Date.now() - this.pendingAt > CHECK_LOCAL_TIMEOUT) {
@@ -1623,9 +1929,136 @@ export class StorySyncController {
 		this.installQuestModelHooks();
 		this.installTriggerHooks();
 		this.installEventStepHooks();
+		this.installQuestCrashGuard();
+		this.installCameraCrashGuard();
 		this.installQuestMenuHooks();
 		this.installQuestVarHook();
 		this.installPartyStoryMarkerHook();
+		this.installPlotTaskHooks();
+		this.installMapVarHook();
+	}
+
+	/** 1.72.0: capture map/tmp var writes while a side-quest sync runs. Quest
+	 * events set map vars LOCALLY (CHANGE_VAR steps resolve to
+	 * 'maps.<camelMap>.<var>'; direct writes use 'map.<var>'/'tmp.<var>'), and
+	 * spawnConditions of quest chests/enemies evaluate against those buckets.
+	 * Only the client whose world/quest actually ran sees the write — relay it
+	 * to every synced client so the boss spawns on the host even when the host
+	 * never accepted the quest (leader-driven vars reach it), and the phase
+	 * chest appears for every teammate (world-reaction vars like
+	 * map.minibossLoot, set on the host where the boss died, reach everyone).
+	 * Receivers write the bucket directly (bypassing this hooked API) so nothing
+	 * echoes back. */
+	private installMapVarHook(): void {
+		try {
+			if (this.mapVarHookInstalled) return;
+			const vars: any = (ig as any).vars;
+			if (!vars || typeof vars.set !== 'function') return;
+			this.mapVarHookInstalled = true;
+			const ctl = this;
+			const wrap = function (method: string) {
+				const orig = vars[method];
+				if (typeof orig !== 'function') return;
+				vars[method] = function (path: any, val: any) {
+					const r = orig.apply(this, arguments as any);
+					try { ctl.captureMapVar(path); } catch (_) { /* never break a var write */ }
+					return r;
+				};
+			};
+			wrap('set'); wrap('add'); wrap('sub'); wrap('mul'); wrap('div');
+			wrap('mod'); wrap('and'); wrap('or'); wrap('xor'); wrap('append');
+			console.log('[storysync] map-var sync hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Post-write capture: resolve a written path to its storage bucket + key and
+	 * queue the new value when it is a sync-relevant map/tmp var. */
+	private captureMapVar(path: any): void {
+		if (!this.active || this.isPlotQuest(this.quest)) return;
+		if (typeof path !== 'string') return;
+		const vars: any = (ig as any).vars;
+		if (!vars || !vars.storage) return;
+		let bucket = '';
+		let key = '';
+		let obj: any = null;
+		if (path.indexOf('maps.') === 0) {
+			const dot = path.indexOf('.', 5);
+			if (dot === -1) return;
+			bucket = path.slice(0, dot);
+			key = path.slice(dot + 1);
+			obj = vars.storage.maps[path.slice(5, dot)];
+		} else if (path.indexOf('map.') === 0) {
+			const camel = vars.currentLevelName;
+			if (!camel) return;
+			bucket = 'maps.' + camel;
+			key = path.slice(4);
+			obj = vars.storage.map;
+		} else if (path.indexOf('tmp.') === 0) {
+			bucket = 'tmp';
+			key = path.slice(4);
+			obj = vars.storage.tmp;
+		} else {
+			return;
+		}
+		if (!key || key.indexOf('.') !== -1 || !obj) return;
+		const v = obj[key];
+		const tv = typeof v;
+		if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') return;
+		// Dedupe against the tail of the queue (event chains often rewrite the same
+		// var several times in one frame; only the final value matters).
+		for (let i = this.mapVarQueue.length; i--;) {
+			const e = this.mapVarQueue[i];
+			if (e.b === bucket && e.k === key) {
+				if (e.v === v) return;
+				this.mapVarQueue.splice(i, 1);
+				break;
+			}
+		}
+		if (this.mapVarQueue.length < 128) this.mapVarQueue.push({ b: bucket, k: key, v });
+	}
+
+	/** Batch-send queued map/tmp var writes to the party (throttled ~4Hz). */
+	private flushMapVars(): void {
+		if (!this.mapVarQueue.length) return;
+		const now = Date.now();
+		if (now < this.mapVarFlushAt) return;
+		this.mapVarFlushAt = now + 250;
+		const list = this.mapVarQueue.splice(0, 64);
+		if (!list.length) return;
+		try { this.conn.storySyncMapVar(this.quest, list); } catch (_) { /* ignore */ }
+	}
+
+	/** A synced client wrote map/tmp vars — apply them to our buckets directly
+	 * (bypasses the hooked vars API so nothing re-broadcasts), then re-evaluate
+	 * spawn conditions when the write touches the map we are on. */
+	private onMapVar(data: { from: string, quest: string, list: Array<{ b: string, k: string, v: any }> }): void {
+		try {
+			if (!this.active || this.isPlotQuest(this.quest)) return;
+			if (!data || data.quest !== this.quest || !Array.isArray(data.list)) return;
+			const vars: any = (ig as any).vars;
+			if (!vars || !vars.storage) return;
+			let touchesCurrent = false;
+			const currentBucket = 'maps.' + (vars.currentLevelName || '');
+			for (const e of data.list) {
+				if (!e || typeof e.b !== 'string' || typeof e.k !== 'string' || !e.k) continue;
+				const tv = typeof e.v;
+				if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') continue;
+				let obj: any = null;
+				if (e.b === 'tmp') obj = vars.storage.tmp;
+				else if (e.b.indexOf('maps.') === 0) {
+					const map = e.b.slice(5);
+					if (!map) continue;
+					obj = vars.storage.maps[map] || (vars.storage.maps[map] = {});
+				}
+				if (!obj) continue;
+				if (obj[e.k] === e.v) continue; // already converged
+				obj[e.k] = e.v;
+				if (e.b === 'tmp' || e.b === currentBucket) touchesCurrent = true;
+			}
+			if (touchesCurrent) {
+				try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* never break the frame */ }
 	}
 
 	private installQuestObserver(): void {
@@ -2895,16 +3328,32 @@ export class StorySyncController {
 			console.warn('[storysync] repaired plot.line -> 3710 for "Follow Schneider" task');
 		}
 		// Schneider hands over the guild pass at 3720 and hides again at 3730.
-		// If the pass is missing but the plot is already past his scene, roll the
-		// line back so he can be met again.
+		// If the pass is missing but the plot is already past his scene, grant the
+		// pass DIRECTLY. (The old fix rolled plot.line back to 3720 so Schneider
+		// could be met again — but his pass scene lives on autumn.path-3-1, another
+		// map, and its ONCE trigger stays consumed, so the rollback could never
+		// re-grant anything. Worse, on the guild village map the ALWAYS Intro
+		// trigger immediately re-sets 3740, so guard and trigger fought every
+		// second: endless "repaired plot.line" spam + repair toasts until the
+		// player entered the HQ interior. A missing pass at line >= 3730 means the
+		// grant step never ran locally — e.g. a synced member jumped here via the
+		// leader's state stream — and the guild door only checks item.170, so
+		// granting it matches the story state exactly.)
 		if (line >= 3730 && line < 3750) {
-			const inv: any = (sc as any).inventory;
-			const hasPass = !!(inv && typeof inv.getItemAmount === 'function' && inv.getItemAmount(170) > 0);
+			// The player item-AMOUNT store is sc.model.player (the ONLY
+			// getItemAmount in the engine) — sc.inventory is the item DATABASE
+			// and has no getItemAmount at all, so checking it made hasPass
+			// permanently false: the repair re-fired every second even with the
+			// pass in the bag (and the grant itself went to the correct store,
+			// which the wrong check never saw).
+			const player: any = (sc as any).model && (sc as any).model.player;
+			const hasPass = !!(player && typeof player.getItemAmount === 'function' && player.getItemAmount(170) > 0);
 			if (!hasPass) {
-				vars.set('plot.line', 3720);
-				line = 3720;
-				fixed = true;
-				console.warn('[storysync] repaired plot.line -> 3720 (guild pass missing)');
+				if (player && typeof player.addItem === 'function') {
+					player.addItem(170, 1, true); // skip=true: no obtain popup for a repair grant
+					fixed = true;
+					console.warn('[storysync] granted missing guild pass (item 170) at plot.line ' + line);
+				}
 			}
 		}
 		// Emilie is expected to be in the engine party for this whole segment
@@ -2933,9 +3382,18 @@ export class StorySyncController {
 				if (!e || e._killed || !(NPC && e instanceof NPC)) continue;
 				if (String(e.name || '') !== 'schneider') continue;
 				found = true;
-				if (e.hidden) { e.hidden = false; fixed = true; }
-				if (e.animState && e.animState.alpha === 0) { e.animState.alpha = 1; fixed = true; }
-				try { if (typeof e.updateNpcState === 'function') e.updateNpcState(true); } catch (_) { /* ignore */ }
+				const wasHidden = !!e.hidden;
+				const wasInvisible = !!(e.animState && e.animState.alpha === 0);
+				if (wasHidden) { e.hidden = false; fixed = true; }
+				if (wasInvisible) { e.animState.alpha = 1; fixed = true; }
+				// Only re-apply the NPC state when a visibility repair actually
+				// happened: updateNpcState(true) snaps Schneider to his state's
+				// anchor position, and this guard ticks once per second for the
+				// whole 3710..3730 walk-together segment — calling it every tick
+				// yanked him back mid-stride ("一直移动并一直被拖回位置").
+				if (wasHidden || wasInvisible) {
+					try { if (typeof e.updateNpcState === 'function') e.updateNpcState(true); } catch (_) { /* ignore */ }
+				}
 				break;
 			}
 			if (!found) console.warn('[storysync] Follow-Schneider task active but NPC "schneider" missing on autumn.path-3-1');
@@ -2972,15 +3430,29 @@ export class StorySyncController {
 				this.tryFinishSyncedQuest(data.state);
 			}
 			this.exitLocal('complete', false);
-			showMpToast({ title: t('storySyncCompleted'), subtitle: this.questLabel(this.quest) });
+			// 1.72.0: FF14-style quest turn-in fanfare on every party member's client
+			// (storySyncEnd(reason 'complete') is broadcast to the whole party).
+			// Side quests only — the main-story path has its own cinematic audio.
+			if (!this.isPlotQuest(data.quest)) this.playStorySound('complete');
+			// ROUND 129: side-quest ends get the same big FF14-style center banner as
+			// the sync START (an unmistakable "sync over" cue); the main-story path
+			// keeps the small toast (it has its own cinematics).
+			if (!this.isPlotQuest(data.quest)) this.playEndBanner(t('storySyncCompleted'), this.questLabel(this.quest));
+			else showMpToast({ title: t('storySyncCompleted'), subtitle: this.questLabel(this.quest) });
 			return;
 		}
 		const isSelfLeave = data.reason === 'leave' && data.by === this.localName();
 		this.exitLocal(data.reason, true);
 		switch (data.reason) {
-			case 'cancel': showMpToast({ title: t('storySyncCancelled'), subtitle: this.questLabel(this.quest) }); break;
+			case 'cancel':
+				if (!this.isPlotQuest(data.quest)) this.playEndBanner(t('storySyncCancelled'), this.questLabel(this.quest));
+				else showMpToast({ title: t('storySyncCancelled'), subtitle: this.questLabel(this.quest) });
+				break;
 			case 'leaderLeft':
-			case 'partyEnd': showMpToast({ title: t('storySyncEndedParty'), subtitle: this.questLabel(this.quest) }); break;
+			case 'partyEnd':
+				if (!this.isPlotQuest(data.quest)) this.playEndBanner(t('storySyncEndedParty'), this.questLabel(this.quest));
+				else showMpToast({ title: t('storySyncEndedParty'), subtitle: this.questLabel(this.quest) });
+				break;
 			case 'leave': showMpToast({ title: t('storySyncSelfLeft') }); break;
 			default: break;
 		}
@@ -3001,8 +3473,11 @@ export class StorySyncController {
 				if (restore && this.snapshot) {
 					if (this.isPlotQuest(this.quest)) {
 						// Main-story sync: put the player's OWN plot.line back (teammates
-						// who were ahead were only temporarily clamped to the leader).
+						// who were ahead were only temporarily clamped to the leader —
+						// unless the leader caught up, in which case the joint progress
+						// IS their progress and restoreSnapshot keeps it).
 						this.restoreSnapshot();
+						this.finalizePlotTaskOnExit();
 					} else {
 						// 1.71.9 (issues 6/8): side-quest sync NEVER rolls the quest back.
 						// The live (leader-synced) progress IS the result — cancel, party
@@ -3015,13 +3490,21 @@ export class StorySyncController {
 					}
 				}
 				if (!restore) this.committed = true;              // completion persists
+				// The objective prefix must come off on EVERY exit path (restore=false
+				// skips the branch above) — idempotent, and nulls the held references.
+				if (this.isPlotQuest(this.quest)) { try { this.finalizePlotTaskOnExit(); } catch (_) { /* ignore */ } }
 				this.removeVirtualQuest();
 				this.active = false;
 				this.committed = true;                            // save guard disarms
 				this.snapshot = null;
 				this.mainPlotSnapshot = null;
 				this.plotSyncTarget = null;
+				this.plotWasAhead = false;
+				this.plotPermaAtStart = null;
+				this.plotPermaOriginal = null;
+				this.plotPermaPrefixed = null;
 				this.currentEventSeq = 0;
+			this.mapVarQueue.length = 0;
 				this.currentEventActive = false;
 				this.currentEventPendingSince = 0;
 				this.resetSkipVote();
@@ -3090,6 +3573,16 @@ export class StorySyncController {
 								const v = ctl.questVarValue(st, b);
 								if (v.handled) return v.value;
 							}
+							// 1.72.0 (quest-gated world spawns): the synced quest is NOT
+							// active locally (never accepted here, or activation is still
+							// catching up mid-load). Map spawnConditions reading
+							// quest.<id>.* would see an inactive quest and never spawn
+							// the quest enemies/chest on THIS client — fatal when this
+							// client is the HOST (its enemy stream is authoritative, so
+							// nobody gets the monsters). Answer from the leader's latest
+							// streamed state instead.
+							const lv = ctl.leaderStateVarValue(b);
+							if (lv.handled) return lv.value;
 						}
 					} catch (_) { /* fall through to native */ }
 					return this.parent(a, b);
@@ -3100,6 +3593,9 @@ export class StorySyncController {
 						if (ctl && a && a.id === ctl.currentQuest()) {
 							const st = ctl.syncedQuestView();
 							if (st) return st.currentTask > b;
+							// 1.72.0: same inactive-local fallback as onVarAccess.
+							const ls = ctl.leaderStateForVar();
+							if (ls) return (Number(ls.task) || 0) > b;
 						}
 					} catch (_) { /* fall through to native */ }
 					return this.parent(a, b);
@@ -3110,6 +3606,9 @@ export class StorySyncController {
 						if (ctl && a && a.id === ctl.currentQuest()) {
 							const st = ctl.syncedQuestView();
 							if (st) return b ? st.highestTask : st.currentTask;
+							// 1.72.0: same inactive-local fallback as onVarAccess.
+							const ls = ctl.leaderStateForVar();
+							if (ls) return b ? (Number(ls.highest) || 0) : (Number(ls.task) || 0);
 						}
 					} catch (_) { /* fall through to native */ }
 					return this.parent(a, b);
@@ -3153,6 +3652,43 @@ export class StorySyncController {
 		} catch (_) { return { handled: false, value: undefined }; }
 	}
 
+	/** 1.72.0: the leader's latest streamed quest state for var-routing, ONLY
+	 * usable when the synced quest has no better local answer — i.e. it is NOT
+	 * active locally (never accepted on this client, or the forced activation in
+	 * applySyncedState has not landed yet). Accepted members read their pinned
+	 * real state through the native branch; solved members use syncedQuestView. */
+	public leaderStateForVar(): any {
+		try {
+			if (!this.active || this.isLocalLeader() || this.isPlotQuest(this.quest)) return null;
+			const ls = this.lastLeaderState;
+			if (!ls || ls.id !== this.quest) return null;
+			const q = this.questManager();
+			if (q && typeof q.isQuestActive === 'function' && q.isQuestActive(this.quest)) return null;
+			return ls;
+		} catch (_) { return null; }
+	}
+
+	/** Answer one quest.<synced>.* var read from the leader's streamed state,
+	 * mirroring questVarValue's ACTIVE-branch semantics over the wire shape
+	 * ({task, highest, completed[], labels, finished}). */
+	public leaderStateVarValue(b: any[]): { handled: boolean, value: any } {
+		const ls = this.leaderStateForVar();
+		if (!ls) return { handled: false, value: undefined };
+		try {
+			const n = (b[3] as any) * 1;
+			const task = Number(ls.task) || 0;
+			switch (b[2]) {
+				case 'started': return { handled: true, value: true };
+				case 'solved': return { handled: true, value: !!ls.finished };
+				case 'task': return { handled: true, value: task === n };
+				case 'currentTask': return { handled: true, value: task };
+				case 'subtask': return { handled: true, value: Array.isArray(ls.completed) && ls.completed.indexOf(n) !== -1 };
+				case 'label': return { handled: true, value: ls.labels ? ls.labels[b[3]] : undefined };
+				default: return { handled: true, value: undefined };
+			}
+		} catch (_) { return { handled: false, value: undefined }; }
+	}
+
 	private installEventStepHooks(): void {
 		try {
 			if (this.eventStepsHooksInstalled) return;
@@ -3178,11 +3714,149 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** Crash guard for the fatal "Tried to solve condition of quest that is not
+	 * active". Vanilla never reaches that throw (events are authored against the
+	 * local quest state), but in a party a member replaying the leader's NPC
+	 * turn-in event can run SOLVE_QUEST_CONDITION for a quest that is not ACTIVE
+	 * locally — already finished (the sync-complete path beats the replayed dialog
+	 * to it) or never accepted. Solving a condition on such a quest is meaningless
+	 * by intent, so log and skip instead of letting the engine kill the game.
+	 * Unknown quest ids still fall through to the native throw (real corruption). */
+	private installQuestCrashGuard(): void {
+		try {
+			if (this.questCrashGuardInstalled) return;
+			const QM: any = (sc as any).QuestModel;
+			if (!QM || typeof QM.inject !== 'function') return;
+			this.questCrashGuardInstalled = true;
+			QM.inject({
+				solveQuestCondition(this: any, id: any, label: any) {
+					try {
+						const known = !!(this.staticQuests && this.staticQuests[id]);
+						if (known && typeof this.isQuestActive === 'function' && !this.isQuestActive(id)) {
+							console.warn('[storysync] solveQuestCondition skipped: quest ' + id + ' not active (label ' + label + ')');
+							return;
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(id, label);
+				},
+			});
+			console.log('[storysync] quest crash guard installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Crash guard for the fatal "Cannot read property 'coll' of null" from camera
+	 * event steps. SET_CAMERA_TARGET / SET_CAMERA_BETWEEN resolve their entities by
+	 * name at start() and push the camera target WITHOUT a null check (vanilla bug
+	 * — solo, the named entity always exists). In a party the named entity can be
+	 * missing on this client (member replay divergence, a synced NPC cleaned up,
+	 * a map state difference) and the first camera frame then throws. A skipped
+	 * camera move is cosmetically harmless — a crash is not. Additionally harden
+	 * EntityTarget/MultiEntityTarget themselves so ANY stale handle (e.g. a spectate
+	 * target whose entity went away) degrades to the player position. */
+	private installCameraCrashGuard(): void {
+		try {
+			if (this.cameraCrashGuardInstalled) return;
+			const ES: any = (ig as any).EVENT_STEP;
+			const Cam: any = (ig as any).Camera;
+			if (!ES || !Cam) return;
+			this.cameraCrashGuardInstalled = true;
+			const fallbackPos = (out: any): void => {
+				try {
+					const p: any = (ig as any).game && (ig as any).game.playerEntity;
+					if (out && p && p.coll) {
+						out.x = Math.round(p.coll.pos.x + p.coll.size.x / 2);
+						out.y = Math.round(p.coll.pos.y + p.coll.size.y / 2);
+					}
+				} catch (_) { /* ignore */ }
+			};
+			// 1) Event steps: pre-resolve with the SAME ig.Event.getEntity call the
+			//    native start() makes; a missing entity skips the step (its run() just
+			//    checks the camera clock — no handle bookkeeping to leave dangling).
+			const guardStep = (name: string, fields: string[]): void => {
+				try {
+					const cls = ES[name];
+					if (!cls || cls._mpCamGuarded || typeof cls.inject !== 'function') return;
+					cls._mpCamGuarded = true;
+					cls.inject({
+						start(this: any, a: any, b: any) {
+							try {
+								const Ev: any = (ig as any).Event;
+								if (Ev && typeof Ev.getEntity === 'function') {
+									for (let i = 0; i < fields.length; i++) {
+										const spec = this[fields[i]];
+										if (spec == null) continue;
+										const ent = Ev.getEntity(spec, b);
+										if (!ent || !ent.coll) {
+											console.warn('[storysync] ' + name + ' skipped: entity missing on this client ('
+												+ String((spec && spec.name) || spec) + ')');
+											return;
+										}
+									}
+								}
+							} catch (_) { /* resolution hiccup — let the native step decide */ }
+							return this.parent(a, b);
+						},
+					});
+				} catch (_) { /* ignore */ }
+			};
+			guardStep('SET_CAMERA_TARGET', ['entity']);
+			guardStep('SET_CAMERA_BETWEEN', ['entity1', 'entity2']);
+			// 2) Class-level: a null/coll-less entity degrades to the player position.
+			if (Cam.EntityTarget && typeof Cam.EntityTarget.inject === 'function') {
+				try {
+					Cam.EntityTarget.inject({
+						start(this: any) {
+							if (!this.entity || !this.entity.coll) { this._currentZ = 0; return; }
+							return this.parent();
+						},
+						getPos(this: any, out: any) {
+							if (!this.entity || !this.entity.coll) { fallbackPos(out); return; }
+							return this.parent(out);
+						},
+					});
+				} catch (_) { /* ignore */ }
+			}
+			if (Cam.MultiEntityTarget && typeof Cam.MultiEntityTarget.inject === 'function') {
+				try {
+					Cam.MultiEntityTarget.inject({
+						start(this: any) {
+							try { this.entities = (this.entities || []).filter((e: any) => e && e.coll); } catch (_) { /* ignore */ }
+							if (!this.entities || !this.entities.length) { this._currentZ = 0; return; }
+							return this.parent();
+						},
+						getPos(this: any, out: any) {
+							try {
+								const valid = (this.entities || []).filter((e: any) => e && e.coll);
+								if (!valid.length) { fallbackPos(out); return; }
+								if (valid.length !== this.entities.length) this.entities = valid;
+							} catch (_) { /* fall through to native */ }
+							return this.parent(out);
+						},
+					});
+				} catch (_) { /* ignore */ }
+			}
+			console.log('[storysync] camera crash guard installed');
+		} catch (_) { /* ignore */ }
+	}
+
 	private shouldSuppressEventQuestStep(step: any, method: string): boolean {
 		try {
-			if (!this.active || !this.isLocalMember()) return false;
+			if (this.isLocalLeader()) return false;
 			const target = method === 'START_STATIC_QUEST' ? step.quest : step.questId;
-			return target === this.quest;
+			if (!target) return false;
+			if (this.active && this.isLocalMember() && target === this.quest) return true;
+			// Post-completion grace: the sync-complete path (onEnd 'complete' ->
+			// tryFinishSyncedQuest -> setQuestFinished -> exitLocal) finishes the synced
+			// quest locally and flips active=false WHILE the member's replayed turn-in
+			// event can still be running — the END packet lands as soon as the leader's
+			// client reports completion, seconds before the replayed dialog reaches its
+			// own quest steps. A native SOLVE_QUEST_CONDITION on that now-finished quest
+			// then throws "Tried to solve condition of quest that is not active" (fatal
+			// crash), and START_STATIC_QUEST likewise ("Static quest is already
+			// finished!"). A quest already SOLVED locally can never legally take either
+			// step again (finished quests never re-activate), so suppress both steps for
+			// solved quests regardless of whether the sync is still flagged active.
+			return this.solvedAlready(target);
 		} catch (_) { return false; }
 	}
 
@@ -3432,6 +4106,29 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** ROUND 129: FF14-style END banner for side-quest sync exits (complete /
+	 * cancel / leader left / party ended) — the exact same look as the
+	 * commencement banner so the whole party gets an unmistakable, symmetric
+	 * "sync over" cue. Pure overlay, no pointer interception, auto-fades. */
+	private playEndBanner(title: string, sub: string): void {
+		try {
+			if (typeof document === 'undefined' || !document.body) return;
+			try { $('.mpStoryComm').remove(); } catch (_) { /* ignore */ }
+			const box = $('<div class="mpStoryComm"></div>');
+			box.append('<div class="mpStoryCommGlow"></div>');
+			const inner = $('<div class="mpStoryCommInner"></div>');
+			inner.append(this.partyOrnamentHtml(false));
+			inner.append('<div class="mpStoryCommTitle">' + title + '</div>');
+			inner.append(this.partyOrnamentHtml(true));
+			if (sub) inner.append('<div class="mpStoryCommSub">' + sub + '</div>');
+			box.append(inner);
+			$(document.body).append(box);
+			(window as any).setTimeout(() => {
+				try { box.remove(); } catch (_) { /* ignore */ }
+			}, 3500);
+		} catch (_) { /* ignore */ }
+	}
+
 	/** Shared FF14-style horizontal ornament: gradient line - diamond - gradient line. */
 	private partyOrnamentHtml(below: boolean): string {
 		return '<div class="mpStoryCommOrnament' + (below ? ' below' : '') + '">'
@@ -3463,18 +4160,24 @@ export class StorySyncController {
 	/** Lazily create + cache an engine sound (same idiom as the game's own GUI
 	 * sounds — see socialOverlay's comm ring). Returns null when the sound system
 	 * is not up yet; the caller then simply retries at play time. */
-	private getStorySound(key: 'accept' | 'light' | 'full'): any {
+	private getStorySound(key: 'accept' | 'light' | 'full' | 'complete'): any {
 		const paths: { [key: string]: string } = {
 			accept: 'media/sound/storysync/quest-accept.ogg',
 			light: 'media/sound/storysync/light-party.ogg',
 			full: 'media/sound/storysync/full-party.ogg',
+			// 1.72.0: FF14-style quest TURN-IN fanfare (synthesized bell arpeggio).
+			// ROUND 128: must ship as OGG — ig's WebAudio loader REWRITES any
+			// extension to ig.soundManager.format.ext (.ogg here), so the old .wav
+			// was never requested; the loader asked for a nonexistent .ogg and the
+			// XHR error crashed the game on quest turn-in.
+			complete: 'media/sound/storysync/quest-complete.ogg',
 		};
 		// 1.71.9 (QoL 3): the FF14 fanfares ship quiet — 1.75x makes the sync-start
 		// audio clearly audible over BGM without clipping (WebAudio volume is not
 		// clamped at construction; SoundHandle applies its own squared falloff).
 		// The light/full-party jingles play right after that fanfare and felt too
 		// loud at the same gain — halved to 50% of the accept fanfare (0.875).
-		const volumes: { [key: string]: number } = { accept: 1.75, light: 0.875, full: 0.875 };
+		const volumes: { [key: string]: number } = { accept: 1.75, light: 0.875, full: 0.875, complete: 1.75 };
 		let snd = this.storySounds[key];
 		if (!snd) {
 			snd = new (ig as any).Sound(paths[key], volumes[key]);
@@ -3484,7 +4187,7 @@ export class StorySyncController {
 	}
 
 	/** Play one cached fanfare; a missing/blocked sound must never break a banner. */
-	private playStorySound(key: 'accept' | 'light' | 'full'): void {
+	private playStorySound(key: 'accept' | 'light' | 'full' | 'complete'): void {
 		try {
 			const snd = this.getStorySound(key);
 			if (snd && typeof snd.play === 'function') snd.play(false);
@@ -3520,4 +4223,85 @@ export function storySyncSuppressMemberCutsceneStream(): boolean {
 		const ctl: StorySyncController = (window as any).__mpStory;
 		return !!(ctl && typeof ctl.isLocalMember === 'function' && ctl.isLocalMember());
 	} catch (_) { return false; }
+}
+
+/** Stuck-stage auto repair, run once per server (re-)entry after the login-time
+ * save restore settles. Side-quest sync can strand a MEMBER's quest one stage
+ * behind: an abnormal exit (crash/disconnect mid-sync) commits a state whose
+ * CURRENT task's subtasks are actually all satisfied — their fulfillment lives
+ * in world state (inventory, landmarks, a solved sub-quest) or in labels the
+ * leader's state stream already applied — while currentTask never advanced.
+ * Nothing local re-fires those completions afterwards, so the quest sits at a
+ * stage it has long finished and can never advance.
+ *
+ * The repair re-evaluates the CURRENT task's subtasks with the same sources the
+ * engine's own initState/updateState use (COLLECT -> live inventory, LANDMARK ->
+ * map landmark counters, QUEST -> isQuestSolved, CONDITION -> st.labels[label],
+ * the label solveQuestCondition flips together with the subtask flag) and, when
+ * every subtask of the current task is fulfilled, advances via the engine's own
+ * increaseTaskIndex — whose FINISHED notification flows into setQuestFinished,
+ * so a quest that should have completed completes for real (rewards queued).
+ * KILL subtask counts are not re-derivable (the engine keeps no other record),
+ * so those states are left untouched. Sync-owned view entries (_mpStoryViewOnly)
+ * are never touched. Idempotent: a healthy quest fails the first subtask check. */
+export function repairStuckQuestStages(reason: string): void {
+	try {
+		// Never touch quest state while a story sync owns it: mid-sync (death)
+		// reloads rebuild the member's quest model from the guarded PRE-SYNC
+		// snapshot and the view-only hardening has not re-latched yet — repairing
+		// then would advance (or even COMPLETE, with rewards) the member's local
+		// copy ahead of the leader's stream. The sync's own convergence pump
+		// re-applies the leader's state a second later anyway.
+		const ctl: any = (window as any).__mpStory;
+		if (ctl && typeof ctl.isStorySyncActive === 'function' && ctl.isStorySyncActive()) return;
+		const q: any = (sc as any).quests;
+		if (!q || !Array.isArray(q.activeQuests) || !q.activeQuests.length) return;
+		const model: any = (sc as any).model;
+		const mapModel: any = (sc as any).map;
+		// slice(): a repaired quest that COMPLETES splices itself out of
+		// activeQuests mid-pass (setQuestFinished) — iterate over a copy.
+		for (const st of q.activeQuests.slice()) {
+			try {
+				if (!st || st.finished || !st.quest || !Array.isArray(st.quest.tasks) || !st.quest.tasks.length) continue;
+				if (st._mpStoryViewOnly) continue; // sync view entry — the leader's stream owns it
+				const id = st.quest.id || '?';
+				let advanced = false;
+				let guard = 0;
+				while (!st.finished && guard++ <= st.quest.tasks.length + 1) {
+					const ti = st.currentTask;
+					const task = st.quest.tasks[ti];
+					const subs = task && task.subTasks;
+					const subDone = st.done && st.done[ti];
+					if (!subs || !subs.length || !subDone) break;
+					let all = true;
+					for (let k = 0; k < subs.length; k++) {
+						const s = subs[k];
+						if (!s || typeof s.isFulfilled !== 'function') { all = false; break; }
+						const d = subDone[k] || (subDone[k] = {});
+						try {
+							if (s.type === 'COLLECT' && model && model.player && typeof model.player.getItemAmount === 'function') {
+								d.collected = model.player.getItemAmount(s.item);
+							} else if (s.type === 'LANDMARK' && mapModel && typeof mapModel.getTotalLandmarksFoundInArea === 'function') {
+								d.unlocked = mapModel.getTotalLandmarksFoundInArea(s.area);
+							} else if (s.type === 'QUEST' && s.quest && !d.active && typeof q.isQuestSolved === 'function' && q.isQuestSolved(s.quest)) {
+								d.active = true;
+							} else if (s.type === 'CONDITION' && !d.active && s.label && st.labels && st.labels[s.label]) {
+								d.active = true;
+							}
+						} catch (_) { /* per-subtask derivation is best-effort */ }
+						if (!s.isFulfilled(d)) { all = false; break; }
+					}
+					if (!all) break;
+					const before = st.currentTask;
+					st.increaseTaskIndex(); // engine advance; FINISHED -> setQuestFinished on the last task
+					advanced = true;
+					console.log('[storysync] repaired stuck quest (' + reason + '): ' + id + ' task ' + before + ' -> ' + st.currentTask + (st.finished ? ' (completed)' : ''));
+				}
+				if (advanced) {
+					try { (sc as any).Model.notifyObserver(q, 1, st); } catch (_) { /* ignore */ }
+					try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+				}
+			} catch (_) { /* one bad quest must not stop the pass */ }
+		}
+	} catch (_) { /* the repair is strictly best-effort */ }
 }

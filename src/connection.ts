@@ -106,7 +106,7 @@ export interface IConnection {
      * the member applies VERBATIM — `perfect` = a perfect guard (0 damage + counter
      * window), `regular` = a regular guard (chip damage + guard-bar), `knockback` =
      * whether the engine knockback fires. PvP hits (mirror-to-mirror) omit these. */
-    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void;
+    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void;
     /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
      * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
@@ -128,6 +128,16 @@ export interface IConnection {
      * speedlines on the same entity; the server excludes the sender and rate-limits
      * ~20/s. kind = 'counter' | 'break'. */
     emitCombatFx(uid: number, kind: string): void;
+    /** The local player genuinely fell into a fall terrain (water/hole/...) —
+     * relay the terrain to the party so teammates replay the splash + fall-damage
+     * visual on our mirror. Needed because replica-local terrain falls are
+     * suppressed (water-edge phantom-loop fix), which also muted REAL falls. */
+    sendPlayerFall(terrain: number): void;
+    /** A story-gated dungeon CUTSCENE EventTrigger just started locally (e.g.
+     * the Temple Mine elevator console) — relay {map, trigger mapId, our exact
+     * player position} so same-block teammates gather onto us and replay the
+     * cutscene. Server broadcasts to the map instance, sender excluded. */
+    sendCutsceneTrigger(map: string, mi: number, p: [number, number, number]): void;
     /** Round 17: HOST -> all — one of my real enemies started an attack (fresh attack
      * anim edge at block cadence). Members replay it on their puppet toward the local
      * player (member puppets no longer run local AI). Round 22 (RC1): `t` is the
@@ -207,6 +217,11 @@ export interface IConnection {
     /** 1.71.0: a same-instance client relayed dungeon puzzle state — apply it to
      * our matching local entities by mapId. */
     onPuzzleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
+    /** ROUND 132: stream the LOCAL player's thrown-ball positions (bounce-puzzle
+     * visibility — throwBall only relays the throw moment, not the steered bounce). */
+    playerBall(map: string, entries: Array<{ i: number, el?: number, x: number, y: number, z: number, vx?: number, vy?: number }>): void;
+    /** ROUND 132: a same-instance peer relayed its thrown-ball positions. */
+    onPlayerBall(callback: (data: { from: string, map: string, entries: Array<any> }) => void): void;
 
     updateEntityPosition(id: number, pos: Vec3): void;
     updateEntityAnimation(id: number, face: Vec2, anim: string): void;
@@ -243,7 +258,10 @@ export interface IConnection {
     // ---- 1.70.61 剧情同步模式 (story sync mode) ----
     /** Leader-only: ask the server to run the party-wide eligibility handshake for
      * a quest (all online members must be active or solved, leader active). */
-    storySyncRequest(quest: string): void;
+    /** plotLine/ptask: main-story mode piggybacks the leader's current plot.line
+     * and objective text so the server's start envelope can clamp ahead members
+     * immediately and show them the party's real objective. */
+    storySyncRequest(quest: string, plotLine?: number, ptask?: { [lang: string]: string }): void;
     /** Reply to the server's `storySyncCheck` for the party-wide start handshake. */
     storySyncCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void;
     /** Reply to the server's `storySyncJoinCheck` — joining a party whose story
@@ -252,6 +270,11 @@ export interface IConnection {
     /** Leader -> everyone: this client's authoritative quest progress (locks all
      * members onto the same task state). */
     storySyncState(quest: string, state: any, map?: string): void;
+    /** Any synced client -> everyone else: map/tmp var writes produced by quest
+     * events or world reactions (quest-gated chest/boss spawnConditions evaluate
+     * against these buckets on every client). */
+    storySyncMapVar(quest: string, list: Array<{ b: string, k: string, v: any }>): void;
+    onStorySyncMapVar(callback: (data: { from: string, quest: string, list: Array<{ b: string, k: string, v: any }> }) => void): void;
     /** Leader -> everyone: the story event just started on the leader (members
      * replay the same local engine event; key = entity mapId string). */
     storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number): void;
@@ -406,6 +429,12 @@ export interface IConnection {
      * relayed, sender excluded). Replay it locally on the same-uid entity. kind =
      * 'counter' | 'break'. */
     onCombatFx(callback: (uid: number, kind: string) => void): void;
+    /** A party teammate genuinely fell into a fall terrain — replay the fall
+     * visual (splash effect + damage popup + respawn drift) on their mirror. */
+    onPlayerFall(callback: (from: string, terrain: number) => void): void;
+    /** A same-block teammate started a story-gated dungeon cutscene — gather
+     * onto their exact position and start the same trigger locally. */
+    onCutsceneTrigger(callback: (data: { map: string, mi: number, p: [number, number, number], from?: string }) => void): void;
     /** Round 23: the host killed a real enemy — grant the relayed credits to our own
      * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
      * via broadcastHostState. */
@@ -541,7 +570,7 @@ export interface IConnection {
      * into a story-syncing party through. */
     onStorySyncJoinCheck(cb: (reqId: string, quest: string) => void): void;
     /** The mode envelope: quest + leader + the exact members that started it. */
-    onStorySyncStart(cb: (data: { quest: string, leader: string, members: string[] }) => void): void;
+    onStorySyncStart(cb: (data: { quest: string, leader: string, members: string[], plotLine?: number, ptask?: { [lang: string]: string } }) => void): void;
     /** The start handshake failed — `reason` is one of 'notLeader','busy',
      * 'offline','timeout','partyGone','partyChanged','membersNotReady',
      * 'leaderNotActive','mismatch'. */

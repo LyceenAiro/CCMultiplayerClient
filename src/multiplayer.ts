@@ -32,15 +32,16 @@ import { PlayerListener } from './listeners/game/playerListener';
 import { IMultiplayerEntity } from './mpEntity';
 import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
-import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey, isSharedTownNow } from './util/areaUtil';
+import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows, showMpWindow, showStartModeWindow } from './ui/socialMenuInject';
 import { NetSync } from './sync/netSync';
-import { StorySyncController } from './sync/storySync';
+import { StorySyncController, repairStuckQuestStages } from './sync/storySync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
+import { installCutsceneRelay, ICutsceneRelay } from './sync/cutsceneRelay';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
@@ -55,7 +56,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.72.0';
+export const MP_VERSION = '1.73.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -290,6 +291,7 @@ export class Multiplayer {
 	 * once; the session handle is re-bound every connect (initializeListeners). */
 	public ghostChests?: IGhostChestsModule;
 	public puzzleSync?: IPuzzleSync;
+	public cutsceneRelay?: ICutsceneRelay;
 	/** netSync hook fired when this client is promoted to instance host (set in
 	 * initializeListeners; respawns puppet enemies as real AI-driven ones). */
 	public onPromotedToHost?: () => void;
@@ -1070,6 +1072,14 @@ export class Multiplayer {
 		// The module is process-once; install() re-binds the listener to this socket.
 		if (!this.puzzleSync) this.puzzleSync = installPuzzleSync(() => this);
 		try { this.puzzleSync.install(); } catch (e) { console.warn('[multiplayer] puzzle sync install failed', e); }
+		// Dungeon cutscene gather: a story-gated CUTSCENE EventTrigger (switch /
+		// console) that fires on one client is relayed to same-block teammates,
+		// who teleport to the triggerer's exact position and replay the event.
+		if (!this.cutsceneRelay) this.cutsceneRelay = installCutsceneRelay(() => this);
+		try { this.cutsceneRelay.install(); } catch (e) { console.warn('[multiplayer] cutscene relay install failed', e); }
+		this.connection.onCutsceneTrigger((data) => {
+			try { this.cutsceneRelay && this.cutsceneRelay.onRelay(data); } catch (_) { /* ignore */ }
+		});
 		// Round 17 (issue 1): the HOST's real enemy started an attack — relayed to the
 		// instance. Replay it on the matching member-side puppet toward the local player
 		// (puppets no longer run local AI; this keeps round-2 monster-attacks-members at
@@ -2331,11 +2341,16 @@ export class Multiplayer {
 	 * players + bots <= 8. */
 	private checkBotRoster(): void {
 		try {
-			if (!this.host || !this.connection || !this.connection.isOpen()) return;
-			// Main-city refactor: never publish bots while in a shared town — several
-			// parties sharing one room would fight over the instance bot roster. Bots
-			// stay leader-local (only the leader's own client shows them).
-			if (isSharedTownNow()) return;
+			if (!this.connection || !this.connection.isOpen()) return;
+			// 1.72.0 (bot visibility regression fix): the roster publish was gated on
+			// the INSTANCE HOST plus blocked outright in shared towns — so a party leader
+			// who invited a bot in a town (or while not hosting the block) never
+			// published and teammates could not see the bot at all. Bots belong to the
+			// party LEADER (botState has always been leader-driven, and only the leader
+			// can invite); the relay is party-scoped now, so the shared-town cross-party
+			// roster fight the town block guarded against no longer exists.
+			if (!this.isPartyLeader) return;
+			if (!this.partyMembers || this.partyMembers.length < 2) return;
 			// 1.71.0: the vanilla game hides follower bots inside dungeons. Publish
 			// an EMPTY roster on dungeon entry so members cull their copies too.
 			if (this.inDungeonNow()) {
@@ -2666,9 +2681,9 @@ export class Multiplayer {
 	private streamBotState(): void {
 		try {
 			if (!this.connection || !this.connection.isOpen()) return;
-			// Main-city refactor: no botState stream in a shared town (bots are
-			// leader-local there — see checkBotRoster).
-			if (isSharedTownNow()) return;
+			// 1.72.0: the shared-town stream block is lifted with the roster fix —
+			// receivers now filter botState to their OWN party leader, so parties
+			// sharing a town instance no longer see each other's bots.
 			if (!this.isPartyLeader) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
 			// 1.71.0: dungeons have no follower bots — keep streaming the EMPTY cull
@@ -2716,6 +2731,10 @@ export class Multiplayer {
 			this._mpLastBotStateAt = Date.now();
 			if (data.from === this.name) return;
 			if (this.isPartyLeader) return; // we run our own bots with full AI
+			// 1.72.0: botState relays are instance-wide and shared towns mix several
+			// parties into one instance — accept bot state ONLY from our own party
+			// leader, or a neighbouring party's bots would spawn on our client.
+			if (!data.from || data.from !== this.partyLeader) return;
 			// 1.71.0: dungeon maps never hold follower bots. The vanilla
 			// dungeonBlocked path already hides them and keeps currentParty intact,
 			// so simply ignore the stream until we leave.
@@ -4437,7 +4456,28 @@ export class Multiplayer {
 		// const buttonInteract = ig.gui.menues[15].children[2].buttonInteract; // TODO Resolve buttonInteract
 		// ig.interact.removeEntry(buttonInteract);
 
-		ig.interact.removeEntry(ig.interact.entries[0]);
+		// ROUND 125: precise title-entry removal. The old blunt entries[0] removal
+		// only hit the title BUTTONS entry when it happened to sit first in the
+		// stack; any other ordering (intro/BG screenInteract, changelog/DLC panels)
+		// left the title button group LIVE in ig.interact after the game started —
+		// WASD then kept navigating the invisible title buttons mid-gameplay
+		// (focus-change sounds, and Enter would even press one). Find the title GUI
+		// and remove BOTH of its entries; entries[0] stays only as a fallback.
+		try {
+			const hooks: any[] = (ig.gui && (ig.gui as any).guiHooks) || [];
+			let removed = false;
+			for (let i = 0; i < hooks.length; i++) {
+				const gui: any = hooks[i] && hooks[i].gui;
+				if (gui && gui.buttons && gui.buttons.buttonInteract) { // sc.TitleScreenGui
+					try { ig.interact.removeEntry(gui.buttons.buttonInteract); removed = true; } catch (_) { /* ignore */ }
+					try { if (gui.screenInteract) ig.interact.removeEntry(gui.screenInteract); } catch (_) { /* ignore */ }
+					break;
+				}
+			}
+			if (!removed) ig.interact.removeEntry(ig.interact.entries[0]);
+		} catch (_) {
+			try { ig.interact.removeEntry(ig.interact.entries[0]); } catch (_) { /* ignore */ }
+		}
 		ig.bgm.clear('MEDIUM_OUT'); // Clear BGM
 
 		// ROUND 103 (fresh start): the player chose the story beginning. The server
@@ -4472,7 +4512,11 @@ export class Multiplayer {
 			// already starts normally; nothing to await, and no server save to restore.
 			// Uploads are still governed by allowUpload's item-1/3 rules.
 			this._saveRestoreSettled = true;
-			this.onceGameReady(() => { /* nothing to restore */ });
+			this.onceGameReady(() => {
+				// nothing to restore — but a sync-stranded quest stage in the LOCAL
+				// save still self-heals on server (re-)entry.
+				try { repairStuckQuestStages('login'); } catch (_) { /* ignore */ }
+			});
 			// ITEM 1: entering the game — re-arm the 5s no-upload window (covers
 			// "进入游戏" even when the login-time arm has already elapsed).
 			this._saveSuppressUntil = Date.now() + 5000;
@@ -4562,6 +4606,9 @@ export class Multiplayer {
 			this.removeSaveBlock();
 			this.onceGameReady(() => {
 				if (!failed) this.restoreServerSave(raw);
+				// After the cloud save is in place: self-heal quests whose current
+				// stage is actually complete (sync-stranded members re-entering).
+				try { repairStuckQuestStages('login'); } catch (_) { /* ignore */ }
 			});
 			// ITEM 1: entering the game — re-arm the 5s no-upload window (the download
 			// block may have held game start longer than the login-time arm).
@@ -4763,6 +4810,13 @@ export class Multiplayer {
 				} catch (e) { /* ignore */ }
 				const cbs = self._pendingReady.splice(0);
 				for (const c of cbs) c();
+				// Self-heal sync-stranded quest stages on EVERY load completion, not
+				// just the first: the login-time cloud-save restore is ASYNC (loadSlot
+				// schedules a teleport; the quest model rebuilds during THAT load), so
+				// a one-shot repair at entry raced it and saw the pre-restore model —
+				// the stuck quest only exists after this second firing. Idempotent,
+				// and repairStuckQuestStages skips itself while a story sync is active.
+				try { repairStuckQuestStages('load'); } catch (_) { /* ignore */ }
 			},
 		});
 	}

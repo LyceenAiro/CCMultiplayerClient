@@ -755,7 +755,7 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('throwBall', ballInfo);
 	}
 
-	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void {
+	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void {
 		this.syncEmit('combatHit', hit);
 	}
 
@@ -787,8 +787,12 @@ export class SocketIoConnector implements IConnection {
 	// ---- 1.70.61 剧情同步模式 (story sync mode) ----
 	// All story-sync events use plain socket.emit (NOT syncEmit): they are
 	// PARTY-scoped and must travel even while our own instance has one member.
-	public storySyncRequest(quest: string): void {
-		this.socket.emit('storySyncRequest', { quest });
+	public storySyncRequest(quest: string, plotLine?: number, ptask?: { [lang: string]: string }): void {
+		this.socket.emit('storySyncRequest', {
+			quest,
+			plotLine: typeof plotLine === 'number' && isFinite(plotLine) && plotLine >= 0 ? Math.round(plotLine) : undefined,
+			ptask: ptask && typeof ptask === 'object' ? ptask : undefined,
+		});
 	}
 	public storySyncCheckResult(reqId: string, quest: string, available: boolean, active: boolean, solved: boolean): void {
 		this.socket.emit('storySyncCheckResult', { reqId, quest, available: !!available, active: !!active, solved: !!solved });
@@ -798,6 +802,9 @@ export class SocketIoConnector implements IConnection {
 	}
 	public storySyncState(quest: string, state: any, map?: string): void {
 		this.socket.emit('storySyncState', { quest, state, map: typeof map === 'string' ? map : '' });
+	}
+	public storySyncMapVar(quest: string, list: Array<{ b: string, k: string, v: any }>): void {
+		this.socket.emit('storySyncMapVar', { quest, list });
 	}
 	public storySyncEvent(quest: string, map: string, key: string, kind: 'trigger' | 'location' | 'npc', type: number): void {
 		this.socket.emit('storySyncEvent', {
@@ -944,6 +951,19 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('combatFx', { uid, kind });
 	}
 
+	/** The local player genuinely fell (water/hole/...): relay the ig.TERRAIN
+	 * number to the party — replicas suppress terrain-driven falls locally. */
+	public sendPlayerFall(terrain: number): void {
+		this.syncEmit('playerFall', { t: terrain });
+	}
+
+	/** A story-gated dungeon cutscene EventTrigger started locally: relay the
+	 * trigger identity + our exact position so same-block teammates gather and
+	 * replay it (see CutsceneRelay). */
+	public sendCutsceneTrigger(map: string, mi: number, p: [number, number, number]): void {
+		this.syncEmit('cutsceneTrigger', { map, mi, p });
+	}
+
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
 	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void {
@@ -1037,6 +1057,17 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('puzzleState', (data: any) => {
 			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
 			callback({ map: data.map, entries: data.entries });
+		});
+	}
+
+	// ROUND 132: player thrown-ball position stream (bounce-puzzle visibility).
+	public playerBall(map: string, entries: any[]): void {
+		this.syncEmit('playerBall', { map, entries });
+	}
+	public onPlayerBall(callback: (data: { from: string, map: string, entries: any[] }) => void): void {
+		this.socket.on('playerBall', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
+			callback({ from: (typeof data.from === 'string' ? data.from : ''), map: data.map, entries: data.entries });
 		});
 	}
 
@@ -1214,6 +1245,25 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('combatFx', (data: any) => {
 			if (data && typeof data.uid === 'number' && typeof data.kind === 'string') {
 				callback(data.uid, data.kind);
+			}
+		});
+	}
+	/** A party teammate genuinely fell — replay the fall visual on their mirror
+	 * (see NetSync.replayPlayerFall). */
+	public onPlayerFall(callback: (from: string, terrain: number) => void): void {
+		this.socket.on('playerFall', (data: any) => {
+			if (data && typeof data.from === 'string' && typeof data.t === 'number') {
+				callback(data.from, data.t);
+			}
+		});
+	}
+	/** A same-block teammate started a story-gated dungeon cutscene: gather onto
+	 * their position and start the same trigger (see CutsceneRelay). */
+	public onCutsceneTrigger(callback: (data: { map: string, mi: number, p: [number, number, number], from?: string }) => void): void {
+		this.socket.on('cutsceneTrigger', (data: any) => {
+			if (data && typeof data.map === 'string' && typeof data.mi === 'number'
+				&& Array.isArray(data.p) && data.p.length === 3) {
+				callback(data);
 			}
 		});
 	}
@@ -1647,7 +1697,7 @@ export class SocketIoConnector implements IConnection {
 			if (data && typeof data.reqId === 'string' && typeof data.quest === 'string') callback(data.reqId, data.quest);
 		});
 	}
-	public onStorySyncStart(callback: (data: { quest: string, leader: string, members: string[] }) => void): void {
+	public onStorySyncStart(callback: (data: { quest: string, leader: string, members: string[], plotLine?: number, ptask?: { [lang: string]: string } }) => void): void {
 		this.socket.on('storySyncStart', (data: any) => {
 			if (data && typeof data.quest === 'string' && typeof data.leader === 'string' && Array.isArray(data.members)) {
 				callback({ quest: data.quest, leader: data.leader, members: data.members.filter((m: any) => typeof m === 'string') });
@@ -1662,6 +1712,17 @@ export class SocketIoConnector implements IConnection {
 					quest: data.quest,
 					reason: typeof data.reason === 'string' ? data.reason : 'unknown',
 					names: Array.isArray(data.names) ? data.names.filter((n: any) => typeof n === 'string') : [],
+				});
+			}
+		});
+	}
+	public onStorySyncMapVar(callback: (data: { from: string, quest: string, list: Array<{ b: string, k: string, v: any }> }) => void): void {
+		this.socket.on('storySyncMapVar', (data: any) => {
+			if (data && typeof data.quest === 'string' && Array.isArray(data.list)) {
+				callback({
+					from: typeof data.from === 'string' ? data.from : '',
+					quest: data.quest,
+					list: data.list,
 				});
 			}
 		});

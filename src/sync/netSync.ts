@@ -1,7 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { ILootDrop } from '../connection';
 import { t } from '../i18n';
-import { isSharedTownNow, isSharedTownMap, currentAreaPath } from '../util/areaUtil';
+import { isSharedTownNow, isSharedTownMap, currentAreaPath, currentAreaType, AREA_TYPE } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
 import { showRemoteHeal } from '../ui/healSync';
 import { createDeathLineHud, DeathLineHud } from '../ui/deathLineHud';
@@ -239,13 +239,20 @@ export class NetSync {
 	 * Deliberately SEPARATE from `puppets` — these are PROJECTILES (Ball/Stone), not
 	 * enemies; they render + rotate but never hit or damage (host-authoritative damage
 	 * flows through combatHit). */
-	private projectiles: { [uid: number]: any } = Object.create(null);
+	private projectiles: { [uid: string]: any } = Object.create(null);
 	/** Round 62: accumulator for the HOST enemy-projectile stream. Re-armed to
 	 * `blockInterval` (the option-driven 怪物同步频率, default 1/30) so the projectile
 	 * stream matches the hostile enemy-block rate instead of a hardcoded 15Hz. */
 	private _mpProjSendTimer = 0;
 	/** Round 62: stale-reap accumulator for visual projectile copies (member side). */
 	private _mpProjReapTimer = 0;
+	/** ROUND 132: accumulator for the LOCAL player's thrown-ball position stream
+	 * (bounce-puzzle visibility). throwBall relays a ball only at the throw moment;
+	 * a bounce puzzle then steers the ball and the one-shot replay loses it. This
+	 * streams the live position so peers render a neutralized visual copy at the
+	 * true spot through every bounce. Copies live in the projectiles map under
+	 * pb_<from>_<uid> keys, reusing the dead-reckon/reap/clear pipeline. */
+	private _mpPlayerBallSendTimer = 0;
 	/** ROUND 88 (collision-map leak fix): periodic sweep accumulator. Every few
 	 * seconds the impact.js spatial hash is cleaned of entries whose
 	 * `_inCollisionMap` flag is false — the exact stale trail left by a locked
@@ -512,6 +519,9 @@ export class NetSync {
 	 * (reapStalePuppets) — the block-based reap was per-block; the time-based reap
 	 * trades an ~600ms delay for robustness against a single dropped block. */
 	private _mpReapTimer = 0;
+	/** ROUND 125: 1s throttle for the gameplay interact-stack watchdog
+	 * (sweepStaleButtonInteracts). */
+	private _mpInteractSweepAt = 0;
 	/** Round 24: count of FULL-flagged entityState blocks seen since map entry (each
 	 * stream fires a full block ~1s; reaching 2 means BOTH streams reported a full
 	 * roster, so a map enemy missing a stamp is dead-on-host — see the map-enemy
@@ -630,6 +640,10 @@ export class NetSync {
 		// relayed, sender excluded). Replay it on our matching puppet / real enemy so the
 		// head popup + speedlines show for everyone, not just the acting member.
 		conn.onCombatFx((uid, kind) => this.replayCombatFx(uid, kind));
+		// A party teammate genuinely fell into a fall terrain (water/hole/...) —
+		// replay the splash + fall-damage visual on their mirror (replica-local
+		// terrain falls are suppressed, so genuine falls arrive via this relay).
+		conn.onPlayerFall((from, t) => this.replayPlayerFall(from, t));
 		// Round 23: the host killed a real enemy and relayed its credits + raw drop
 		// table — grant the credits and roll the drops with our own stats (Round 24
 		// loot fairness; member side only; the host already got its loot from the real
@@ -685,6 +699,11 @@ export class NetSync {
 		// Round 62: the host streamed enemy projectiles (Ball/Stone) so members see
 		// ranged attacks (弹幕). Spawn/update visual-only copies; reap absent uids.
 		conn.onProjectileState((map, list) => this.applyProjectileState(map, list));
+		// ROUND 132: a peer streamed its thrown-ball positions (bounce puzzle). Render
+		// neutralized visual copies at the true spots so the bouncing ball is visible.
+		if (typeof conn.onPlayerBall === 'function') {
+			conn.onPlayerBall((data) => this.applyPlayerBallState(data));
+		}
 		// ROUND 82 (door transition visuals): a remote player opened a door on OUR map —
 		// open our matching door so their enter/exit walk is visible.
 		if (typeof conn.onDoorTransition === 'function') {
@@ -897,6 +916,164 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] mapInteract menu gate failed', e); }
+
+			// ROUND 124 (quest-scope fix, part 2): quest-pump suppression flag. Relayed
+			// loot grants (applyLoot) call addItem on the member's own player model,
+			// whose ITEM_OBTAINED notification pumps EVERY active quest's COLLECT
+			// subtasks — during a side-quest sync that leaks the leader-driven progress
+			// into the member's NON-SELECTED quests. While the flag is set the two
+			// quest-pump entry points no-op; applyLoot raises it around its relayed
+			// addItem calls only when a sync is active, so native pickups and all
+			// out-of-sync behaviour are untouched. The synced quest itself loses
+			// nothing: on members it is view-only (the leader's stream owns it).
+			try {
+				const QM: any = (sc as any).QuestModel && (sc as any).QuestModel.prototype;
+				if (QM && !QM._mpSyncPumpWrapped) {
+					QM._mpSyncPumpWrapped = true;
+					const origUpdQuests = QM.updateActiveQuests;
+					const origResolveQuests = QM.resolveActiveQuestChanges;
+					QM.updateActiveQuests = function (this: any) {
+						try { if ((window as any).__mpQuestPumpSuppress) return; } catch (_) { /* ignore */ }
+						return origUpdQuests.apply(this, arguments as any);
+					};
+					QM.resolveActiveQuestChanges = function (this: any) {
+						try { if ((window as any).__mpQuestPumpSuppress) return; } catch (_) { /* ignore */ }
+						return origResolveQuests.apply(this, arguments as any);
+					};
+				}
+			} catch (e) { console.warn('[netsync] quest-pump suppress wrap failed', e); }
+
+			// ROUND 126: cancel the level-up WORLD freeze while online. The level-up
+			// scene freezes the world with a NAMED ig.slowMotion handle ('levelUp',
+			// factor 0) held until the player dismisses the level-up HUD —
+			// ig.Game.setPaused is never involved, so the ROUND 94 pause suppression
+			// can't see it. While connected, skip adding that handle: the flourish
+			// (sound / levelUp anim / camera zoom / HUD / jump) still plays and the
+			// dismissal still ends the scene, but the world keeps simulating.
+			// Gate on substate==LEVELUP so the combat "dramatic effects" (final-kill /
+			// rank-up slow-mo) that REUSE the 'levelUp' handle name are untouched —
+			// they always run in RUNNING substate.
+			try {
+				const SM: any = (ig as any).SlowMotion && (ig as any).SlowMotion.prototype;
+				if (SM && typeof SM.add === 'function' && !SM._mpLevelUpFreezeWrapped) {
+					SM._mpLevelUpFreezeWrapped = true;
+					const origSlowAdd = SM.add;
+					SM.add = function (this: any, factor: any, time: any, name: any) {
+						try {
+							if (name === 'levelUp') {
+								const m: any = (window as any).__mpMain;
+								const connOk = !!(m && m.connection && m.connection.isOpen && m.connection.isOpen());
+								const mdl: any = (sc as any).model;
+								const isLevelUp = !!(mdl && typeof mdl.isLevelUp === 'function' && mdl.isLevelUp());
+								if (connOk && isLevelUp) {
+									console.log('[netsync] level-up world freeze suppressed (online)');
+									return null;
+								}
+							}
+						} catch (_) { /* fall through to native */ }
+						return origSlowAdd.call(this, factor, time, name);
+					};
+				}
+			} catch (e) { console.warn('[netsync] level-up freeze suppression failed', e); }
+
+			try {
+				// 1.72.0 (water-edge fall loop): mirrors/puppets are stream-driven
+				// replicas — their position authority is the network, never local
+				// terrain physics. At a water/hole boundary the lerp could settle the
+				// replica a hair INSIDE the fall tile even though the owner stands on
+				// solid ground: the engine's actor update then quick-falls/respawns the
+				// replica to ITS OWN last safe spot, the lerp pulls it forward again,
+				// and the splash loop replays forever ("队友在水边一直落水"). Skip both
+				// fall entry points for synced replicas; when the owner genuinely falls,
+				// their streamed position snaps back to shore and the replica follows.
+				// 1.72.x (genuine-fall visual): the blanket skip also muted REAL falls —
+				// the replica just slides back to shore with no splash / no damage
+				// popup. Genuine falls now travel as an explicit 'playerFall' relay:
+				// the OWNER broadcasts from doQuickRespawn (below), and the receiver
+				// replays the native fall chain on the mirror under the _mpFallAllow
+				// bypass flag, so the water-splash effect, the fall-damage number and
+				// the drift-back-to-shore all show exactly like pre-fix — while the
+				// terrain-driven phantom loop stays suppressed.
+				const CB: any = (ig.ENTITY as any).Combatant;
+				if (CB && CB.prototype && !CB.prototype._mpFallWrapped) {
+					CB.prototype._mpFallWrapped = true;
+					const isReplica = (self: any): boolean => !!(self && (self._mpMirror || self._mpPuppet));
+					if (typeof CB.prototype.quickFall === 'function') {
+						const origQuickFall = CB.prototype.quickFall;
+						CB.prototype.quickFall = function (this: any, a: any) {
+							if (isReplica(this) && !this._mpFallAllow) return;
+							return origQuickFall.apply(this, arguments as any);
+						};
+					}
+					if (typeof CB.prototype.doQuickRespawn === 'function') {
+						const origQuickRespawn = CB.prototype.doQuickRespawn;
+						CB.prototype.doQuickRespawn = function (this: any, a: any, b: any, c: any) {
+							if (isReplica(this) && !this._mpFallAllow) return;
+							const r = origQuickRespawn.apply(this, arguments as any);
+							// The LOCAL player committed a genuine fall (quickFall gates
+							// repeats via respawn.timer, so this fires once per fall) —
+							// tell the party so their mirrors replay the visual.
+							try {
+								const game: any = ig.game;
+								if (game && this === game.playerEntity) {
+									const m: any = (window as any).__mpMain;
+									const conn: any = m && m.connection;
+									if (conn && typeof conn.isOpen === 'function' && conn.isOpen()
+										&& typeof conn.sendPlayerFall === 'function') {
+										conn.sendPlayerFall(a);
+									}
+								}
+							} catch (_) { /* the broadcast must never break the fall */ }
+							return r;
+						};
+					}
+				}
+			} catch (e) { console.warn('[netsync] replica fall-guard wrap failed', e); }
+
+			try {
+				// 1.72.0 (cross-world gimmick guard): a remote player's replayed attacks
+				// eslint-disable-next-line @typescript-eslint/no-this-alias
+				const nsSync = this;
+				// must not destroy/trigger LOCAL world gimmicks outside shared areas.
+				// Replayed balls / charged shots spawn with the owner's MIRROR as their
+				// combatant, so "remote-owned" = the combatant root is a mirror/puppet.
+				// Gimmicks are the non-combatant entities carrying ballHit (Destructible,
+				// RegenDestruct, ball switches, BallTrigger, ...); combatant damage is NOT
+				// gated (puppet combat + the combatHit relay keep working everywhere).
+				// Mirrors are Enemy-typed so they can never press FloorSwitches
+				// (isEntitySupported requires isPlayer or a pushable block) — nothing to
+				// guard there. Remote melee sweeps are visual-only FX (no CircleHitForce
+				// is ever spawned for a mirror), so the two ball dispatch sites below are
+				// the complete remote attack -> gimmick surface.
+				const BallProto: any = (ig.ENTITY as any).Ball && (ig.ENTITY as any).Ball.prototype;
+				if (BallProto && typeof BallProto.onProjectileHit === 'function' && !BallProto._mpGimmickGuard) {
+					BallProto._mpGimmickGuard = true;
+					const origBallHit = BallProto.onProjectileHit;
+					BallProto.onProjectileHit = function (this: any, a: any, b: any) {
+						try {
+							if (a && !a.isCombatant && typeof a.ballHit === 'function'
+								&& nsSync.isReplicaAttack(this) && !nsSync.gimmickHitAllowed()) {
+								return false; // remote ball meets a local gimmick: pass through, no trigger
+							}
+						} catch (_) { /* fall through */ }
+						return origBallHit.call(this, a, b);
+					};
+				}
+				const CompProto: any = (sc as any).CompressedBaseEntity && (sc as any).CompressedBaseEntity.prototype;
+				if (CompProto && typeof CompProto.collideWith === 'function' && !CompProto._mpGimmickGuard) {
+					CompProto._mpGimmickGuard = true;
+					const origCompCollide = CompProto.collideWith;
+					CompProto.collideWith = function (this: any, a: any, b: any) {
+						try {
+							if (a && !a.isCombatant && typeof a.ballHit === 'function'
+								&& nsSync.isReplicaAttack(this) && !nsSync.gimmickHitAllowed()) {
+								return; // charged/wave shot from a remote player: never touch local gimmicks
+							}
+						} catch (_) { /* fall through */ }
+						return origCompCollide.call(this, a, b);
+					};
+				}
+			} catch (e) { console.warn('[netsync] gimmick guard wrap failed', e); }
 
 			try {
 				// Round 11 skill-FX sync: wrap the EffectSheet spawn choke points. Skill
@@ -2822,6 +2999,92 @@ export class NetSync {
 								}
 							}
 						}
+						// 1.72.0 (boss anti-deaggro): a BOSS that has engaged must never
+						// drop its lock while the fight is genuinely still on. Arena bosses
+						// normally rely on force-combat for this, but overworld / non-force-
+						// combat bosses (and every mod release path above — the nav watchdog,
+						// the same-block/hold engagement clears, the far-mirror lose branch)
+						// can still strip the target mid-fight: the boss then walks home and
+						// heals to full (boss战脱锁回满血). Once any target/engagement latches
+						// the fight (_mpBossFight), this block owns boss targeting every frame:
+						// a valid current target keeps targetLoseTimer pinned at 0 (the vanilla
+						// distance lose can never fire); a lost target is instantly re-acquired
+						// to the nearest reachable combatant (nav-held mirrors last). Only when
+						// NOBODY living remains near the boss for a sustained grace — wipe /
+						// everyone left, the NECESSARY reset — does the latch release so vanilla
+						// de-aggro + heal can proceed. Players in a cutscene count as PRESENT
+						// (mid-fight phase videos must not reset the boss) but are not
+						// targetable. Host-side only: member-side puppets follow the tn stream.
+						try {
+							const mB = (window as any).__mpMain;
+							const nsB: any = mB && mB.netSync;
+							if (nsB && nsB.main && nsB.main.host && enemy.enemyType && enemy.enemyType.boss && !enemy._killed) {
+								const nowB = Date.now();
+								if (!enemy._mpBossFight && (enemy.target || enemy._mpEngaged)) {
+									enemy._mpBossFight = true;
+								}
+								if (enemy._mpBossFight) {
+									const plB: any = (ig.game as any).playerEntity;
+									const hostAlive = !!(plB && !plB._killed && !(plB as any)._hidden
+										&& !(nsB && nsB._mpDead));
+									let present = false;
+									if (hostAlive) {
+										try { present = enemy.distanceTo(plB) < 900; } catch (_) { present = true; }
+									}
+									const mmB = mirrorTargets();
+									for (let bi = 0; !present && bi < mmB.length; bi++) {
+										try { present = enemy.distanceTo(mmB[bi]) < 900; } catch (_) { /* skip */ }
+									}
+									if (!present) {
+										if (!enemy._mpBossAloneAt) enemy._mpBossAloneAt = nowB;
+										if (nowB - enemy._mpBossAloneAt >= 5000) {
+											enemy._mpBossFight = false;
+											enemy._mpBossAloneAt = 0;
+											if (enemy._mpEngaged) { try { enemy._mpEngaged = null; } catch (_) { /* ignore */ } }
+										}
+									} else {
+										enemy._mpBossAloneAt = 0;
+										const pool: any[] = [];
+										if (hostAlive && !(nsB && nsB.inCutscene)) pool.push(plB);
+										for (let bi = 0; bi < mmB.length; bi++) {
+											const recB = mB && mB.players ? mB.players[mmB[bi].name] : null;
+											if (recB && (recB as any)._mpCutscene) continue;
+											pool.push(mmB[bi]);
+										}
+										let curOk = false;
+										const curT = enemy.target;
+										if (curT && !curT._killed) {
+											for (let bi = 0; bi < pool.length; bi++) {
+												if (pool[bi] === curT) { curOk = true; break; }
+											}
+										}
+										if (!curOk && pool.length) {
+											const holdB = enemy._mpNavHold;
+											let bestB: any = null, bestBD = 1e9, bestBHeld = true;
+											for (let bi = 0; bi < pool.length; bi++) {
+												const candB = pool[bi];
+												let dB = 1e9;
+												try { dB = enemy.distanceTo(candB); } catch (_) { continue; }
+												const heldB = !!(holdB && candB.name && candB.name === holdB.name && nowB < holdB.until);
+												if (!bestB || (bestBHeld && !heldB) || (heldB === bestBHeld && dB < bestBD)) {
+													bestB = candB; bestBD = dB; bestBHeld = heldB;
+												}
+											}
+											if (bestB) {
+												try { this.assignTarget(enemy, bestB, true); } catch (_) {
+													try { enemy.setTarget(bestB); } catch (__) { /* ignore */ }
+												}
+												try {
+													if (bestB._mpMirror && bestB.name) enemy._mpEngaged = { name: bestB.name };
+													else if (enemy._mpEngaged) enemy._mpEngaged = null;
+												} catch (_) { /* ignore */ }
+											}
+										}
+										if (enemy.target) { try { enemy.targetLoseTimer = 0; } catch (_) { /* ignore */ } }
+									}
+								}
+							}
+						} catch (_) { /* boss pin is best-effort */ }
 					},
 				});
 				// Reselection (on target death / spawn / neighbour aggro): fold mirrors into
@@ -3098,6 +3361,18 @@ export class NetSync {
 		// (visualType falling back to type, both numeric sc.ATTACK_TYPE) so the member
 		// replays the genuine melee-hit sound instead of the hardcoded LIGHT ball sound.
 		let ax: number | undefined; let ay: number | undefined; let atk = 0; let attackType = 0;
+		// The MIRROR's center at verdict time = the exact spot the hit connected on.
+		// It rides on the packet (hx/hy) so the victim's client can lag-compensate:
+		// a member who has moved further than the round-trip physically allows was
+		// hit on a stale ghost of themselves — their client drops that verdict.
+		let hx: number | undefined; let hy: number | undefined;
+		try {
+			const mc0: any = mirror && mirror.coll;
+			if (mc0 && mc0.pos) {
+				hx = mc0.pos.x + (mc0.size ? mc0.size.x / 2 : 0);
+				hy = mc0.pos.y + (mc0.size ? mc0.size.y / 2 : 0);
+			}
+		} catch (_) { /* hx/hy stay undefined -> members keep the old no-gate behavior */ }
 		let atkVelX = 0; let atkVelY = 0; // ROUND 65: attacker velocity for the guard direction fallback
 		try {
 			const root: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
@@ -3545,6 +3820,8 @@ export class NetSync {
 			stb: (el > 0 && stb > 0) ? stb : undefined,
 			bdf: (el > 0 && stb > 0) ? bdf : undefined,
 			afc: (el > 0 && stb > 0) ? afc : undefined,
+			// Lag-compensation anchor: the mirror's center at connect time.
+			hx, hy,
 		});
 	}
 
@@ -4870,6 +5147,28 @@ export class NetSync {
 		} catch (_) { /* a failed FX replay must never crash the frame */ }
 	}
 
+	/** 1.72.x: a party teammate GENUINELY fell into a fall terrain (relayed as
+	 * 'playerFall' by the owner's doQuickRespawn — replica-local terrain falls are
+	 * suppressed to kill the water-edge phantom loop). Replay the native fall chain
+	 * on their mirror under the _mpFallAllow bypass: water-splash/hole effect at the
+	 * mirror's position, the fall-damage number, and the drift back to the mirror's
+	 * own last safe spot — identical to the pre-fix visual, without re-enabling the
+	 * phantom terrain trigger. No mirror on our map (or already respawning —
+	 * quickFall gates on respawn.timer) -> silently ignored. */
+	private replayPlayerFall(from: string, terrain: number): void {
+		try {
+			const main: any = this.main;
+			if (!main || !from || from === main.name) return;
+			const p = main.players && main.players[from];
+			const ent: any = p && p.entity;
+			if (!ent || ent._killed || !ent.coll) return;
+			if (typeof ent.quickFall !== 'function') return;
+			ent._mpFallAllow = true;
+			try { ent.quickFall(terrain); }
+			finally { try { ent._mpFallAllow = false; } catch (_) { /* ignore */ } }
+		} catch (_) { /* a cosmetic replay must never break the frame */ }
+	}
+
 	/** Round 20 (fix 3): knock a host enemy away from the member's mirror after a
 	 * member-initiated hit. Used ONLY by the applyEnemyDamage FALLBACK now (the success
 	 * path steers the native onDamage via the mirror's coll.vel — round 34). The engine's
@@ -4996,7 +5295,7 @@ export class NetSync {
 		} catch (_) { /* status must never break the hit */ }
 	}
 
-	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number }): void {
+	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void {
 		try {
 			const D = (t: string, ...a: any[]) => { try { this._sfxLog('ch.' + t, ...a); } catch (_) { /* ignore */ } };
 			// ROUND 38: the attacker's REAL attack-type (sc.ATTACK_TYPE) rides on the packet
@@ -5056,6 +5355,37 @@ export class NetSync {
 			const p: any = ig.game.playerEntity;
 			if (!p || !p.params || p._killed) { D('noplayer'); return; }
 			if (p.invincibleTimer && p.invincibleTimer > 0) { D('iframes', 't=' + p.invincibleTimer); return; } // i-frames
+		// LAG COMPENSATION (monster hits): the host judged this hit against our MIRROR,
+		// whose position trails our real player by roughly one RTT (stream cadence +
+		// one-way lag on both legs). hx/hy is where that mirror stood when the hit
+		// connected. If our real player has since moved further than it could cover
+		// within that window (+ a slack for interpolation jitter), the hit landed on a
+		// ghost we no longer occupy — the "enemy hits me from across the screen at
+		// high ping" report — so drop the verdict entirely (no HP, no flinch, no
+		// knockback). Works for melee AND ranged (an undodged projectile connects at
+		// our feet -> dist ~0 -> lands; a whiffed one lands where we were -> dropped).
+		// Old hosts ship no hx/hy -> the gate stays inert (backward compatible).
+		try {
+			const hxN = (hit as any).hx, hyN = (hit as any).hy;
+			if (!!(hit && hit.monster) && typeof hxN === 'number' && typeof hyN === 'number' && isFinite(hxN) && isFinite(hyN) && p.coll) {
+				const conn: any = this.main.connection;
+				const rtt = (conn && typeof conn.pingMs === 'number' && conn.pingMs >= 0) ? conn.pingMs : 100;
+				// Effective lag window: the RTT plus one stream-cadence slack, capped so
+				// an absurd probe sample can't widen the gate into uselessness.
+				const lagMs = Math.min(500, rtt + 60);
+				const ps = p.coll.size || { x: 0, y: 0 };
+				const pcx = p.coll.pos.x + (ps.x || 0) / 2, pcy = p.coll.pos.y + (ps.y || 0) / 2;
+				// 0.22 px/ms = run speed (~220px/s): the distance we could legitimately
+				// cover during the lag window. A dash (~450px/s) outruns it — intended:
+				// "I dodged and still got hit" is exactly what this gate kills.
+				const allowance = 20 + lagMs * 0.22;
+				const dist = Math.hypot(pcx - hxN, pcy - hyN);
+				if (dist > allowance) {
+					D('lagdrop', 'dist=' + Math.round(dist), 'allow=' + Math.round(allowance), 'rtt=' + Math.round(rtt), 'dmg=' + hit.damage);
+					return;
+				}
+			}
+		} catch (_) { /* the gate must never drop a verdict on error */ }
 			// ROUND 27 (item 4): a MONSTER hit is now host-authoritative. The host already
 			// resolved guard/perfect/damage against OUR streamed guard state + defense, so
 			// we apply its result VERBATIM (no local guard re-derivation — the round-26
@@ -5289,7 +5619,15 @@ export class NetSync {
 					// Amount: min..max, same as the engine.
 					let n = m.min || 1;
 					if (m.max) n += Math.floor((m.max + 1 - n) * Math.random());
-					pm.addItem(Number(m.item), n, false, false);
+					// ROUND 124: during a story sync, this RELAYED grant must not pump the
+					// member's non-selected quests (COLLECT credit would track the leader's
+					// progress). The addItem -> ITEM_OBTAINED -> quest-pump chain is
+					// synchronous, so a scoped flag around the call is sufficient.
+					const story: any = this.main.storySync;
+					const syncing = !!(story && typeof story.isStorySyncActive === 'function' && story.isStorySyncActive());
+					if (syncing) { try { (window as any).__mpQuestPumpSuppress = true; } catch (_) { /* ignore */ } }
+					try { pm.addItem(Number(m.item), n, false, false); }
+					finally { if (syncing) { try { (window as any).__mpQuestPumpSuppress = false; } catch (_) { /* ignore */ } } }
 					// ROUND 100 (drop-pickup visibility): our roll is a silent addItem —
 					// relay it so teammates see the drop fall where the enemy died and
 					// fly to OUR mirror (the host's own drops ride the spawnDrops wrap).
@@ -5312,22 +5650,42 @@ export class NetSync {
 	private applyQuestKill(kill: { enemy: string, map: string }): void {
 		try {
 			if (!kill || typeof kill.enemy !== 'string' || !kill.enemy || kill.enemy.length > 64) return;
-			const synced = !!(this.main.storySync && typeof this.main.storySync.isStorySyncActive === 'function'
-				&& this.main.storySync.isStorySyncActive());
-			if (!synced) {
-				const localMap = String((ig.game && (ig.game as any).mapName) || '');
-				if (typeof kill.map !== 'string' || !kill.map || kill.map !== localMap) return;
-			}
+			const story: any = this.main.storySync;
+			const synced = !!(story && typeof story.isStorySyncActive === 'function'
+				&& story.isStorySyncActive());
 			const q: any = (sc as any).quests;
 			if (!q || typeof q.onCombatEvent !== 'function') return;
 			const ev: any = (sc as any).COMBAT_EVENT;
 			if (!ev || typeof ev.DEFEATED !== 'number') return;
-			q.onCombatEvent({ enemyName: kill.enemy }, ev.DEFEATED);
-			// In story-sync mode, when WE are the leader this kill must flow to every
-			// member immediately (the 0.25s coalescing timer would normally wait).
-			if (synced && this.main.storySync && typeof this.main.storySync.markStateDirty === 'function'
-				&& this.main.storySync.isLocalLeader()) {
-				this.main.storySync.markStateDirty();
+			if (!synced) {
+				const localMap = String((ig.game && (ig.game as any).mapName) || '');
+				if (typeof kill.map !== 'string' || !kill.map || kill.map !== localMap) return;
+				q.onCombatEvent({ enemyName: kill.enemy }, ev.DEFEATED);
+				return;
+			}
+			// ROUND 124 (quest-scope fix): while a story sync runs, a RELAYED kill must
+			// not advance any NON-SELECTED quest on either side. Member side there is
+			// nothing to pump at all: the synced quest is view-only (the leader's state
+			// stream owns it) and the member's other quests must stay untouched. Leader
+			// side only the SELECTED quest takes the credit — sc.quests.onCombatEvent
+			// would broadcast the kill to EVERY active quest, so call the synced quest
+			// state's updateState directly with the engine's KILL event shape instead.
+			if (typeof story.isLocalLeader === 'function' && story.isLocalLeader()) {
+				const questId = typeof story.getSyncedQuestId === 'function' ? story.getSyncedQuestId() : '';
+				const isPlot = typeof story.isPlotSyncActive === 'function' && story.isPlotSyncActive();
+				if (questId && !isPlot
+					&& typeof q.getStaticQuest === 'function' && typeof q.getQuestState === 'function') {
+					const quest = q.getStaticQuest(questId);
+					const st = quest && q.getQuestState(quest);
+					const solved = typeof q.isQuestSolved === 'function' && q.isQuestSolved(questId);
+					if (st && !solved && typeof st.updateState === 'function') {
+						st.updateState('KILL', { enemy: kill.enemy, amount: 1 });
+						try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+					}
+				}
+				// In story-sync mode, when WE are the leader this kill must flow to every
+				// member immediately (the 0.25s coalescing timer would normally wait).
+				if (typeof story.markStateDirty === 'function') story.markStateDirty();
 			}
 		} catch (_) { /* never let a quest relay crash the frame */ }
 	}
@@ -5972,6 +6330,40 @@ export class NetSync {
 		console.log('[netsync] SHOW_EXTERN_ANIM relay hook installed');
 	}
 
+	/** ROUND 125 (gameplay interact-stack watchdog): during FREE gameplay (state
+	 * GAME + substate RUNNING) no ButtonInteractEntry may legitimately sit on
+	 * ig.interact — menus, dialogs, the quick menu and the title screen all remove
+	 * theirs on close, and the only legit gameplay entries are ScreenInteractEntry
+	 * (messages/cinematics, which run under the CUTSCENE state anyway). A leaked
+	 * ButtonInteractEntry keeps its button group keyboard-active while invisible:
+	 * WASD then navigates the ghost buttons (the stray focus-change sounds the user
+	 * heard, and Enter would even PRESS one). Sweep leftovers once a second; every
+	 * step guarded, and the sweep never runs outside free gameplay so quick menus,
+	 * choices, quest-solved dialogs and pause/menu states are untouched. */
+	private sweepStaleButtonInteracts(): void {
+		try {
+			const mdl: any = (sc as any).model;
+			const igAny: any = ig as any;
+			if (!mdl || !igAny.interact || !igAny.interact.entries) return;
+			const GS: any = (sc as any).GAME_MODEL_STATE;
+			const SUB: any = (sc as any).GAME_MODEL_SUBSTATE;
+			if (mdl.currentState !== (GS ? GS.GAME : 1)) return;
+			if (mdl.currentSubState !== (SUB ? SUB.RUNNING : 0)) return;
+			if (typeof mdl.isCutscene === 'function' && mdl.isCutscene()) return;
+			const BI: any = igAny.ButtonInteractEntry;
+			if (!BI) return;
+			const entries: any[] = igAny.interact.entries;
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i];
+				if (e && e instanceof BI) {
+					console.warn('[netsync] sweeping stale button-interact entry during gameplay ('
+						+ ((e.constructor && e.constructor.name) || '?') + ') — a UI closed without removing it');
+					try { igAny.interact.removeEntry(e); } catch (_) { /* ignore */ }
+				}
+			}
+		} catch (_) { /* the watchdog must never break the frame */ }
+	}
+
 	private tick(): void {
 		try {
 			// Connection check FIRST: death state must not survive a logout/disconnect
@@ -5982,6 +6374,13 @@ export class NetSync {
 				if (this._mpDead) this.clearDeathState();
 				if (this._mpChargeFrozen) this.clearChargeFreeze();
 				return;
+			}
+
+			// ROUND 125: stale button-interact watchdog (1s throttle).
+			const nowSweep = Date.now();
+			if (nowSweep - this._mpInteractSweepAt > 1000) {
+				this._mpInteractSweepAt = nowSweep;
+				this.sweepStaleButtonInteracts();
 			}
 
 			const game: any = ig.game;
@@ -6094,12 +6493,13 @@ export class NetSync {
 			// Round 62: member-side stale projectile reap (~150ms). Projectiles are
 			// short-lived and the host sends no empty blocks, so absence in the stream
 			// is what tells us a projectile died on the host.
-			if (!this.main.host) {
-				this._mpProjReapTimer += ig.system.tick;
-				if (this._mpProjReapTimer >= 0.15) {
-					this._mpProjReapTimer = 0;
-					this.reapStaleProjectiles();
-				}
+			// ROUND 132: run for the host too — the host's projectile map holds only
+			// peer thrown-ball visuals (pb_ keys; enemy projectileState stays member-only),
+			// and those need the same stale-reap when a peer's ball dies.
+			this._mpProjReapTimer += ig.system.tick;
+			if (this._mpProjReapTimer >= 0.15) {
+				this._mpProjReapTimer = 0;
+				this.reapStaleProjectiles();
 			}
 			// ROUND 85: restore remote door ignoreCollision flags whose grace expired.
 			this._mpUpdateDoorIgnores();
@@ -6115,6 +6515,9 @@ export class NetSync {
 			this.checkMenuCloseOnHit();
 
 			this.sendPlayerState();
+			// ROUND 132: every client (host AND member) streams its own thrown balls so
+			// peers see the bounce-puzzle ball through every bounce.
+			this.sendPlayerBallBlock();
 			if (this.main.host) {
 				// Main-city refactor: towns have no enemies — skip the enemy/projectile
 				// blocks entirely (the host streams only playerState there).
@@ -8762,11 +9165,11 @@ export class NetSync {
 			const now = Date.now();
 			for (const s of list) {
 				if (!s || typeof s.i !== 'number') continue;
-				let e: any = this.projectiles[s.i];
+				let e: any = this.projectiles[s.i as any];
 				if (!e || e._killed) {
 					e = this.spawnProjectilePuppet(s);
 					if (!e) continue;                          // source puppet not ready — retry next block
-					this.projectiles[s.i] = e;
+					this.projectiles[s.i as any] = e;
 				}
 				e._mpProjSeen = now;
 				// Position target (same _mpTo*/_mpSnapNext contract as puppets, so
@@ -8865,6 +9268,160 @@ export class NetSync {
 			e.bounceProxySrc = null;
 			e.timer = 0; // Ball.update only ticks the timer while > 0 -> never self-destructs
 			e._mpProj = true;
+			e._mpSnapNext = true;
+			this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z });
+			return e;
+		} catch (_) { return null; }
+	}
+
+	/**
+	 * ROUND 132 (step 1): SENDER — stream the LOCAL player's live thrown balls. Runs on
+	 * host AND member (each client owns its own throws). Scoped to dungeon maps: bounce
+	 * puzzles are dungeon content, and this keeps overworld/town combat-ball behaviour
+	 * unchanged. Only the player's OWN balls (combatant root == playerEntity), never a
+	 * neutralized visual copy (_mpPlayerBall) or an enemy-stream puppet (_mpProj).
+	 */
+	private sendPlayerBallBlock(): void {
+		try {
+			const conn = this.main.connection;
+			if (!conn || !conn.isOpen() || typeof conn.playerBall !== 'function') return;
+			this._mpPlayerBallSendTimer -= ig.system.tick;
+			if (this._mpPlayerBallSendTimer > 0) return;
+			this._mpPlayerBallSendTimer = this.blockInterval;
+			// dungeon gate (bounce puzzles live in dungeons)
+			const sm: any = (sc as any).map;
+			if (!(sm && typeof sm.isDungeon === 'function' && sm.isDungeon())) return;
+			const Ball = (ig.ENTITY as any).Ball;
+			const PlayerParty = (sc as any).COMBATANT_PARTY.PLAYER;
+			const me: any = (ig.game as any).playerEntity;
+			if (!Ball || !me) return;
+			const list: any[] = [];
+			const entities = (ig.game as any).entities || [];
+			for (let i = 0; i < entities.length; i++) {
+				const e: any = entities[i];
+				if (!(e instanceof Ball) || e._killed || !e.coll) continue;
+				if (e.party !== PlayerParty) continue;             // player throw, not enemy
+				if (e._mpPlayerBall || e._mpProj || e._mpMirror) continue; // never re-stream a visual
+				let root: any = null;
+				try { root = e.getCombatantRoot ? e.getCombatantRoot() : (e.combatant || null); } catch (_) { root = e.combatant || null; }
+				if (root !== me) continue;                          // only MY OWN balls
+				// Only NORMAL player-proxy throws (defaultNeutral/Heat/.../charged/...). Key
+				// balls (overrideBall) and ASSAULT templates are relayed by throwBall with
+				// their real behaviour and must NOT be position-streamed (they'd double).
+				// Match by animSheet identity, the same reverse-lookup sendProjectileBlock
+				// uses: a proxy's data.animation IS the ball's animSheet.
+				let isPlayerProxyBall = false;
+				try {
+					const proxies = me.proxies || {};
+					for (const pn in proxies) {
+						const p: any = proxies[pn];
+						if (p && p.data && p.data.animation && p.data.animation === e.animSheet) { isPlayerProxyBall = true; break; }
+					}
+				} catch (_) { isPlayerProxyBall = false; }
+				if (!isPlayerProxyBall) continue;
+				const vel = e.coll.vel || { x: 0, y: 0 };
+				let el = 0;
+				try { el = (e.attackInfo && typeof e.attackInfo.element === 'number') ? e.attackInfo.element : 0; } catch (_) { el = 0; }
+				list.push({
+					i: e.uid, el,
+					x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
+					vx: Math.round(vel.x), vy: Math.round(vel.y),
+				});
+				if (list.length >= 32) break;
+			}
+			if (!list.length) return;
+			conn.playerBall(this.mapName, list);
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/**
+	 * ROUND 132 (step 2): RECEIVER — a peer's thrown-ball positions arrived. Store a
+	 * neutralized visual copy in the shared projectiles map under 'pb_<from>_<uid>' so
+	 * the existing dead-reckon interpolation / stale-reap / map-change clear all apply
+	 * unchanged. Runs on host AND member (everyone renders everyone else's balls).
+	 */
+	private applyPlayerBallState(data: { from: string, map: string, entries: any[] }): void {
+		try {
+			if (!data || !Array.isArray(data.entries)) return;
+			if (!data.map || data.map !== this.mapName) return;   // ball for a map we left
+			if (data.from && data.from === this.main.name) return; // own echo (defensive)
+			const now = Date.now();
+			for (const s of data.entries) {
+				if (!s || typeof s.i !== 'number') continue;
+				const key = 'pb_' + (data.from || '?') + '_' + s.i;
+				let e: any = this.projectiles[key];
+				if (!e || e._killed) {
+					e = this.spawnPlayerBallPuppet(s);
+					if (!e) continue;                                 // proxy not ready — retry next block
+					this.projectiles[key] = e;
+				}
+				e._mpProjSeen = now;
+				// Same dead-reckon contract as enemy projectiles (see applyProjectileState).
+				const vxRaw = typeof s.vx === 'number' ? s.vx : 0;
+				const vyRaw = typeof s.vy === 'number' ? s.vy : 0;
+				const rawLen = Math.hypot(vxRaw, vyRaw);
+				let spd = rawLen;
+				if (!(spd > 0)) spd = (typeof e.speed === 'number' && e.speed > 0) ? e.speed
+					: ((e.coll && typeof e.coll.maxVel === 'number' && e.coll.maxVel > 0) ? e.coll.maxVel : 0);
+				let nvx = vxRaw, nvy = vyRaw;
+				if (rawLen > 0 && spd > 0 && spd !== rawLen) { nvx = vxRaw / rawLen * spd; nvy = vyRaw / rawLen * spd; }
+				e._mpProjVelX = nvx; e._mpProjVelY = nvy;
+				if (e.coll && e.coll.vel) { e.coll.vel.x = nvx; e.coll.vel.y = nvy; }
+				const prevAt: number = (typeof e._mpProjBaseAt === 'number' && e._mpProjBaseAt > 0) ? e._mpProjBaseAt : 0;
+				if (prevAt > 0 && now - prevAt >= 5 && now - prevAt <= 500) {
+					const measured = now - prevAt;
+					const old = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : measured;
+					e._mpProjWindowMs = Math.max(16, Math.min(250, old * 0.7 + measured * 0.3));
+				} else if (!(e._mpProjWindowMs > 0)) {
+					e._mpProjWindowMs = Math.max(16, Math.min(250, this.blockInterval * 1000));
+				}
+				e._mpProjBaseX = s.x; e._mpProjBaseY = s.y; e._mpProjBaseZ = s.z;
+				e._mpProjBaseAt = now;
+				if (e._mpSnapNext) {
+					e._mpSnapNext = false;
+					const cp = e.coll && e.coll.pos;
+					if (cp) { cp.xProtected = s.x; cp.yProtected = s.y; cp.zProtected = s.z; }
+				}
+			}
+		} catch (_) { /* never break block apply */ }
+	}
+
+	/**
+	 * ROUND 132 (step 3): spawn a NEUTRALIZED visual copy of a peer's thrown ball using
+	 * the LOCAL player's per-element ball proxy (every client runs the same character,
+	 * so defaultNeutral/Heat/Cold/Shock/Wave resolve identically). party OTHER + IGNORE
+	 * collision + no attackInfo/behaviors so it never hits, damages, or self-destructs;
+	 * the stream drives its flight and only the 2D velocity is kept so it rotates.
+	 */
+	private spawnPlayerBallPuppet(s: any): any {
+		try {
+			const me: any = (ig.game as any).playerEntity;
+			if (!me) return null;
+			const names = ['defaultNeutral', 'defaultHeat', 'defaultCold', 'defaultShock', 'defaultWave'];
+			const el = (typeof s.el === 'number' && s.el >= 0 && s.el <= 4) ? s.el : 0;
+			let proxy: any = null;
+			try { proxy = (sc as any).ProxyTools.getProxy(names[el], me) || (sc as any).ProxyTools.getProxy('defaultNeutral', me); } catch (_) { proxy = null; }
+			if (!proxy || typeof proxy.spawn !== 'function') return null;
+			const e = proxy.spawn(s.x, s.y, s.z, me, { x: s.vx || 0, y: s.vy || 0 });
+			if (!e) return null;
+			// Neutralize (same contract as spawnProjectilePuppet).
+			e.party = (sc as any).COMBATANT_PARTY.OTHER;
+			try {
+				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
+				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
+			} catch (_) { /* ignore */ }
+			e.attackInfo = null;
+			e.hitProxy = null;
+			e.onProjectileHit = function () { return false; };
+			e.combatant = me;
+			e.target = null;
+			e.behaviors = null;
+			e.grab = null;
+			e.destroyProxySrc = null;
+			e.bounceProxySrc = null;
+			e.timer = 0;                                   // never self-destructs
+			e._mpPlayerBall = true;
+			e._mpProj = true;                              // enemy stream must not re-stream it
 			e._mpSnapNext = true;
 			this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z });
 			return e;
@@ -9659,6 +10216,32 @@ export class NetSync {
 		this._mpDeathShrinkAt = 0;
 	}
 
+	/** 1.72.0: true when the attack entity (ball / compressed shot / force) is
+	 * owned by a REMOTE player — its combatant chain roots at a mirror/puppet. */
+	public isReplicaAttack(ent: any): boolean {
+		try {
+			let root: any = ent;
+			const c = ent && ent.combatant;
+			if (c) root = typeof c.getCombatantRoot === 'function' ? c.getCombatantRoot() : c;
+			else if (ent && typeof ent.getCombatantRoot === 'function') root = ent.getCombatantRoot();
+			return !!(root && (root._mpMirror || root._mpPuppet));
+		} catch (_) { return false; }
+	}
+
+	/** 1.72.0: may remote players' attacks interact with LOCAL world gimmicks
+	 * right now? Only where the world is genuinely shared: dungeon areas
+	 * (party-scoped co-op instances) or while a story-quest sync is active.
+	 * Everywhere else (野外 paths, towns) remote attacks pass through gimmicks
+	 * without triggering or destroying them. */
+	public gimmickHitAllowed(): boolean {
+		try {
+			if (currentAreaType() === AREA_TYPE.DUNGEON) return true;
+			const story: any = (window as any).__mpStory;
+			if (story && typeof story.isActive === 'function' && story.isActive()) return true;
+		} catch (_) { /* fall through */ }
+		return false;
+	}
+
 	/** True while a BOSS-flagged enemy is actively engaged: present (and alive)
 	 * in sc.combat's active ENEMY combatant list. enemyType.boss is the database
 	 * boss flag (the same one the engine reads for BOSS_KILL score). Used to
@@ -9691,6 +10274,35 @@ export class NetSync {
 		// that skipped enterDeath, e.g. abortDeathForTeleport re-entry.)
 		try { if (p && typeof p.clearCharge === 'function') p.clearCharge(); } catch (_) { /* ignore */ }
 		this.clearChargeFreeze();
+		// ROUND 127: purge every leftover ACTION/STANCE state on soft revive. The
+		// vanilla death flow reloads the map from a checkpoint, which incidentally
+		// rebuilds the player entity; our soft revive keeps the SAME entity, and
+		// while dead/hidden the per-frame isControlBlocked() cleanup branch never
+		// runs — so a player who died mid-aim / mid-guard / mid-dash revived still
+		// aiming (state==1/3 with the aiming config + active crosshair), still
+		// looping the guard FX with a damaged shield, still holding dash/attack
+		// counters, and even resuming the interrupted currentAction (vanilla
+		// onKill clears it; the soft death gates that kill). Reset the lot through
+		// the engine's own helpers — every step individually guarded.
+		try { if (typeof p.quickStateSwitch === 'function' && p.state !== 0) p.quickStateSwitch(0); } catch (_) { /* ignore */ }
+		try { if (typeof p.cancelAction === 'function' && p.currentAction) p.cancelAction(); } catch (_) { /* ignore */ }
+		try {
+			const gd: any = p.guard;
+			if (gd) {
+				try { if (gd.fxHandle && typeof gd.fxHandle.stop === 'function') gd.fxHandle.stop(); } catch (_) { /* ignore */ }
+				gd.fxHandle = null;
+				gd.currentKey = null;
+				gd.damage = 0;
+				gd.timer = 0;
+			}
+		} catch (_) { /* ignore */ }
+		try { p.doAttack = false; p.attackCounter = 0; p.attackResetTimer = 0; p.throwCounter = 0; } catch (_) { /* ignore */ }
+		try { if (p.throwDir) { p.throwDir.x = 0; p.throwDir.y = 0; } } catch (_) { /* ignore */ }
+		try {
+			p.dashBlock = 0; p.dashTimer = 0; p.dashCount = 0;
+			if (p.dashDir) { p.dashDir.x = 0; p.dashDir.y = 0; }
+		} catch (_) { /* ignore */ }
+		try { if (typeof p.resetStunData === 'function') p.resetStunData(); } catch (_) { /* ignore */ }
 		// Round 21 (issue 1): 1s no-collision grace after the local player is re-placed
 		// next to a teammate mirror (this respawn repositions us). updateRemoteMirrorFade
 		// forces every mirror to IGNORE until this deadline so we can't overlap one.
